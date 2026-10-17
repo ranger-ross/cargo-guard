@@ -67,7 +67,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         .iter()
         .skip(app.top)
         .take(app.height)
-        .map(|line| Line::from(line.as_str()))
+        .cloned()
         .collect();
     let numbers: Vec<_> = (app.top..app.top + lines.len())
         .map(|line| {

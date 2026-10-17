@@ -1,9 +1,9 @@
 use std::fs;
 
 use eyre::Context;
-use unicode_width::UnicodeWidthStr;
+use ratatui::text::Line;
 
-use super::ReviewSession;
+use super::{ReviewSession, highlight::Highlighter};
 use crate::config::ApprovedVersion;
 
 pub struct App {
@@ -18,12 +18,13 @@ pub struct App {
 
 pub struct SourceFile {
     pub label: String,
-    pub lines: Vec<String>,
+    pub lines: Vec<Line<'static>>,
     pub width: usize,
 }
 
 impl App {
     pub fn new(session: ReviewSession) -> eyre::Result<Self> {
+        let highlighter = Highlighter::new()?;
         let root = session.package.manifest_path.parent();
         let files = session
             .package
@@ -36,7 +37,9 @@ impl App {
                 let path = root
                     .and_then(|root| script.path.strip_prefix(root).ok())
                     .unwrap_or(&script.path);
-                let lines: Vec<_> = contents.lines().map(expand_tabs).collect();
+                let lines = highlighter.highlight(&contents).with_context(|| {
+                    format!("could not highlight build script {}", script.path.display())
+                })?;
                 let width = lines.iter().map(|line| line.width()).max().unwrap_or(0);
                 Ok(SourceFile {
                     label: format!("{} ({})", path.display(), script.name),
@@ -116,22 +119,6 @@ impl App {
     }
 }
 
-fn expand_tabs(line: &str) -> String {
-    let mut result = String::new();
-    let mut column = 0;
-    for c in line.chars() {
-        if c == '\t' {
-            let spaces = 4 - column % 4;
-            result.extend(std::iter::repeat_n(' ', spaces));
-            column += spaces;
-        } else {
-            result.push(c);
-            column += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-        }
-    }
-    result
-}
-
 #[cfg(test)]
 pub(super) mod tests {
     use std::path::PathBuf;
@@ -185,11 +172,5 @@ pub(super) mod tests {
         assert_eq!((app.top, app.left), (0, 0));
         app.switch_file(true);
         assert_eq!(app.selected, 0);
-    }
-
-    #[test]
-    fn expands_tabs_at_display_column_boundaries() {
-        assert_eq!(expand_tabs("a\tb\t"), "a   b   ");
-        assert_eq!(expand_tabs("界\tx"), "界  x");
     }
 }
