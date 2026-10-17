@@ -6,7 +6,7 @@ use eyre::Context;
 
 use super::{
     ReviewSession,
-    app::{App, Decision},
+    app::App,
     discovery::ReviewQueue,
     input::{self, Action},
     queue::QueueState,
@@ -50,9 +50,7 @@ pub fn run(session: ReviewSession) -> eyre::Result<()> {
             dirty = true;
             let decision = match input::handle_key(&mut app, key) {
                 Action::Quit => break,
-                Action::Approve => Decision::Approve,
-                Action::ApproveFingerprint => Decision::ApproveFingerprint,
-                Action::Reject => Decision::Reject,
+                Action::Decide(decision) => decision,
                 Action::Continue | Action::NextPackage | Action::PreviousPackage | Action::Skip => {
                     continue;
                 }
@@ -108,24 +106,15 @@ pub fn run_queue(queue: ReviewQueue) -> eyre::Result<()> {
                         break;
                     }
                 }
-                action @ (Action::Approve | Action::ApproveFingerprint | Action::Reject) => {
-                    let decision = if action == Action::Approve {
-                        Decision::Approve
-                    } else if action == Action::ApproveFingerprint {
-                        Decision::ApproveFingerprint
-                    } else {
-                        Decision::Reject
-                    };
-                    match state.decide(decision) {
-                        Ok(true) => break,
-                        Ok(false) => {}
-                        Err(error) => {
-                            if let Some(app) = &mut state.app {
-                                app.report_decision_error(error);
-                            }
+                Action::Decide(decision) => match state.decide(decision) {
+                    Ok(true) => break,
+                    Ok(false) => {}
+                    Err(error) => {
+                        if let Some(app) = &mut state.app {
+                            app.report_decision_error(error);
                         }
                     }
-                }
+                },
                 Action::Continue => {}
             }
         }

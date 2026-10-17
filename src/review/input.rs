@@ -1,14 +1,12 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use super::app::App;
+use super::app::{App, Decision};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
     Continue,
     Quit,
-    Approve,
-    ApproveFingerprint,
-    Reject,
+    Decide(Decision),
     NextPackage,
     PreviousPackage,
     Skip,
@@ -43,13 +41,13 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
             return Action::Skip;
         }
         KeyCode::Char('a') if key.kind == KeyEventKind::Press && key.modifiers.is_empty() => {
-            return Action::Approve;
+            return Action::Decide(Decision::Approve);
         }
         KeyCode::Char('r') if key.kind == KeyEventKind::Press && key.modifiers.is_empty() => {
-            return Action::Reject;
+            return Action::Decide(Decision::Reject);
         }
         KeyCode::Char('f') if key.kind == KeyEventKind::Press && key.modifiers.is_empty() => {
-            return Action::ApproveFingerprint;
+            return Action::Decide(Decision::ApproveFingerprint);
         }
         KeyCode::Char('q') | KeyCode::Esc => return Action::Quit,
         KeyCode::Down | KeyCode::Char('j') => app.scroll(1, 0),
@@ -83,12 +81,24 @@ mod tests {
         assert_eq!(handle_key(&mut app, key('a')), Action::Continue);
         handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!app.show_help);
-        assert_eq!(handle_key(&mut app, key('a')), Action::Approve);
+        assert_eq!(
+            handle_key(&mut app, key('a')),
+            Action::Decide(Decision::Approve)
+        );
         app.session.package.approval =
             Some(crate::config::ApprovedVersion::Fingerprint("hash".into()));
-        assert_eq!(handle_key(&mut app, key('a')), Action::Approve);
-        assert_eq!(handle_key(&mut app, key('f')), Action::ApproveFingerprint);
-        assert_eq!(handle_key(&mut app, key('r')), Action::Reject);
+        assert_eq!(
+            handle_key(&mut app, key('a')),
+            Action::Decide(Decision::Approve)
+        );
+        assert_eq!(
+            handle_key(&mut app, key('f')),
+            Action::Decide(Decision::ApproveFingerprint)
+        );
+        assert_eq!(
+            handle_key(&mut app, key('r')),
+            Action::Decide(Decision::Reject)
+        );
     }
 
     #[test]
@@ -112,9 +122,9 @@ mod tests {
     fn approval_actions_require_an_unmodified_key_press() {
         let (_root, mut app) = fixture(&["fn main() {}"]);
         for (character, action) in [
-            ('a', Action::Approve),
-            ('r', Action::Reject),
-            ('f', Action::ApproveFingerprint),
+            ('a', Action::Decide(Decision::Approve)),
+            ('r', Action::Decide(Decision::Reject)),
+            ('f', Action::Decide(Decision::ApproveFingerprint)),
         ] {
             let key = KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE);
             assert_eq!(handle_key(&mut app, key), action);

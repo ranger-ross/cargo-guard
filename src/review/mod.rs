@@ -256,7 +256,10 @@ mod tests {
         let mut app =
             App::new(ReviewSession::from_metadata(&metadata, "default-script").unwrap()).unwrap();
         assert_eq!(app.file().status, FileStatus::Added);
-        assert_eq!(input::handle_key(&mut app, key('a')), Action::Approve);
+        assert_eq!(
+            input::handle_key(&mut app, key('a')),
+            Action::Decide(Decision::Approve)
+        );
         app.decide(Decision::Approve).unwrap();
         let saved = fs::read(app.session.config.path()).unwrap();
         let mut reopened =
@@ -279,7 +282,7 @@ mod tests {
         let mut app =
             App::new(ReviewSession::from_metadata(&upgraded, "default-script").unwrap()).unwrap();
         // Supply the fixture's previous source snapshot; real registry retrieval
-        // is exercised separately by the source-provider tests.
+        // is exercised separately by the source-loading tests.
         app.set_baseline(Baseline::Ready(PackageSources {
             version: "1.0.0".parse().unwrap(),
             scripts: vec![ScriptSource {
@@ -291,7 +294,10 @@ mod tests {
         assert_eq!(app.file().status, FileStatus::Unchanged);
         assert!(app.baseline_message().contains("Build scripts unchanged"));
         assert!(app.can_decide());
-        assert_eq!(input::handle_key(&mut app, key('r')), Action::Reject);
+        assert_eq!(
+            input::handle_key(&mut app, key('r')),
+            Action::Decide(Decision::Reject)
+        );
         app.decide(Decision::Reject).unwrap();
         assert_eq!(fs::read(app.session.config.path()).unwrap(), saved);
 
