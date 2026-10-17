@@ -1,4 +1,6 @@
-use std::path::PathBuf;
+use std::{collections::VecDeque, path::PathBuf};
+
+use unicode_width::UnicodeWidthStr;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
@@ -85,7 +87,12 @@ pub struct QueueState {
     pub app: Option<App>,
     config_path: PathBuf,
     loader: Option<BaselineLoader>,
+    retired_loaders: Vec<BaselineLoader>,
+    cached_apps: VecDeque<(usize, App)>,
+    pub sidebar_width: u16,
 }
+
+const VIEW_CACHE_CAPACITY: usize = 8;
 
 impl QueueState {
     pub fn new(queue: ReviewQueue) -> Self {
@@ -103,12 +110,21 @@ impl QueueState {
             })
             .collect();
         let selected = entries.iter().position(Entry::actionable).unwrap_or(0);
+        let sidebar_width = entries
+            .iter()
+            .map(|entry| format!("{} v{}", entry.package.name, entry.package.version).width() + 5)
+            .max()
+            .unwrap_or(24)
+            .clamp(24, 36) as u16;
         let mut state = Self {
             entries,
             selected,
             app: None,
             config_path,
             loader: None,
+            retired_loaders: Vec::new(),
+            cached_apps: VecDeque::new(),
+            sidebar_width,
         };
         if !state.entries.is_empty() {
             state.open(selected);
@@ -117,10 +133,15 @@ impl QueueState {
     }
 
     fn open(&mut self, selected: usize) {
-        // Dropping cancels and joins the previous loader, so a late result can
-        // never be attached to a different package.
-        self.loader = None;
-        self.app = None;
+        // Cancellation is requested immediately, but joining a worker (which
+        // may be waiting for Cargo) must not block package navigation.
+        self.retire_loader();
+        if let Some(app) = self.app.take() {
+            self.cached_apps.push_back((self.selected, app));
+            if self.cached_apps.len() > VIEW_CACHE_CAPACITY {
+                self.cached_apps.pop_front();
+            }
+        }
         self.selected = selected;
         self.entries[selected].error = None;
         self.entries[selected].baseline_unavailable = false;
@@ -141,16 +162,27 @@ impl QueueState {
             entry.package.approval = config.config().approved.get(&entry.package.name).cloned();
         }
         let entry = &self.entries[self.selected];
-        let mut app = App::new(ReviewSession {
+        let session = ReviewSession {
             package: entry.package.clone(),
             config,
-        })?;
+        };
+        let mut app = if let Some(index) = self
+            .cached_apps
+            .iter()
+            .position(|(index, _)| *index == self.selected)
+        {
+            let (_, mut app) = self.cached_apps.remove(index).expect("cached index exists");
+            app.refresh(session)?;
+            app
+        } else {
+            App::new(session)?
+        };
         app.queue_mode = true;
         app.decision = entry.decision;
         if entry.conflict {
             app.decision_blocked = Some("Multiple versions/sources share this name; one approval entry cannot represent all of them".into());
         }
-        let loader = if entry.conflict {
+        let loader = if entry.conflict || !matches!(app.baseline, Baseline::Loading(_)) {
             None
         } else {
             BaselineLoader::start(&app.session)?
@@ -167,7 +199,18 @@ impl QueueState {
         Ok((app, loader))
     }
 
-    pub fn poll(&mut self) {
+    fn retire_loader(&mut self) {
+        if let Some(loader) = self.loader.take() {
+            loader.cancel();
+            self.retired_loaders.push(loader);
+        }
+        // Drop only completed workers here. Remaining workers are joined on
+        // exit, after their cancellation path has killed/reaped Cargo.
+        self.retired_loaders.retain(|loader| !loader.is_finished());
+    }
+
+    pub fn poll(&mut self) -> bool {
+        self.retired_loaders.retain(|loader| !loader.is_finished());
         if let Some(baseline) = self.loader.as_ref().and_then(BaselineLoader::poll) {
             self.entries[self.selected].baseline_unavailable =
                 matches!(baseline, Baseline::Unavailable { .. });
@@ -178,8 +221,10 @@ impl QueueState {
                     self.app = None;
                 }
             }
-            self.loader = None;
+            self.retire_loader();
+            return true;
         }
+        false
     }
 
     pub fn navigate(&mut self, backwards: bool) {
@@ -228,7 +273,7 @@ impl QueueState {
         }
         self.entries[self.selected].decision = Some(decision);
         self.entries[self.selected].skipped = false;
-        self.loader = None;
+        self.retire_loader();
         Ok(self.advance())
     }
 
@@ -278,6 +323,137 @@ mod tests {
         let (root, metadata) = super::super::tests::fixture();
         let queue = ReviewQueue::from_metadata(&metadata).unwrap();
         (root, QueueState::new(queue))
+    }
+
+    #[test]
+    fn cached_views_preserve_rows_and_scroll_but_refresh_sources_and_approvals() {
+        let (root, mut state) = fixture();
+        let rows = state.app.as_ref().unwrap().file().rows.as_ptr();
+        state.app.as_mut().unwrap().set_viewport(1, 10);
+        state.app.as_mut().unwrap().scroll(1, 0);
+        let top = state.app.as_ref().unwrap().top;
+        state.navigate(false);
+        state.navigate(true);
+        assert_eq!(state.app.as_ref().unwrap().file().rows.as_ptr(), rows);
+        assert_eq!(state.app.as_ref().unwrap().top, top);
+
+        state.navigate(false);
+        fs::write(
+            root.path().join("deps/custom/scripts/custom.rs"),
+            "fn changed() {}\n",
+        )
+        .unwrap();
+        state.navigate(true);
+        let text = state.app.as_ref().unwrap().file().rows[0].text.to_string();
+        assert_eq!(text, "fn changed() {}");
+        assert_eq!(state.app.as_ref().unwrap().top, 0);
+
+        state.navigate(false);
+        fs::write(
+            root.path().join("approved-builds.toml"),
+            "[approved]\ncustom-script='2.0.0'\n",
+        )
+        .unwrap();
+        state.navigate(true);
+        assert!(state.app.as_ref().unwrap().is_current_version_approved());
+        assert!(matches!(
+            state.app.as_ref().unwrap().baseline,
+            Baseline::CurrentVersion
+        ));
+    }
+
+    #[test]
+    fn cached_baselines_do_not_restart_source_retrieval() {
+        use crate::review::sources::PackageSources;
+
+        let (_root, mut state) = fixture();
+        let app = state.app.as_mut().unwrap();
+        let version = "1.0.0".parse::<semver::Version>().unwrap();
+        app.session
+            .config
+            .set_approval("custom-script", ApprovedVersion::SemVer(version.clone()))
+            .unwrap();
+        app.session.package.approval = Some(ApprovedVersion::SemVer(version.clone()));
+        app.set_baseline(Baseline::Ready(PackageSources {
+            version,
+            scripts: vec![],
+        }))
+        .unwrap();
+        let rows = app.file().rows.as_ptr();
+        state.navigate(false);
+        state.navigate(true);
+        assert!(matches!(
+            state.app.as_ref().unwrap().baseline,
+            Baseline::Ready(_)
+        ));
+        assert_eq!(state.app.as_ref().unwrap().file().rows.as_ptr(), rows);
+        assert!(state.loader.is_none());
+    }
+
+    #[test]
+    fn cached_view_keeps_save_conflict_detection() {
+        let (root, mut state) = fixture();
+        state.navigate(false);
+        state.navigate(true);
+        let external = "[approved]\nother='1.0.0'\n";
+        fs::write(root.path().join("approved-builds.toml"), external).unwrap();
+        assert!(state.decide(Decision::Approve).is_err());
+        assert_eq!(
+            fs::read_to_string(root.path().join("approved-builds.toml")).unwrap(),
+            external
+        );
+    }
+
+    #[test]
+    fn view_cache_is_bounded() {
+        let (_root, metadata) = super::super::tests::fixture();
+        let mut queue = ReviewQueue::from_metadata(&metadata).unwrap();
+        let template = queue.packages[0].clone();
+        for index in 0..VIEW_CACHE_CAPACITY + 4 {
+            let mut package = template.clone();
+            package.name = format!("cache-fixture-{index}");
+            package.id.repr = format!("path+file:///cache-fixture-{index}#1.0.0");
+            queue.packages.push(package);
+        }
+        let mut state = QueueState::new(queue);
+        for _ in 0..state.entries.len() * 2 {
+            state.navigate(false);
+            assert!(state.cached_apps.len() <= VIEW_CACHE_CAPACITY);
+        }
+    }
+
+    #[test]
+    #[ignore = "manual navigation performance measurement"]
+    fn navigation_benchmark() {
+        let (root, metadata) = super::super::tests::fixture();
+        let code: String = (0..200).map(|i| format!("fn helper_{i}() {{ let message = \"build script input\"; println!(\"{{message}}\"); }}\n")).collect();
+        let queue = ReviewQueue::from_metadata(&metadata).unwrap();
+        for package in &queue.packages {
+            for script in &package.scripts {
+                fs::write(&script.path, &code).unwrap();
+            }
+        }
+        let cold_start = std::time::Instant::now();
+        let mut state = QueueState::new(queue);
+        for _ in 0..state.entries.len() {
+            state.navigate(false);
+        }
+        println!(
+            "First pass through {} packages: {:?}",
+            state.entries.len(),
+            cold_start.elapsed()
+        );
+        let start = std::time::Instant::now();
+        for _ in 0..40 {
+            state.navigate(false);
+        }
+        let elapsed = start.elapsed();
+        println!(
+            "40 package switches: {elapsed:?} ({:?}/switch)",
+            elapsed / 40
+        );
+        std::hint::black_box(&state.app);
+        drop(root);
     }
 
     #[test]

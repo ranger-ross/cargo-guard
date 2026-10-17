@@ -9,7 +9,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::{
     app::{App, Decision},
-    diff::{FileStatus, LineKind},
+    diff::FileStatus,
     queue::QueueState,
     sources::Baseline,
 };
@@ -39,22 +39,23 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
 pub fn render_queue(frame: &mut Frame, state: &mut QueueState) {
     let wide = frame.area().width >= 100;
-    let sidebar_width = state
-        .entries
-        .iter()
-        .map(|entry| format!("{} v{}", entry.package.name, entry.package.version).width() + 5)
-        .max()
-        .unwrap_or(24)
-        .clamp(24, 36) as u16;
+    let sidebar_width = state.sidebar_width;
     let [packages, review] = if wide {
         Layout::horizontal([Constraint::Length(sidebar_width), Constraint::Min(0)])
             .areas(frame.area())
     } else {
         Layout::vertical([Constraint::Length(4), Constraint::Min(0)]).areas(frame.area())
     };
+    let visible = usize::from(packages.height.saturating_sub(if wide { 1 } else { 2 })).max(1);
+    let start = state
+        .selected
+        .saturating_sub(visible / 2)
+        .min(state.entries.len().saturating_sub(visible));
     let items: Vec<_> = state
         .entries
         .iter()
+        .skip(start)
+        .take(visible)
         .map(|entry| {
             let (marker, color) = match entry.status() {
                 "approved" | "already approved" => ("✓", Color::Green),
@@ -89,7 +90,7 @@ pub fn render_queue(frame: &mut Frame, state: &mut QueueState) {
     frame.render_stateful_widget(
         list,
         packages,
-        &mut ListState::default().with_selected(Some(state.selected)),
+        &mut ListState::default().with_selected(Some(state.selected - start)),
     );
     if let Some(app) = &mut state.app {
         render_area(frame, app, review);
@@ -243,16 +244,8 @@ fn render_area(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 
     let file = app.file();
-    let added = file
-        .rows
-        .iter()
-        .filter(|row| row.kind == LineKind::Addition)
-        .count();
-    let removed = file
-        .rows
-        .iter()
-        .filter(|row| row.kind == LineKind::Deletion)
-        .count();
+    let added = file.additions;
+    let removed = file.deletions;
     let mut label = vec![Span::styled(
         format!("  {}", file.path.display()),
         Style::default().add_modifier(Modifier::BOLD),
@@ -282,16 +275,7 @@ fn render_area(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(label)), title);
 
     let comparing = app.file().status != FileStatus::Current;
-    let digits = app
-        .file()
-        .rows
-        .iter()
-        .flat_map(|row| [row.old_number, row.new_number])
-        .flatten()
-        .max()
-        .unwrap_or(1)
-        .to_string()
-        .len();
+    let digits = app.file().number_width;
     let gutter_width = if comparing {
         digits * 2 + 4
     } else {
@@ -326,9 +310,18 @@ fn render_area(frame: &mut Frame, app: &mut App, area: Rect) {
             gutter_row,
         );
         frame.render_widget(
-            Paragraph::new(row.text.clone())
-                .style(row.kind.style())
-                .scroll((0, app.left)),
+            Paragraph::new(
+                Line::from(
+                    row.text
+                        .spans
+                        .iter()
+                        .map(|span| Span::styled(span.content.as_ref(), span.style))
+                        .collect::<Vec<_>>(),
+                )
+                .style(row.text.style),
+            )
+            .style(row.kind.style())
+            .scroll((0, app.left)),
             code_row,
         );
     }
@@ -467,6 +460,7 @@ fn render_help(frame: &mut Frame, app: &App) {
 mod tests {
     use super::*;
     use crate::review::app::tests::fixture;
+    use crate::review::diff::LineKind;
     use ratatui::{Terminal, backend::TestBackend};
 
     fn screen(terminal: &Terminal<TestBackend>) -> String {

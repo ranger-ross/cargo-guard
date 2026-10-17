@@ -26,18 +26,28 @@ pub fn run(session: ReviewSession) -> eyre::Result<()> {
     let _restore = RestoreTerminal;
     // Ratatui installs a panic hook which restores before printing the panic.
     let mut terminal = ratatui::try_init().context("could not initialize review terminal")?;
+    let mut dirty = true;
     loop {
         if let Some(baseline) = loader.as_ref().and_then(BaselineLoader::poll) {
             app.set_baseline(baseline)?;
             loader = None;
+            dirty = true;
         }
-        terminal
-            .draw(|frame| ui::render(frame, &mut app))
-            .context("could not render review")?;
+        if dirty {
+            terminal
+                .draw(|frame| ui::render(frame, &mut app))
+                .context("could not render review")?;
+            dirty = false;
+        }
         if !event::poll(Duration::from_millis(100)).context("could not poll terminal events")? {
             continue;
         }
-        if let Event::Key(key) = event::read().context("could not read terminal event")? {
+        let event = event::read().context("could not read terminal event")?;
+        if matches!(event, Event::Resize(..)) {
+            dirty = true;
+        }
+        if let Event::Key(key) = event {
+            dirty = true;
             let decision = match input::handle_key(&mut app, key) {
                 Action::Quit => break,
                 Action::Approve => Decision::Approve,
@@ -68,17 +78,26 @@ pub fn run_queue(queue: ReviewQueue) -> eyre::Result<()> {
     {
         let _restore = RestoreTerminal;
         let mut terminal = ratatui::try_init().context("could not initialize review terminal")?;
+        let mut dirty = true;
         loop {
-            state.poll();
-            terminal
-                .draw(|frame| ui::render_queue(frame, &mut state))
-                .context("could not render review queue")?;
+            dirty |= state.poll();
+            if dirty {
+                terminal
+                    .draw(|frame| ui::render_queue(frame, &mut state))
+                    .context("could not render review queue")?;
+                dirty = false;
+            }
             if !event::poll(Duration::from_millis(100)).context("could not poll terminal events")? {
                 continue;
             }
-            let Event::Key(key) = event::read().context("could not read terminal event")? else {
+            let event = event::read().context("could not read terminal event")?;
+            if matches!(event, Event::Resize(..)) {
+                dirty = true;
+            }
+            let Event::Key(key) = event else {
                 continue;
             };
+            dirty = true;
             match state.handle_key(key) {
                 Action::Quit => break,
                 Action::NextPackage => state.navigate(false),

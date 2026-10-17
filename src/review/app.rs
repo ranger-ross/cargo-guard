@@ -42,25 +42,7 @@ pub struct App {
 impl App {
     pub fn new(session: ReviewSession) -> eyre::Result<Self> {
         let highlighter = Highlighter::new()?;
-        let root = session.package.manifest_path.parent();
-        let current = session
-            .package
-            .scripts
-            .iter()
-            .map(|script| {
-                let contents = fs::read_to_string(&script.path).with_context(|| {
-                    format!("could not read build script {}", script.path.display())
-                })?;
-                let path = root
-                    .and_then(|root| script.path.strip_prefix(root).ok())
-                    .unwrap_or(&script.path);
-                Ok(ScriptSource {
-                    path: path.to_path_buf(),
-                    contents,
-                })
-            })
-            .collect::<eyre::Result<Vec<_>>>()?;
-        eyre::ensure!(!current.is_empty(), "no build scripts to display");
+        let current = read_sources(&session)?;
         let baseline = Baseline::for_session(&session);
         let files = diff::build_files(&current, &baseline, &highlighter)?;
         Ok(Self {
@@ -85,6 +67,24 @@ impl App {
 
     pub fn file(&self) -> &ReviewFile {
         &self.files[self.selected]
+    }
+
+    /// Reuse expensive highlighted/diffed rows, but always refresh the edit
+    /// snapshot and compare source contents before displaying a cached view.
+    pub fn refresh(&mut self, session: ReviewSession) -> eyre::Result<()> {
+        let current = read_sources(&session)?;
+        let invalidated =
+            current != self.current || session.package.approval != self.session.package.approval;
+        if invalidated || matches!(self.baseline, Baseline::Unavailable { .. }) {
+            let baseline = Baseline::for_session(&session);
+            let files = diff::build_files(&current, &baseline, &self.highlighter)?;
+            self.replace_files(baseline, files);
+        }
+        self.current = current;
+        self.session = session;
+        self.show_help = false;
+        self.notice = None;
+        Ok(())
     }
 
     pub fn set_baseline(&mut self, baseline: Baseline) -> eyre::Result<()> {
@@ -310,6 +310,29 @@ impl App {
         self.top = 0;
         self.left = 0;
     }
+}
+
+fn read_sources(session: &ReviewSession) -> eyre::Result<Vec<ScriptSource>> {
+    let root = session.package.manifest_path.parent();
+    let current = session
+        .package
+        .scripts
+        .iter()
+        .map(|script| {
+            let contents = fs::read_to_string(&script.path).with_context(|| {
+                format!("could not read build script {}", script.path.display())
+            })?;
+            let path = root
+                .and_then(|root| script.path.strip_prefix(root).ok())
+                .unwrap_or(&script.path);
+            Ok(ScriptSource {
+                path: path.to_path_buf(),
+                contents,
+            })
+        })
+        .collect::<eyre::Result<Vec<_>>>()?;
+    eyre::ensure!(!current.is_empty(), "no build scripts to display");
+    Ok(current)
 }
 
 #[cfg(test)]

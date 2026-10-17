@@ -61,6 +61,9 @@ pub struct ReviewFile {
     pub rows: Vec<DiffLine>,
     pub width: usize,
     pub changes: Vec<usize>,
+    pub additions: usize,
+    pub deletions: usize,
+    pub number_width: usize,
 }
 
 pub fn build_files(
@@ -185,6 +188,16 @@ fn build_file(
     }
     Ok(ReviewFile {
         label: format!("{} [{description}]", path.display()),
+        additions: added,
+        deletions: removed,
+        number_width: rows
+            .iter()
+            .flat_map(|row| [row.old_number, row.new_number])
+            .flatten()
+            .max()
+            .unwrap_or(1)
+            .to_string()
+            .len(),
         path,
         status,
         width: rows.iter().map(|row| row.text.width()).max().unwrap_or(0),

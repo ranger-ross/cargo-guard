@@ -23,7 +23,7 @@ pub struct PackageSources {
     pub scripts: Vec<ScriptSource>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ScriptSource {
     pub path: PathBuf,
     pub contents: String,
@@ -284,11 +284,19 @@ impl BaselineLoader {
     pub fn poll(&self) -> Option<Baseline> {
         self.receiver.try_recv().ok()
     }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.worker.as_ref().is_none_or(JoinHandle::is_finished)
+    }
 }
 
 impl Drop for BaselineLoader {
     fn drop(&mut self) {
-        self.cancelled.store(true, Ordering::Relaxed);
+        self.cancel();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }

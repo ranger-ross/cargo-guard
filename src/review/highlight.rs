@@ -1,3 +1,5 @@
+use std::sync::LazyLock;
+
 use eyre::{Context, ContextCompat};
 use ratatui::{
     style::{Color, Style},
@@ -11,20 +13,26 @@ use syntect::{
 };
 use unicode_width::UnicodeWidthChar;
 
-/// Syntax/theme data is shared across files; parser state is fresh per file.
+static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
+static THEMES: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
+
+/// Share syntax data and compiled regexes across the entire review session.
+/// Parser state remains fresh for each source file.
 pub struct Highlighter {
-    syntaxes: SyntaxSet,
-    theme: Theme,
+    syntaxes: &'static SyntaxSet,
+    theme: &'static Theme,
 }
 
 impl Highlighter {
     pub fn new() -> eyre::Result<Self> {
-        let syntaxes = SyntaxSet::load_defaults_newlines();
-        let theme = ThemeSet::load_defaults()
+        let theme = THEMES
             .themes
-            .remove("base16-eighties.dark")
+            .get("base16-eighties.dark")
             .context("bundled syntax theme is missing")?;
-        Ok(Self { syntaxes, theme })
+        Ok(Self {
+            syntaxes: &SYNTAXES,
+            theme,
+        })
     }
 
     pub fn highlight(&self, source: &str) -> eyre::Result<Vec<Line<'static>>> {
@@ -32,13 +40,13 @@ impl Highlighter {
             .syntaxes
             .find_syntax_by_extension("rs")
             .context("bundled Rust syntax is missing")?;
-        let mut highlighter = HighlightLines::new(syntax, &self.theme);
+        let mut highlighter = HighlightLines::new(syntax, self.theme);
         let mut lines = Vec::new();
         // Parse the complete file before selecting viewport lines. In particular,
         // scrolling into a multiline string/comment must retain its context.
         for line in LinesWithEndings::from(source) {
             let tokens = highlighter
-                .highlight_line(line, &self.syntaxes)
+                .highlight_line(line, self.syntaxes)
                 .context("could not highlight Rust source")?;
             let mut column = 0;
             let spans = tokens
