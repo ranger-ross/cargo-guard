@@ -11,7 +11,8 @@ pub struct Config {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum ApprovedVersion {
-    SemVer(String),
+    SemVer(semver::Version),
+    Fingerprint(String),
 }
 
 pub fn load_config() -> eyre::Result<Config> {
@@ -54,4 +55,35 @@ fn determine_workspace_root() -> eyre::Result<PathBuf> {
         .context("could not determine cargo workspace root")?;
 
     Ok(metadata.workspace_root.into_std_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_versions_and_fingerprints_and_round_trips() {
+        let hash = "7c22171135c52f3285ec525c724cf784149707b935293dd6d158eff15b7bd3e8";
+        let source = format!(
+            "[approved]\nfoo = \"1.0.0\"\nbar = \"{hash}\"\npreview = \"2.0.0-rc.1+build.2\"\n"
+        );
+        let config: Config = toml::from_str(&source).unwrap();
+        for config in [
+            toml::from_str::<Config>(&toml::to_string(&config).unwrap()).unwrap(),
+            config,
+        ] {
+            assert!(matches!(
+                &config.approved["foo"],
+                ApprovedVersion::SemVer(version) if version == &semver::Version::new(1, 0, 0)
+            ));
+            assert!(matches!(
+                &config.approved["bar"],
+                ApprovedVersion::Fingerprint(value) if value == hash
+            ));
+            assert!(matches!(
+                &config.approved["preview"],
+                ApprovedVersion::SemVer(version) if version.to_string() == "2.0.0-rc.1+build.2"
+            ));
+        }
+    }
 }

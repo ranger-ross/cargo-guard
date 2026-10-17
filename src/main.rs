@@ -2,9 +2,13 @@ use std::{env, process::Command};
 
 use eyre::Context;
 
-use crate::config::{ApprovedVersion, load_config};
+use crate::{
+    config::{ApprovedVersion, load_config},
+    fingerprint::BuildScriptFingerprint,
+};
 
 mod config;
+mod fingerprint;
 
 fn main() {
     if let Err(error) = run() {
@@ -17,46 +21,56 @@ fn main() {
 }
 
 fn run() -> eyre::Result<()> {
-    let build_script = BuildScriptVersion::current()?;
-
-    let config = load_config()?;
-
-    eyre::ensure!(
-        matches!(
-            config.approved.get(&build_script.name),
-            Some(ApprovedVersion::SemVer(version)) if version == &build_script.version
-        ),
-        "build script for {0} v{1} is not approved\n\n\
-         To approve it, add this entry under [approved] in approved-builds.toml:\n\n  \
-         {0} = \"{1}\"",
-        build_script.name,
-        build_script.version
-    );
-
     let mut args = env::args_os().skip(1);
     let binary = args.next().ok_or_else(|| {
         eyre::eyre!("expected the build script binary path as the first argument")
     })?;
+    let build_script = BuildScriptFingerprint::current(std::path::Path::new(&binary))?;
+
+    let config = load_config()?;
+
+    match config.approved.get(&build_script.name) {
+        Some(ApprovedVersion::SemVer(version)) => {
+            eyre::ensure!(
+                version.to_string() == build_script.version,
+                "build script for {0} v{1} is not approved: version mismatch\n\n\
+                 Approved version: {2}\n\
+                 Current version:  {1}\n\n\
+                 To approve this version, update the entry under [approved] in approved-builds.toml:\n\n  \
+                 {0} = \"{1}\"",
+                build_script.name,
+                build_script.version,
+                version,
+            );
+        }
+        Some(ApprovedVersion::Fingerprint(approved)) => {
+            let current = build_script.fingerprint()?;
+            eyre::ensure!(
+                approved == &current,
+                "build script for {0} v{1} is not approved: fingerprint mismatch\n\n\
+                 Approved fingerprint: {2}\n\
+                 Current fingerprint:  {3}\n\n\
+                 To approve this fingerprint, update the entry under [approved] in approved-builds.toml:\n\n  \
+                 {0} = \"{3}\"",
+                build_script.name,
+                build_script.version,
+                approved,
+                current,
+            );
+        }
+        None => eyre::bail!(
+            "build script for {0} v{1} is not approved: no approval entry\n\n\
+             To approve this version, add this entry under [approved] in approved-builds.toml:\n\n  \
+             {0} = \"{1}\"",
+            build_script.name,
+            build_script.version,
+        ),
+    }
+
     let status = Command::new(&binary)
         .args(args)
         .status()
         .with_context(|| format!("could not run build script {}", binary.to_string_lossy()))?;
 
     std::process::exit(status.code().unwrap_or(1));
-}
-
-#[derive(Debug)]
-struct BuildScriptVersion {
-    name: String,
-    version: String,
-    // TODO: Hash?
-}
-
-impl BuildScriptVersion {
-    pub fn current() -> eyre::Result<Self> {
-        Ok(Self {
-            name: env::var("CARGO_PKG_NAME").context("could not read CARGO_PKG_NAME")?,
-            version: env::var("CARGO_PKG_VERSION").context("could not read CARGO_PKG_VERSION")?,
-        })
-    }
 }
