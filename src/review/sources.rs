@@ -89,62 +89,55 @@ struct SourceRequest {
     workspace_root: PathBuf,
 }
 
-/// Fetching is separate from presentation. Providers return plain source text;
-/// they never compile the package or execute any of its build scripts.
-trait SourceProvider {
-    fn load(&self, request: &SourceRequest, cancelled: &AtomicBool)
-    -> eyre::Result<PackageSources>;
-}
+/// Load source text without compiling the package or executing build scripts.
+fn load_sources(request: &SourceRequest, cancelled: &AtomicBool) -> eyre::Result<PackageSources> {
+    let index = registry_index(request.source.as_deref())?;
+    let temporary = tempfile::tempdir().context("could not create baseline workspace")?;
+    let manifest_path = temporary.path().join("Cargo.toml");
+    fs::write(&manifest_path, baseline_manifest(request))?;
+    fs::write(temporary.path().join("lib.rs"), "")?;
 
-struct CargoSourceProvider;
-
-impl SourceProvider for CargoSourceProvider {
-    fn load(
-        &self,
-        request: &SourceRequest,
-        cancelled: &AtomicBool,
-    ) -> eyre::Result<PackageSources> {
-        let index = registry_index(request.source.as_deref())?;
-        let temporary = tempfile::tempdir().context("could not create baseline workspace")?;
-        let manifest_path = temporary.path().join("Cargo.toml");
-        fs::write(&manifest_path, baseline_manifest(request))?;
-        fs::write(temporary.path().join("lib.rs"), "")?;
-
-        let registry = format!(
-            "registries.cargo-guard-review.index={}",
-            toml::Value::String(index.to_owned())
-        );
-        let options = vec![
-            "--color".into(),
-            "never".into(),
-            "--config".into(),
-            registry,
-        ];
-        let mut command = MetadataCommand::new();
-        command
-            .manifest_path(&manifest_path)
-            .current_dir(&request.workspace_root);
-        // Use Cargo's cache and source configuration; do not assume a particular
-        // registry cache layout or download/extract unverified archives ourselves.
-        let mut offline = options.clone();
-        offline.push("--offline".into());
-        command.other_options(offline);
-        let metadata = match execute_metadata(&command, cancelled) {
-            Ok(metadata) => metadata,
-            Err(_) if !cancelled.load(Ordering::Relaxed) => {
-                command.other_options(options);
-                execute_metadata(&command, cancelled)
-                    .context("could not retrieve the approved release (it may be unavailable or not cached while offline)")?
-            }
-            Err(error) => return Err(error),
-        };
-        let package = metadata.packages.iter().find(|package| {
+    let registry = format!(
+        "registries.cargo-guard-review.index={}",
+        toml::Value::String(index.to_owned())
+    );
+    let options = vec![
+        "--color".into(),
+        "never".into(),
+        "--config".into(),
+        registry,
+    ];
+    let mut command = MetadataCommand::new();
+    command
+        .manifest_path(&manifest_path)
+        .current_dir(&request.workspace_root);
+    // Use Cargo's cache and source configuration; do not assume a particular
+    // registry cache layout or download/extract unverified archives ourselves.
+    let mut offline = options.clone();
+    offline.push("--offline".into());
+    command.other_options(offline);
+    let metadata = match execute_metadata(&command, cancelled) {
+        Ok(metadata) => metadata,
+        Err(_) if !cancelled.load(Ordering::Relaxed) => {
+            command.other_options(options);
+            execute_metadata(&command, cancelled)
+                .context("could not retrieve the approved release (it may be unavailable or not cached while offline)")?
+        }
+        Err(error) => return Err(error),
+    };
+    let package = metadata
+        .packages
+        .iter()
+        .find(|package| {
             package.name.as_str() == request.name
                 && package.version == request.version
-                && package.source.as_ref().map(|source| source.repr.as_str()) == request.source.as_deref()
-        }).context("Cargo did not return the exact approved package version from the original registry")?;
-        read_package_sources(package)
-    }
+                && package.source.as_ref().map(|source| source.repr.as_str())
+                    == request.source.as_deref()
+        })
+        .context(
+            "Cargo did not return the exact approved package version from the original registry",
+        )?;
+    read_package_sources(package)
 }
 
 fn registry_index(source: Option<&str>) -> eyre::Result<&str> {
@@ -271,7 +264,7 @@ impl BaselineLoader {
         let worker = thread::Builder::new()
             .name("approved-sources".into())
             .spawn(move || {
-                let result = CargoSourceProvider.load(&request, &worker_cancelled);
+                let result = load_sources(&request, &worker_cancelled);
                 let baseline = match result {
                     Ok(sources) => Baseline::Ready(sources),
                     Err(error) => Baseline::Unavailable {
@@ -353,9 +346,7 @@ mod tests {
             source: Some("sparse+http://127.0.0.1:9/cargo-guard-test-index/".into()),
             workspace_root: root.path().to_path_buf(),
         };
-        let error = CargoSourceProvider
-            .load(&request, &AtomicBool::new(false))
-            .unwrap_err();
+        let error = load_sources(&request, &AtomicBool::new(false)).unwrap_err();
         let message = format!("{error:#}");
         assert!(
             message.contains("could not retrieve the approved release"),
