@@ -17,7 +17,7 @@ fn main() {
     let args = Args::parse_args();
     let is_runner = matches!(&args.command, GuardCommand::BuildScript(_));
     let result = match args.command {
-        GuardCommand::Review { package } => review::run(package.as_deref()),
+        GuardCommand::Review { package, options } => review::run(package.as_deref(), &options),
         GuardCommand::BuildScript(args) => run(&args),
     };
     if let Err(error) = result {

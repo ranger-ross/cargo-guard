@@ -1,12 +1,16 @@
 use std::path::PathBuf;
 
-use cargo_metadata::{Metadata, MetadataCommand, PackageId, Source};
-use eyre::{Context, ContextCompat};
+use cargo_metadata::{Metadata, Package, PackageId, Source};
+use eyre::Context;
 
-use crate::config::{ApprovedVersion, edit::ConfigFile};
+use crate::{
+    args::ReviewOptions,
+    config::{ApprovedVersion, edit::ConfigFile},
+};
 
 mod app;
 mod diff;
+mod discovery;
 mod highlight;
 mod input;
 mod sources;
@@ -35,24 +39,25 @@ pub struct BuildScript {
     pub path: PathBuf,
 }
 
-pub fn run(package: Option<&str>) -> eyre::Result<()> {
-    let name = package.context(
-        "reviewing all packages is not implemented yet; use `cargo guard review <PACKAGE>`",
-    )?;
+pub fn run(package: Option<&str>, options: &ReviewOptions) -> eyre::Result<()> {
     // Full metadata includes dependency packages, not just workspace members.
     // This resolves/downloads sources but does not compile or execute scripts.
-    let metadata = MetadataCommand::new()
+    let metadata = discovery::metadata_command(options)
         .exec()
         .context("could not load workspace metadata for review")?;
-    let session = ReviewSession::from_metadata(&metadata, name)?;
-    tui::run(session)
+    if let Some(name) = package {
+        tui::run(ReviewSession::from_metadata(&metadata, name)?)
+    } else {
+        let queue = discovery::ReviewQueue::from_metadata(&metadata)?;
+        queue.print();
+        Ok(())
+    }
 }
 
 impl ReviewSession {
     fn from_metadata(metadata: &Metadata, name: &str) -> eyre::Result<Self> {
-        let mut candidates: Vec<_> = metadata
-            .packages
-            .iter()
+        let mut candidates: Vec<_> = discovery::resolved_packages(metadata)?
+            .into_iter()
             .filter(|package| package.name.as_str() == name)
             .collect();
         candidates.sort_by(|a, b| {
@@ -74,6 +79,21 @@ impl ReviewSession {
                 .join("\n")
         );
         let package = candidates[0];
+        // Review discovers the consuming workspace itself, rather than relying
+        // on build-runner environment variables or a dependency's manifest dir.
+        let config = ConfigFile::for_workspace(metadata.workspace_root.as_std_path())?;
+        let package = ReviewPackage::from_package(package, &config);
+        eyre::ensure!(
+            !package.scripts.is_empty(),
+            "package `{name}` v{} has no build scripts",
+            package.version
+        );
+        Ok(Self { package, config })
+    }
+}
+
+impl ReviewPackage {
+    fn from_package(package: &Package, config: &ConfigFile) -> Self {
         let mut scripts: Vec<_> = package
             .targets
             .iter()
@@ -84,33 +104,22 @@ impl ReviewSession {
             })
             .collect();
         scripts.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.name.cmp(&b.name)));
-        eyre::ensure!(
-            !scripts.is_empty(),
-            "package `{name}` v{} has no build scripts",
-            package.version
-        );
-
-        // Review discovers the consuming workspace itself, rather than relying
-        // on build-runner environment variables or a dependency's manifest dir.
-        let config = ConfigFile::for_workspace(metadata.workspace_root.as_std_path())?;
-        let approval = config.config().approved.get(name).cloned();
-        Ok(Self {
-            package: ReviewPackage {
-                id: package.id.clone(),
-                name: package.name.to_string(),
-                version: package.version.clone(),
-                source: package.source.clone(),
-                manifest_path: package.manifest_path.clone().into_std_path_buf(),
-                approval,
-                scripts,
-            },
-            config,
-        })
+        let approval = config.config().approved.get(package.name.as_str()).cloned();
+        Self {
+            id: package.id.clone(),
+            name: package.name.to_string(),
+            version: package.version.clone(),
+            source: package.source.clone(),
+            manifest_path: package.manifest_path.clone().into_std_path_buf(),
+            approval,
+            scripts,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use cargo_metadata::MetadataCommand;
     use std::{fs, path::Path};
 
     use super::*;
@@ -121,7 +130,7 @@ mod tests {
         fs::write(path, content).unwrap();
     }
 
-    fn fixture() -> (tempfile::TempDir, Metadata) {
+    pub(super) fn fixture() -> (tempfile::TempDir, Metadata) {
         let root = tempfile::tempdir().unwrap();
         write(
             root.path(),

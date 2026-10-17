@@ -15,11 +15,29 @@ pub enum Command {
     Review {
         /// Package to review; omit to review all packages
         package: Option<String>,
+        #[command(flatten)]
+        options: ReviewOptions,
     },
     // Cargo's host runner invokes us with an executable path followed by
     // arbitrary arguments. Clap leaves those arguments uninterpreted.
     #[command(external_subcommand)]
     BuildScript(Vec<OsString>),
+}
+
+#[derive(Clone, Debug, Default, clap::Args)]
+pub struct ReviewOptions {
+    /// Filter metadata to this target triple (default: all platforms)
+    #[arg(long)]
+    pub target: Option<String>,
+    /// Workspace features to enable (comma/space separated; may be repeated)
+    #[arg(long, short = 'F', value_delimiter = ',')]
+    pub features: Vec<String>,
+    /// Enable all features
+    #[arg(long)]
+    pub all_features: bool,
+    /// Disable default features
+    #[arg(long)]
+    pub no_default_features: bool,
 }
 
 impl Args {
@@ -58,15 +76,41 @@ mod tests {
         ] {
             assert!(matches!(
                 Args::try_parse_args_from(args).unwrap().command,
-                Command::Review { package: Some(name) } if name == "example"
+                Command::Review { package: Some(name), .. } if name == "example"
             ));
         }
         assert!(matches!(
             Args::try_parse_args_from(["cargo-guard", "guard", "review"])
                 .unwrap()
                 .command,
-            Command::Review { package: None }
+            Command::Review { package: None, .. }
         ));
+    }
+
+    #[test]
+    fn parses_review_target_and_feature_selection() {
+        let args = Args::try_parse_args_from([
+            "cargo-guard",
+            "guard",
+            "review",
+            "example",
+            "--target",
+            "x86_64-unknown-linux-gnu",
+            "--features",
+            "one,two",
+            "-F",
+            "three four",
+            "--all-features",
+            "--no-default-features",
+        ])
+        .unwrap();
+        let Command::Review { package, options } = args.command else {
+            panic!("expected review")
+        };
+        assert_eq!(package.as_deref(), Some("example"));
+        assert_eq!(options.target.as_deref(), Some("x86_64-unknown-linux-gnu"));
+        assert_eq!(options.features, ["one", "two", "three four"]);
+        assert!(options.all_features && options.no_default_features);
     }
 
     #[test]
