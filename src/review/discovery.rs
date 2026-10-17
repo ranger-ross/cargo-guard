@@ -84,6 +84,7 @@ impl ReviewQueue {
         let config = ConfigFile::for_workspace(metadata.workspace_root.as_std_path())?;
         let packages: Vec<_> = resolved_packages(metadata)?
             .into_iter()
+            .filter(|package| !crate::workspace::is_member(metadata, package))
             .filter(|package| {
                 package
                     .targets
@@ -204,7 +205,6 @@ mod tests {
                 "build-only",
                 "default-script",
                 "dev-only",
-                "member",
                 "shared",
                 "unix-script",
                 "windows-script"
@@ -232,7 +232,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(all.packages.len(), 8);
+        assert_eq!(all.packages.len(), 7);
         assert!(!root.path().join("approved-builds.toml").exists());
         assert!(!root.path().join("target").exists());
     }

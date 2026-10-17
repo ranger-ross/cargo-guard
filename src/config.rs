@@ -37,7 +37,7 @@ pub fn load_config_from(path: &Path) -> eyre::Result<Config> {
     toml::from_str(&contents).with_context(|| format!("could not parse config {}", path.display()))
 }
 
-fn determine_workspace_root() -> eyre::Result<PathBuf> {
+pub fn determine_workspace_root() -> eyre::Result<PathBuf> {
     // A build-script runner's working directory belongs to the dependency,
     // not the workspace that is building it. Cargo config must supply the root.
     if let Some(root) = env::var_os("CARGO_GUARD_WORKSPACE_ROOT") {

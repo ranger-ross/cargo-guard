@@ -12,6 +12,7 @@ mod args;
 mod config;
 mod fingerprint;
 mod review;
+mod workspace;
 
 fn main() {
     let args = Args::parse_args();
@@ -37,7 +38,23 @@ fn run(args: &[OsString]) -> eyre::Result<()> {
     let (binary, args) = args.split_first().ok_or_else(|| {
         eyre::eyre!("expected the build script binary path as the first argument")
     })?;
-    let build_script = BuildScriptFingerprint::current(Path::new(binary))?;
+    let root = config::determine_workspace_root()?;
+    let manifest = std::env::var_os("CARGO_MANIFEST_PATH")
+        .ok_or_else(|| eyre::eyre!("could not read CARGO_MANIFEST_PATH"))?;
+    if !workspace::contains_manifest(&root, Path::new(&manifest))? {
+        check_approval(Path::new(binary))?;
+    }
+
+    let status = Command::new(binary)
+        .args(args)
+        .status()
+        .with_context(|| format!("could not run build script {}", binary.to_string_lossy()))?;
+
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+fn check_approval(binary: &Path) -> eyre::Result<()> {
+    let build_script = BuildScriptFingerprint::current(binary)?;
 
     let config = load_config()?;
 
@@ -79,10 +96,5 @@ fn run(args: &[OsString]) -> eyre::Result<()> {
         ),
     }
 
-    let status = Command::new(binary)
-        .args(args)
-        .status()
-        .with_context(|| format!("could not run build script {}", binary.to_string_lossy()))?;
-
-    std::process::exit(status.code().unwrap_or(1));
+    Ok(())
 }

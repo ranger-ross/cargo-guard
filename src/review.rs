@@ -47,6 +47,21 @@ pub fn run(package: Option<&str>, options: &ReviewOptions) -> eyre::Result<()> {
         .exec()
         .context("could not load workspace metadata for review")?;
     if let Some(name) = package {
+        let candidates = discovery::resolved_packages(&metadata)?;
+        let named: Vec<_> = candidates
+            .into_iter()
+            .filter(|p| p.name.as_str() == name)
+            .collect();
+        if !named.is_empty()
+            && named
+                .iter()
+                .all(|p| crate::workspace::is_member(&metadata, p))
+        {
+            println!(
+                "Package `{name}` belongs to the current workspace; its build scripts do not require approval."
+            );
+            return Ok(());
+        }
         tui::run(ReviewSession::from_metadata(&metadata, name)?)
     } else {
         let queue = discovery::ReviewQueue::from_metadata(&metadata)?;
@@ -59,6 +74,7 @@ impl ReviewSession {
         let mut candidates: Vec<_> = discovery::resolved_packages(metadata)?
             .into_iter()
             .filter(|package| package.name.as_str() == name)
+            .filter(|package| !crate::workspace::is_member(metadata, package))
             .collect();
         candidates.sort_by(|a, b| {
             a.version

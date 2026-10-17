@@ -67,7 +67,7 @@ pub fn run(session: ReviewSession) -> eyre::Result<()> {
 
 pub fn run_queue(queue: ReviewQueue) -> eyre::Result<()> {
     if queue.packages.is_empty() {
-        println!("No build scripts found in the selected dependency graph.");
+        println!("No dependency build scripts to review in the selected dependency graph.");
         return Ok(());
     }
     eyre::ensure!(
