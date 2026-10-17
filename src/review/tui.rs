@@ -51,6 +51,7 @@ pub fn run(session: ReviewSession) -> eyre::Result<()> {
             let decision = match input::handle_key(&mut app, key) {
                 Action::Quit => break,
                 Action::Approve => Decision::Approve,
+                Action::ApproveFingerprint => Decision::ApproveFingerprint,
                 Action::Reject => Decision::Reject,
                 Action::Continue | Action::NextPackage | Action::PreviousPackage | Action::Skip => {
                     continue;
@@ -107,9 +108,11 @@ pub fn run_queue(queue: ReviewQueue) -> eyre::Result<()> {
                         break;
                     }
                 }
-                action @ (Action::Approve | Action::Reject) => {
+                action @ (Action::Approve | Action::ApproveFingerprint | Action::Reject) => {
                     let decision = if action == Action::Approve {
                         Decision::Approve
+                    } else if action == Action::ApproveFingerprint {
+                        Decision::ApproveFingerprint
                     } else {
                         Decision::Reject
                     };

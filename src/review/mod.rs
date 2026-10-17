@@ -11,6 +11,7 @@ use crate::{
 mod app;
 mod diff;
 mod discovery;
+mod fingerprint;
 mod highlight;
 mod input;
 mod queue;

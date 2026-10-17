@@ -36,7 +36,6 @@ impl BuildScriptFingerprint {
             return Ok(fingerprint.clone());
         }
 
-        let manifest = read_manifest(&self.manifest_path)?;
         let manifest_dir = self
             .manifest_path
             .parent()
@@ -44,40 +43,49 @@ impl BuildScriptFingerprint {
         let dep_info = fs::read_to_string(&self.dep_info_path)
             .with_context(|| format!("could not read dep-info {}", self.dep_info_path.display()))?;
 
-        let mut dependencies = manifest.clone();
-        // Resolve inherited declarations, while retaining declared version
-        // requirements rather than claiming to pin lockfile-resolved versions.
-        let needs_workspace = dependency_tables(&manifest).iter().any(|(_, table)| {
-            table.as_table().is_some_and(|table| {
-                table
-                    .values()
-                    .any(|dep| dep.get("workspace").and_then(toml::Value::as_bool) == Some(true))
-            })
-        });
-        if needs_workspace {
-            let metadata = cargo_metadata::MetadataCommand::new()
-                .manifest_path(&self.manifest_path)
-                .no_deps()
-                .exec()
-                .context("could not resolve workspace build dependencies")?;
-            let workspace =
-                read_manifest(metadata.workspace_root.join("Cargo.toml").as_std_path())?;
-            inherit_dependencies(&mut dependencies, &workspace)?;
-        }
-
         let dep_info_root = env::var_os("CARGO_GUARD_WORKSPACE_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| manifest_dir.to_path_buf());
-        let fingerprint = fingerprint_inputs(
-            &manifest,
-            &dependencies,
-            manifest_dir,
-            &dep_info,
-            &dep_info_root,
-        )?;
+        let fingerprint = from_dep_info(&self.manifest_path, &dep_info, &dep_info_root)?;
         *self.fingerprint.borrow_mut() = Some(fingerprint.clone());
         Ok(fingerprint)
     }
+}
+
+pub(crate) fn from_dep_info(
+    manifest_path: &Path,
+    dep_info: &str,
+    dep_info_root: &Path,
+) -> eyre::Result<String> {
+    let manifest = read_manifest(manifest_path)?;
+    let manifest_dir = manifest_path.parent().context("manifest has no parent")?;
+    let mut dependencies = manifest.clone();
+    // Resolve inherited declarations, while retaining declared version
+    // requirements rather than claiming to pin lockfile-resolved versions.
+    let needs_workspace = dependency_tables(&manifest).iter().any(|(_, table)| {
+        table.as_table().is_some_and(|table| {
+            table
+                .values()
+                .any(|dep| dep.get("workspace").and_then(toml::Value::as_bool) == Some(true))
+        })
+    });
+    if needs_workspace {
+        let metadata = cargo_metadata::MetadataCommand::new()
+            .manifest_path(manifest_path)
+            .no_deps()
+            .exec()
+            .context("could not resolve workspace build dependencies")?;
+        let workspace = read_manifest(metadata.workspace_root.join("Cargo.toml").as_std_path())?;
+        inherit_dependencies(&mut dependencies, &workspace)?;
+    }
+
+    fingerprint_inputs(
+        &manifest,
+        &dependencies,
+        manifest_dir,
+        dep_info,
+        dep_info_root,
+    )
 }
 
 fn read_manifest(path: &Path) -> eyre::Result<toml::Value> {
@@ -223,7 +231,7 @@ fn hash_field(hash: &mut Sha256, bytes: &[u8]) {
 
 // rustc emits Make-style rules, including escaped spaces, line continuations,
 // repeated prerequisite lists, empty rules, and env-dep comments.
-fn parse_dep_info(contents: &str) -> eyre::Result<BTreeSet<PathBuf>> {
+pub(crate) fn parse_dep_info(contents: &str) -> eyre::Result<BTreeSet<PathBuf>> {
     let contents = contents.replace("\\\r\n", " ").replace("\\\n", " ");
     let mut paths = BTreeSet::new();
     let mut saw_rule = false;

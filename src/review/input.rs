@@ -7,6 +7,7 @@ pub enum Action {
     Continue,
     Quit,
     Approve,
+    ApproveFingerprint,
     Reject,
     NextPackage,
     PreviousPackage,
@@ -32,7 +33,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
         }
         return Action::Continue;
     }
-    if matches!(key.code, KeyCode::Char('a' | 'r')) && !app.can_decide() {
+    if matches!(key.code, KeyCode::Char('a' | 'r' | 'f')) && !app.can_decide() {
         return Action::Continue;
     }
     match key.code {
@@ -46,6 +47,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
         }
         KeyCode::Char('r') if key.kind == KeyEventKind::Press && key.modifiers.is_empty() => {
             return Action::Reject;
+        }
+        KeyCode::Char('f') if key.kind == KeyEventKind::Press && key.modifiers.is_empty() => {
+            return Action::ApproveFingerprint;
         }
         KeyCode::Char('q') | KeyCode::Esc => return Action::Quit,
         KeyCode::Down | KeyCode::Char('j') => app.scroll(1, 0),
@@ -71,7 +75,7 @@ mod tests {
     use crate::review::app::tests::fixture;
 
     #[test]
-    fn help_blocks_decisions_and_fingerprint_actions_are_disabled() {
+    fn help_blocks_decisions_and_fingerprint_actions_are_enabled() {
         let (_root, mut app) = fixture(&["fn main() {}"]);
         let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
         handle_key(&mut app, key('?'));
@@ -82,9 +86,9 @@ mod tests {
         assert_eq!(handle_key(&mut app, key('a')), Action::Approve);
         app.session.package.approval =
             Some(crate::config::ApprovedVersion::Fingerprint("hash".into()));
-        for c in ['a', 'r'] {
-            assert_eq!(handle_key(&mut app, key(c)), Action::Continue);
-        }
+        assert_eq!(handle_key(&mut app, key('a')), Action::Approve);
+        assert_eq!(handle_key(&mut app, key('f')), Action::ApproveFingerprint);
+        assert_eq!(handle_key(&mut app, key('r')), Action::Reject);
     }
 
     #[test]
@@ -93,7 +97,7 @@ mod tests {
         app.session.package.approval = Some(crate::config::ApprovedVersion::SemVer(
             app.session.package.version.clone(),
         ));
-        for character in ['a', 'r'] {
+        for character in ['a', 'r', 'f'] {
             assert_eq!(
                 handle_key(
                     &mut app,
@@ -107,7 +111,11 @@ mod tests {
     #[test]
     fn approval_actions_require_an_unmodified_key_press() {
         let (_root, mut app) = fixture(&["fn main() {}"]);
-        for (character, action) in [('a', Action::Approve), ('r', Action::Reject)] {
+        for (character, action) in [
+            ('a', Action::Approve),
+            ('r', Action::Reject),
+            ('f', Action::ApproveFingerprint),
+        ] {
             let key = KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE);
             assert_eq!(handle_key(&mut app, key), action);
             for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {

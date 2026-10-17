@@ -12,6 +12,7 @@ use eyre::Context;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decision {
     Approve,
+    ApproveFingerprint,
     Reject,
 }
 
@@ -111,13 +112,11 @@ impl App {
         if let Some(reason) = &self.decision_blocked {
             eyre::bail!("{reason}");
         }
-        eyre::ensure!(
-            !matches!(
-                self.session.package.approval,
-                Some(ApprovedVersion::Fingerprint(_))
-            ),
-            "fingerprint approvals cannot be changed by version review"
-        );
+        if decision == Decision::ApproveFingerprint
+            || (decision == Decision::Approve && self.prefers_fingerprint())
+        {
+            return self.approve_fingerprints();
+        }
         let revoke = matches!(
             &self.session.package.approval,
             Some(ApprovedVersion::SemVer(version)) if version == &self.session.package.version
@@ -126,6 +125,7 @@ impl App {
             Decision::Approve => Some(Baseline::CurrentVersion),
             Decision::Reject if revoke => Some(Baseline::NewPackage),
             Decision::Reject => None,
+            Decision::ApproveFingerprint => unreachable!(),
         };
         let prepared = next_baseline
             .map(|baseline| {
@@ -135,6 +135,7 @@ impl App {
             .transpose()?;
         let package = &self.session.package;
         let message = match decision {
+            Decision::ApproveFingerprint => unreachable!(),
             Decision::Approve => {
                 self.session.config.set_approval(
                     &package.name,
@@ -192,6 +193,46 @@ impl App {
         });
     }
 
+    pub fn prefers_fingerprint(&self) -> bool {
+        matches!(
+            self.session.package.approval,
+            Some(ApprovedVersion::Fingerprint(_))
+        )
+    }
+
+    fn approve_fingerprints(&mut self) -> eyre::Result<()> {
+        eyre::ensure!(
+            self.can_decide(),
+            "this package is already approved or read-only"
+        );
+        let approvals = super::fingerprint::approvals(&self.session)?;
+        eyre::ensure!(
+            read_sources(&self.session)? == self.current,
+            "build script sources changed since opening review; reopen review before approving"
+        );
+        self.session
+            .config
+            .add_approvals(&self.session.package.name, &approvals)?;
+        self.session.package.approval = self
+            .session
+            .config
+            .config()
+            .approved
+            .get(&self.session.package.name)
+            .and_then(|a| a.for_review(&self.session.package.version));
+        self.decision = Some(Decision::ApproveFingerprint);
+        self.notice = Some(Notice {
+            message: format!(
+                "Approved {} fingerprint(s) for {} v{}",
+                approvals.len(),
+                self.session.package.name,
+                self.session.package.version
+            ),
+            is_error: false,
+        });
+        Ok(())
+    }
+
     pub fn baseline_message(&self) -> String {
         let mut message = self.baseline.message();
         if matches!(self.baseline, Baseline::Ready(_))
@@ -236,13 +277,13 @@ impl App {
     pub fn can_decide(&self) -> bool {
         self.decision_blocked.is_none()
             && !self.is_current_version_approved()
-            && !matches!(
-                self.session.package.approval,
-                Some(ApprovedVersion::Fingerprint(_))
-            )
+            && self.decision != Some(Decision::ApproveFingerprint)
     }
 
     pub fn approval_status(&self) -> String {
+        if self.decision == Some(Decision::ApproveFingerprint) {
+            return "Approved current build-script fingerprints".into();
+        }
         if let Some(reason) = &self.decision_blocked {
             return format!("Read-only: {reason}");
         }
@@ -269,7 +310,7 @@ impl App {
                 )
             }
             Some(ApprovedVersion::Fingerprint(_)) => {
-                "Fingerprint approval: version review unsupported".into()
+                "Fingerprint approval: approve to add current script fingerprints".into()
             }
             None => "Not approved: no previous approval".into(),
             Some(ApprovedVersion::Multiple(_)) => {
@@ -438,11 +479,10 @@ pub(super) mod tests {
             .unwrap();
         app.session.package.approval = app.session.config.config().approved.get("example").cloned();
         let before = fs::read(app.session.config.path()).unwrap();
-        for decision in [Decision::Approve, Decision::Reject] {
-            assert!(app.decide(decision).is_err());
-            assert_eq!(fs::read(app.session.config.path()).unwrap(), before);
-            assert_eq!(app.decision, None);
-        }
+        assert!(app.decide(Decision::Approve).is_err());
+        assert_eq!(app.decision, None);
+        app.decide(Decision::Reject).unwrap();
+        assert_eq!(fs::read(app.session.config.path()).unwrap(), before);
     }
 
     #[test]

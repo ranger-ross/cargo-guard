@@ -67,7 +67,7 @@ impl Baseline {
             Self::NewPackage => "Baseline: none (new approval)".into(),
             Self::CurrentVersion => "Baseline: current version is already approved".into(),
             Self::Fingerprint => {
-                "Baseline: fingerprint approvals are not supported by version review".into()
+                "Baseline: fingerprints do not identify a historical source version".into()
             }
             Self::Loading(version) => format!("Baseline: loading approved v{version}…"),
             Self::Ready(sources) => format!(

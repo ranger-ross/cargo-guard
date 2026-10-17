@@ -128,7 +128,9 @@ fn heading(app: &App) -> Line<'static> {
         ("Blocked", Color::Yellow)
     } else if app.decision == Some(Decision::Reject) {
         ("Rejected", Color::Red)
-    } else if app.is_current_version_approved() {
+    } else if app.is_current_version_approved()
+        || app.decision == Some(Decision::ApproveFingerprint)
+    {
         ("Approved", Color::Green)
     } else {
         ("Reviewing", Color::Green)
@@ -142,7 +144,7 @@ fn heading(app: &App) -> Line<'static> {
     let mut line = status_line(label, version, color);
     let suffix = match &package.approval {
         None => " (new)",
-        Some(ApprovedVersion::Fingerprint(_)) => " (fingerprint, read-only)",
+        Some(ApprovedVersion::Fingerprint(_)) => " (fingerprint)",
         _ => "",
     };
     line.spans.push(Span::styled(suffix, muted()));
@@ -336,7 +338,18 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         Layout::horizontal([Constraint::Min(0), Constraint::Length(16)]).areas(area);
     let mut keys = Vec::new();
     if app.can_decide() {
-        keys.extend([("a", "approve"), ("r", "reject")]);
+        keys.push((
+            "a",
+            if app.prefers_fingerprint() {
+                "fingerprints"
+            } else {
+                "approve"
+            },
+        ));
+        if !app.prefers_fingerprint() {
+            keys.push(("f", "fingerprints"));
+        }
+        keys.push(("r", "reject"));
     }
     if app.queue_mode {
         keys.extend([("n/p", "packages"), ("s", "skip")]);
@@ -399,8 +412,16 @@ fn render_help(frame: &mut Frame, app: &App) {
     if app.can_decide() {
         let after = if app.queue_mode { "advance" } else { "exit" };
         lines.push(Line::from(format!(
-            "a  Save this package version's approval and {after}"
+            "a  Approve {} and {after}",
+            if app.prefers_fingerprint() {
+                "current fingerprints"
+            } else {
+                "this package version"
+            }
         )));
+        lines.push(Line::from(
+            "f  Approve all script fingerprints using the latest compiled inputs",
+        ));
         lines.push(Line::from(format!(
             "r  Reject and {after}; keep existing approvals"
         )));
@@ -411,9 +432,7 @@ fn render_help(frame: &mut Frame, app: &App) {
             "This version is already approved; viewing only.",
         ));
     } else {
-        lines.push(Line::from(
-            "Fingerprint approvals are read-only in version review.",
-        ));
+        lines.push(Line::from("Current fingerprints have been approved."));
     }
     lines.extend([
         Line::default(),
@@ -496,20 +515,21 @@ mod tests {
     }
 
     #[test]
-    fn renders_context_aware_help_and_fingerprint_read_only_controls() {
+    fn renders_context_aware_help_and_fingerprint_controls() {
         let (_root, mut app) = fixture(&["fn main() {}"]);
         app.session.package.approval = Some(ApprovedVersion::Fingerprint("hash".into()));
         let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let text = screen(&terminal);
-        assert!(text.contains("fingerprint, read-only"));
+        assert!(text.contains("(fingerprint)"));
+        assert!(text.contains("a fingerprints"));
         assert!(!text.contains("a approve"));
         assert!(!text.contains("Approvals:"));
         app.show_help = true;
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let text = screen(&terminal);
         assert!(text.contains("Review help"));
-        assert!(text.contains("Fingerprint approvals are read-only"));
+        assert!(text.contains("Approve current fingerprints"));
         assert!(text.contains("Approvals:"));
         for (width, height) in [(40, 12), (1, 1), (0, 0)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();

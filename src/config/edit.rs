@@ -51,48 +51,68 @@ impl ConfigFile {
     }
 
     pub fn set_approval(&mut self, package: &str, approval: ApprovedVersion) -> eyre::Result<()> {
+        self.add_approvals(package, &[approval])
+    }
+
+    /// Persist approvals together. A scalar fingerprint is replaced by a new
+    /// fingerprint batch; explicit arrays retain their additive semantics.
+    pub fn add_approvals(
+        &mut self,
+        package: &str,
+        approvals: &[ApprovedVersion],
+    ) -> eyre::Result<()> {
         let mut document = self.document.clone();
         let table = document
             .entry("approved")
             .or_insert(Item::Table(Table::new()))
             .as_table_like_mut()
             .context("approved must be a TOML table")?;
-        let new = match approval {
-            ApprovedVersion::SemVer(version) => version.to_string(),
-            ApprovedVersion::Fingerprint(fingerprint) => fingerprint,
-            ApprovedVersion::Multiple(_) => eyre::bail!("add one approval at a time"),
-        };
-        let mut value = if let Some(old) = table.get(package).and_then(Item::as_value) {
-            let mut array = match old {
-                Value::Array(array) => array.clone(),
-                _ => {
-                    let mut array = toml_edit::Array::new();
-                    array.push(old.as_str().context("approval must be a string or array")?);
-                    array
-                }
+        let replace_fingerprint = matches!(
+            self.config.approved.get(package),
+            Some(ApprovedVersion::Fingerprint(_))
+        ) && approvals
+            .iter()
+            .all(|approval| matches!(approval, ApprovedVersion::Fingerprint(_)));
+        for (index, approval) in approvals.iter().enumerate() {
+            let new = match approval {
+                ApprovedVersion::SemVer(version) => version.to_string(),
+                ApprovedVersion::Fingerprint(fingerprint) => fingerprint.clone(),
+                ApprovedVersion::Multiple(_) => eyre::bail!("add one approval at a time"),
             };
-            if array.iter().any(|v| v.as_str() == Some(&new)) {
-                eyre::ensure!(
-                    read_optional(&self.path)? == self.original,
-                    "config {} changed since it was loaded; reload it before saving approvals",
-                    self.path.display()
-                );
-                return Ok(());
+            let mut value = if replace_fingerprint && index == 0 {
+                Value::from(new)
+            } else if let Some(old) = table.get(package).and_then(Item::as_value) {
+                let mut array = match old {
+                    Value::Array(array) => array.clone(),
+                    _ => {
+                        let mut array = toml_edit::Array::new();
+                        array.push(old.as_str().context("approval must be a string or array")?);
+                        array
+                    }
+                };
+                if array.iter().any(|v| v.as_str() == Some(&new)) {
+                    eyre::ensure!(
+                        read_optional(&self.path)? == self.original,
+                        "config {} changed since it was loaded; reload it before saving approvals",
+                        self.path.display()
+                    );
+                    continue;
+                }
+                array.push(new);
+                Value::Array(array)
+            } else {
+                Value::from(new)
+            };
+            // Replacing a value should retain its spacing and trailing comment.
+            if let Some(item) = table.get_mut(package) {
+                if let Some(old) = item.as_value() {
+                    *value.decor_mut() = old.decor().clone();
+                }
+                // Keep the existing key too: leading comments belong to its decor.
+                *item = Item::Value(value);
+            } else {
+                table.insert(package, Item::Value(value));
             }
-            array.push(new);
-            Value::Array(array)
-        } else {
-            Value::from(new)
-        };
-        // Replacing a value should retain its spacing and trailing comment.
-        if let Some(item) = table.get_mut(package) {
-            if let Some(old) = item.as_value() {
-                *value.decor_mut() = old.decor().clone();
-            }
-            // Keep the existing key too: leading comments belong to its decor.
-            *item = Item::Value(value);
-        } else {
-            table.insert(package, Item::Value(value));
         }
         self.save(document)
     }
@@ -198,6 +218,41 @@ mod tests {
     }
 
     #[test]
+    fn scalar_fingerprints_replace_but_explicit_arrays_append() {
+        for (original, hashes, expected) in [
+            ("'old-hash'", vec!["new-hash"], "\"new-hash\""),
+            (
+                "['old-hash']",
+                vec!["new-hash"],
+                "['old-hash', \"new-hash\"]",
+            ),
+            (
+                "'old-hash'",
+                vec!["first", "second"],
+                "[\"first\", \"second\"]",
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let path = config_path(root.path());
+            fs::write(
+                &path,
+                format!("[approved]\n# explanation\nexample = {original} # retained\n"),
+            )
+            .unwrap();
+            let mut file = ConfigFile::open(&path).unwrap();
+            let approvals: Vec<_> = hashes
+                .into_iter()
+                .map(|hash| ApprovedVersion::Fingerprint(hash.into()))
+                .collect();
+            file.add_approvals("example", &approvals).unwrap();
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                format!("[approved]\n# explanation\nexample = {expected} # retained\n")
+            );
+        }
+    }
+
+    #[test]
     fn appends_without_duplicates_and_removes_only_selected_version() {
         let root = tempfile::tempdir().unwrap();
         let path = config_path(root.path());
@@ -215,6 +270,41 @@ mod tests {
         assert!(file.config.approved["example"].allows_version(&"1.0.0".parse().unwrap()));
         assert!(file.config.approved["example"].allows_fingerprint("fingerprint"));
         assert!(!file.config.approved["example"].allows_version(&"2.0.0".parse().unwrap()));
+    }
+
+    #[test]
+    fn fingerprint_batches_are_saved_together_and_conflicts_save_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let path = config_path(root.path());
+        fs::write(&path, "[approved]\nexample='1.0.0' # retained\n").unwrap();
+        let mut file = ConfigFile::open(&path).unwrap();
+        let batch = [
+            ApprovedVersion::Fingerprint("first".into()),
+            ApprovedVersion::Fingerprint("second".into()),
+        ];
+        file.add_approvals("example", &batch).unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("# retained"));
+        assert!(file.config.approved["example"].allows_fingerprint("first"));
+        assert!(file.config.approved["example"].allows_fingerprint("second"));
+        assert!(file.config.approved["example"].allows_version(&"1.0.0".parse().unwrap()));
+        let before = file.config.approved.clone();
+        fs::write(&path, "[approved]\nexternal='2.0.0'\n").unwrap();
+        assert!(
+            file.add_approvals(
+                "example",
+                &[
+                    ApprovedVersion::Fingerprint("third".into()),
+                    ApprovedVersion::Fingerprint("fourth".into())
+                ]
+            )
+            .is_err()
+        );
+        assert_eq!(file.config.approved, before);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "[approved]\nexternal='2.0.0'\n"
+        );
     }
 
     #[test]

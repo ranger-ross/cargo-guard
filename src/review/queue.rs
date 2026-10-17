@@ -26,26 +26,25 @@ impl Entry {
         matches!(&self.package.approval, Some(ApprovedVersion::SemVer(version)) if version == &self.package.version)
     }
 
-    fn unsupported(&self) -> bool {
+    fn fingerprint_only(&self) -> bool {
         matches!(self.package.approval, Some(ApprovedVersion::Fingerprint(_)))
     }
 
     fn actionable(&self) -> bool {
-        self.decision.is_none()
-            && !self.skipped
-            && !self.unsupported()
-            && !self.already_approved()
-            && self.error.is_none()
+        self.decision.is_none() && !self.skipped && !self.already_approved() && self.error.is_none()
     }
 
     pub fn status(&self) -> &str {
         if self.error.is_some() {
             "load error"
-        } else if self.decision == Some(Decision::Approve) {
+        } else if matches!(
+            self.decision,
+            Some(Decision::Approve | Decision::ApproveFingerprint)
+        ) {
             "approved"
         } else if self.decision == Some(Decision::Reject) {
             "rejected"
-        } else if self.unsupported() {
+        } else if self.fingerprint_only() {
             "fingerprint"
         } else if self.already_approved() {
             "already approved"
@@ -258,7 +257,7 @@ impl QueueState {
                 .get(&entry.package.name)
                 .and_then(|a| a.for_review(&entry.package.version));
         }
-        self.entries[self.selected].decision = Some(decision);
+        self.entries[self.selected].decision = app.decision;
         self.entries[self.selected].skipped = false;
         self.retire_loader();
         Ok(self.advance())
@@ -287,9 +286,9 @@ impl QueueState {
         let mut summary = Summary::default();
         for entry in &self.entries {
             match entry.decision {
-                Some(Decision::Approve) => summary.approved += 1,
+                Some(Decision::Approve | Decision::ApproveFingerprint) => summary.approved += 1,
                 Some(Decision::Reject) => summary.rejected += 1,
-                None if entry.unsupported() || entry.error.is_some() => summary.unresolved += 1,
+                None if entry.error.is_some() => summary.unresolved += 1,
                 None if entry.already_approved() => summary.already_approved += 1,
                 None if entry.baseline_unavailable => summary.unresolved += 1,
                 None => summary.skipped += 1,
@@ -474,7 +473,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_with_only_read_only_entries_opens_for_inspection() {
+    fn fingerprint_entries_are_actionable_and_version_approvals_are_read_only() {
         let (root, metadata) = super::super::tests::fixture();
         fs::write(
             root.path().join("approved-builds.toml"),
@@ -482,16 +481,16 @@ mod tests {
         )
         .unwrap();
         let mut state = QueueState::new(ReviewQueue::from_metadata(&metadata).unwrap());
-        assert_eq!(state.selected, 0);
-        assert!(!state.app.as_ref().unwrap().can_decide());
-        state.navigate(false);
+        assert_eq!(state.selected, 1);
         assert_eq!(state.entries[state.selected].status(), "fingerprint");
+        assert!(state.app.as_ref().unwrap().can_decide());
+        state.navigate(true);
         assert!(!state.app.as_ref().unwrap().can_decide());
         assert_eq!(
             state.summary(),
             Summary {
                 already_approved: 3,
-                unresolved: 1,
+                skipped: 1,
                 ..Default::default()
             }
         );
