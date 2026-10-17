@@ -1,7 +1,15 @@
-use std::{collections::BTreeMap, env, fs, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 use eyre::Context;
 use serde::{Deserialize, Serialize};
+
+// Used by the review command in the next implementation steps.
+#[allow(dead_code)]
+pub mod edit;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
@@ -17,13 +25,18 @@ pub enum ApprovedVersion {
 
 pub fn load_config() -> eyre::Result<Config> {
     let workspace_root = determine_workspace_root()?;
+    load_config_from(&config_path(&workspace_root))
+}
 
-    let config_path = workspace_root.join("approved-builds.toml");
-    let contents = fs::read_to_string(&config_path)
-        .with_context(|| format!("could not read config {}", config_path.display()))?;
+pub fn config_path(workspace_root: &Path) -> PathBuf {
+    workspace_root.join("approved-builds.toml")
+}
 
-    toml::from_str(&contents)
-        .with_context(|| format!("could not parse config {}", config_path.display()))
+pub fn load_config_from(path: &Path) -> eyre::Result<Config> {
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("could not read config {}", path.display()))?;
+
+    toml::from_str(&contents).with_context(|| format!("could not parse config {}", path.display()))
 }
 
 fn determine_workspace_root() -> eyre::Result<PathBuf> {
