@@ -132,17 +132,15 @@ fn render_area(frame: &mut Frame, app: &mut App, area: Rect) {
         )
     });
     let multiple = app.files.len() > 1;
-    let [header, notice_area, baseline, tabs, title, source, footer] = Layout::vertical([
-        Constraint::Length(2),
+    let [header, notice_area, baseline, tabs, source, footer] = Layout::vertical([
+        Constraint::Length(1),
         Constraint::Length(message_height(notice.as_ref(), area.width)),
         Constraint::Length(message_height(note.as_ref(), area.width)),
         Constraint::Length(if multiple { 2 } else { 0 }),
-        Constraint::Length(2),
         Constraint::Min(0),
         Constraint::Length(1),
     ])
     .areas(area);
-    frame.render_widget(Paragraph::new(heading(app)), header);
     if let Some(notice) = notice {
         frame.render_widget(
             Paragraph::new(notice).wrap(Wrap { trim: false }),
@@ -170,24 +168,24 @@ fn render_area(frame: &mut Frame, app: &mut App, area: Rect) {
     let file = app.file();
     let added = file.additions;
     let removed = file.deletions;
-    let mut label = vec![Span::styled(
+    let mut label = Line::from(vec![Span::styled(
         format!("  {}", file.path.display()),
         Style::default().add_modifier(Modifier::BOLD),
-    )];
+    )]);
     if added > 0 {
-        label.push(Span::styled(
+        label.spans.push(Span::styled(
             format!("  +{added}"),
             Style::default().fg(Color::Green),
         ));
     }
     if removed > 0 {
-        label.push(Span::styled(
+        label.spans.push(Span::styled(
             format!("  -{removed}"),
             Style::default().fg(Color::Red),
         ));
     }
     if file.rows.is_empty() {
-        label.push(Span::styled(
+        label.spans.push(Span::styled(
             match file.status {
                 FileStatus::Added => "  (new empty file)",
                 FileStatus::Removed => "  (deleted empty file)",
@@ -196,7 +194,13 @@ fn render_area(frame: &mut Frame, app: &mut App, area: Rect) {
             muted(),
         ));
     }
-    frame.render_widget(Paragraph::new(Line::from(label)), title);
+    let [package_header, file_header] = Layout::horizontal([
+        Constraint::Min(0),
+        Constraint::Length(label.width().min(usize::from(header.width)) as u16),
+    ])
+    .areas(header);
+    frame.render_widget(Paragraph::new(heading(app)), package_header);
+    frame.render_widget(Paragraph::new(label), file_header);
 
     let comparing = app.file().status != FileStatus::Current;
     let digits = app.file().number_width;
