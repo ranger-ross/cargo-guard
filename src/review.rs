@@ -183,6 +183,70 @@ mod tests {
     }
 
     #[test]
+    fn single_package_review_workflow_persists_decisions_and_reopens() {
+        use super::{
+            app::{App, Decision},
+            diff::FileStatus,
+            input::{self, Action},
+            sources::{Baseline, PackageSources, ScriptSource},
+        };
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (root, metadata) = fixture();
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        let mut app =
+            App::new(ReviewSession::from_metadata(&metadata, "default-script").unwrap()).unwrap();
+        assert_eq!(app.file().status, FileStatus::Added);
+        assert_eq!(input::handle_key(&mut app, key('a')), Action::Approve);
+        app.decide(Decision::Approve).unwrap();
+        let saved = fs::read(app.session.config.path()).unwrap();
+        let mut reopened =
+            App::new(ReviewSession::from_metadata(&metadata, "default-script").unwrap()).unwrap();
+        assert!(reopened.is_current_version_approved());
+        assert_eq!(input::handle_key(&mut reopened, key('r')), Action::Continue);
+        assert_eq!(input::handle_key(&mut reopened, key('q')), Action::Quit);
+        assert_eq!(fs::read(reopened.session.config.path()).unwrap(), saved);
+
+        let manifest_path = root.path().join("deps/default/Cargo.toml");
+        let manifest = fs::read_to_string(&manifest_path)
+            .unwrap()
+            .replace("version = '1.0.0'", "version = '1.1.0'");
+        fs::write(&manifest_path, manifest).unwrap();
+        let upgraded = MetadataCommand::new()
+            .manifest_path(root.path().join("Cargo.toml"))
+            .other_options(vec!["--offline".into()])
+            .exec()
+            .unwrap();
+        let mut app =
+            App::new(ReviewSession::from_metadata(&upgraded, "default-script").unwrap()).unwrap();
+        // Supply the fixture's previous source snapshot; real registry retrieval
+        // is exercised separately by the source-provider tests.
+        app.set_baseline(Baseline::Ready(PackageSources {
+            version: "1.0.0".parse().unwrap(),
+            scripts: vec![ScriptSource {
+                path: "build.rs".into(),
+                contents: fs::read_to_string(root.path().join("deps/default/build.rs")).unwrap(),
+            }],
+        }))
+        .unwrap();
+        assert_eq!(app.file().status, FileStatus::Unchanged);
+        assert!(app.baseline_message().contains("Build scripts unchanged"));
+        assert!(app.can_decide());
+        assert_eq!(input::handle_key(&mut app, key('r')), Action::Reject);
+        app.decide(Decision::Reject).unwrap();
+        assert_eq!(fs::read(app.session.config.path()).unwrap(), saved);
+
+        let mut app =
+            App::new(ReviewSession::from_metadata(&upgraded, "default-script").unwrap()).unwrap();
+        app.decide(Decision::Approve).unwrap();
+        let reopened = ReviewSession::from_metadata(&upgraded, "default-script").unwrap();
+        assert!(
+            matches!(reopened.package.approval, Some(ApprovedVersion::SemVer(v)) if v == semver::Version::new(1, 1, 0))
+        );
+        assert!(!root.path().join("target").exists());
+    }
+
+    #[test]
     fn discovers_dependency_scripts_and_workspace_approvals() {
         let (root, metadata) = fixture();
         let session = ReviewSession::from_metadata(&metadata, "default-script").unwrap();

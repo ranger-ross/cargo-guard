@@ -34,6 +34,7 @@ pub struct App {
     change_target: Option<usize>,
     pub decision: Option<Decision>,
     pub notice: Option<Notice>,
+    pub show_help: bool,
 }
 
 impl App {
@@ -74,6 +75,7 @@ impl App {
             change_target: None,
             decision: None,
             notice: None,
+            show_help: false,
         })
     }
 
@@ -189,7 +191,7 @@ impl App {
                 .iter()
                 .all(|file| file.status == FileStatus::Unchanged)
         {
-            message.push_str(" · Build scripts unchanged");
+            message.push_str(" · Build scripts unchanged; new version still needs approval");
         }
         message
     }
@@ -220,6 +222,14 @@ impl App {
             &self.session.package.approval,
             Some(ApprovedVersion::SemVer(version)) if version == &self.session.package.version
         )
+    }
+
+    pub fn can_decide(&self) -> bool {
+        !self.is_current_version_approved()
+            && !matches!(
+                self.session.package.approval,
+                Some(ApprovedVersion::Fingerprint(_))
+            )
     }
 
     pub fn approval_status(&self) -> String {

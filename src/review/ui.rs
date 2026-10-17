@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Style},
     text::Line,
-    widgets::{Block, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
 use super::app::App;
@@ -148,15 +148,70 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(
-                "↑/↓ j/k Scroll · ←/→ h/l Pan · PgUp/PgDn · Home/End · [/] Changes · Tab Files · q Quit",
+                "↑/↓ j/k Scroll · ←/→ h/l Pan · PgUp/PgDn · Home/End · [/] Changes · Tab Files · ? Help · q Quit",
             ),
             Line::from(if app.is_current_version_approved() {
                 format!("{position} · Current version already approved · q Quit")
+            } else if !app.can_decide() {
+                format!("{position} · Fingerprint approval: read-only · q Quit")
             } else {
                 format!("{position} · a Approve version · r Reject · Decide and exit")
             }),
         ]),
         footer,
+    );
+    if app.show_help {
+        render_help(frame, app);
+    }
+}
+
+fn render_help(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    let width = area.width.min(78);
+    let height = area.height.min(18);
+    let popup = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    let mut lines = vec![
+        Line::from("↑/↓ or j/k       Scroll source"),
+        Line::from("←/→ or h/l       Pan long lines"),
+        Line::from("PgUp / PgDn      Scroll a page"),
+        Line::from("Home / End       First / last page (also g / G)"),
+        Line::from("[ / ]            Previous / next change"),
+        Line::from("Tab / Shift+Tab  Next / previous file"),
+        Line::from(""),
+    ];
+    if app.can_decide() {
+        lines.push(Line::from(
+            "a  Save this package version's approval and exit",
+        ));
+        lines.push(Line::from(
+            "r  Reject this version and exit; keep existing approvals",
+        ));
+    } else if app.is_current_version_approved() {
+        lines.push(Line::from(
+            "This version is already approved; viewing only.",
+        ));
+    } else {
+        lines.push(Line::from(
+            "Fingerprint approvals are read-only in version review.",
+        ));
+    }
+    lines.extend([
+        Line::from(""),
+        Line::from("Approval covers every build script in this package version."),
+        Line::from("This view shows entry-point files, not their dependencies."),
+        Line::from("? / Esc  Close help     q / Ctrl+C  Exit without changes"),
+    ]);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::bordered().title(" Review help "))
+            .wrap(Wrap { trim: false }),
+        popup,
     );
 }
 
@@ -166,6 +221,40 @@ mod tests {
 
     use super::*;
     use crate::review::app::tests::fixture;
+
+    #[test]
+    fn renders_context_aware_help_and_fingerprint_read_only_controls() {
+        let (_root, mut app) = fixture(&["fn main() {}"]);
+        app.session.package.approval =
+            Some(crate::config::ApprovedVersion::Fingerprint("hash".into()));
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("Fingerprint approval: read-only"));
+        assert!(!screen.contains("a Approve"));
+        app.show_help = true;
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("Review help"));
+        assert!(screen.contains("Fingerprint approvals are read-only"));
+        assert!(!screen.contains("Save this package"));
+        for (width, height) in [(40, 12), (1, 1), (0, 0)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        }
+    }
 
     #[test]
     fn hides_decision_actions_for_approved_versions() {

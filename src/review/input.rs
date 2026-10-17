@@ -14,11 +14,23 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
     if key.kind == KeyEventKind::Release {
         return Action::Continue;
     }
-    if matches!(key.code, KeyCode::Char('a' | 'r')) && app.is_current_version_approved() {
-        return Action::Continue;
-    }
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Action::Quit;
+    }
+    if key.code == KeyCode::Char('?') && key.kind == KeyEventKind::Press {
+        app.show_help = !app.show_help;
+        return Action::Continue;
+    }
+    if app.show_help {
+        match key.code {
+            KeyCode::Esc => app.show_help = false,
+            KeyCode::Char('q') => return Action::Quit,
+            _ => {}
+        }
+        return Action::Continue;
+    }
+    if matches!(key.code, KeyCode::Char('a' | 'r')) && !app.can_decide() {
+        return Action::Continue;
     }
     match key.code {
         KeyCode::Char('a') if key.kind == KeyEventKind::Press && key.modifiers.is_empty() => {
@@ -49,6 +61,23 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
 mod tests {
     use super::*;
     use crate::review::app::tests::fixture;
+
+    #[test]
+    fn help_blocks_decisions_and_fingerprint_actions_are_disabled() {
+        let (_root, mut app) = fixture(&["fn main() {}"]);
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        handle_key(&mut app, key('?'));
+        assert!(app.show_help);
+        assert_eq!(handle_key(&mut app, key('a')), Action::Continue);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.show_help);
+        assert_eq!(handle_key(&mut app, key('a')), Action::Approve);
+        app.session.package.approval =
+            Some(crate::config::ApprovedVersion::Fingerprint("hash".into()));
+        for c in ['a', 'r'] {
+            assert_eq!(handle_key(&mut app, key(c)), Action::Continue);
+        }
+    }
 
     #[test]
     fn approved_versions_ignore_approval_and_rejection_keys() {
