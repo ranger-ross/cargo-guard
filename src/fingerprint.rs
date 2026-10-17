@@ -65,7 +65,16 @@ impl BuildScriptFingerprint {
             inherit_dependencies(&mut dependencies, &workspace)?;
         }
 
-        let fingerprint = fingerprint(&manifest, &dependencies, manifest_dir, &dep_info)?;
+        let dep_info_root = env::var_os("CARGO_GUARD_WORKSPACE_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| manifest_dir.to_path_buf());
+        let fingerprint = fingerprint_inputs(
+            &manifest,
+            &dependencies,
+            manifest_dir,
+            &dep_info,
+            &dep_info_root,
+        )?;
         *self.fingerprint.borrow_mut() = Some(fingerprint.clone());
         Ok(fingerprint)
     }
@@ -127,11 +136,22 @@ fn inherit_dependencies(manifest: &mut toml::Value, workspace: &toml::Value) -> 
     Ok(())
 }
 
+#[cfg(test)]
 fn fingerprint(
     manifest: &toml::Value,
     dependencies: &toml::Value,
     manifest_dir: &Path,
     dep_info: &str,
+) -> eyre::Result<String> {
+    fingerprint_inputs(manifest, dependencies, manifest_dir, dep_info, manifest_dir)
+}
+
+fn fingerprint_inputs(
+    manifest: &toml::Value,
+    dependencies: &toml::Value,
+    manifest_dir: &Path,
+    dep_info: &str,
+    dep_info_root: &Path,
 ) -> eyre::Result<String> {
     let mut files = BTreeSet::new();
     match manifest.get("package").and_then(|p| p.get("build")) {
@@ -142,16 +162,21 @@ fn fingerprint(
             files.insert(PathBuf::from(path));
         }
         Some(toml::Value::Array(paths)) => {
-            for path in paths {
-                files.insert(PathBuf::from(
-                    path.as_str()
-                        .context("build script path must be a string")?,
-                ));
-            }
+            // Cargo's dep-info belongs to this binary and includes its entry
+            // point. Other scripts in the package are independent approvals.
+            eyre::ensure!(!paths.is_empty(), "manifest has no build scripts");
+            eyre::ensure!(
+                !parse_dep_info(dep_info)?.is_empty(),
+                "build script dep-info has no inputs"
+            );
         }
         _ => eyre::bail!("manifest does not enable a build script"),
     }
-    files.extend(parse_dep_info(dep_info)?);
+    files.extend(
+        parse_dep_info(dep_info)?
+            .into_iter()
+            .map(|path| dep_info_root.join(path)),
+    );
 
     // Normalize and deduplicate absolute dep-info paths and manifest-relative
     // script paths. Package-local labels do not include the versioned cache path.
@@ -252,6 +277,44 @@ fn parse_dep_info(contents: &str) -> eyre::Result<BTreeSet<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multiple_scripts_track_only_their_own_workspace_relative_inputs() {
+        let root = tempfile::tempdir().unwrap();
+        let package = root.path().join("dep");
+        fs::create_dir(&package).unwrap();
+        fs::write(package.join("first.rs"), "mod helper; fn main() {}").unwrap();
+        fs::write(package.join("second.rs"), "fn main() {}").unwrap();
+        fs::write(package.join("helper.rs"), "const VALUE: u8 = 1;").unwrap();
+        let manifest: toml::Value =
+            toml::from_str("[package]\nbuild=['first.rs','second.rs']\n").unwrap();
+        let first = || {
+            fingerprint_inputs(
+                &manifest,
+                &manifest,
+                &package,
+                "binary: dep/first.rs dep/helper.rs\n",
+                root.path(),
+            )
+            .unwrap()
+        };
+        let second = || {
+            fingerprint_inputs(
+                &manifest,
+                &manifest,
+                &package,
+                "binary: dep/second.rs\n",
+                root.path(),
+            )
+            .unwrap()
+        };
+        let first_hash = first();
+        let second_hash = second();
+        assert_ne!(first_hash, second_hash);
+        fs::write(package.join("helper.rs"), "const VALUE: u8 = 2;").unwrap();
+        assert_ne!(first_hash, first());
+        assert_eq!(second_hash, second());
+    }
 
     #[test]
     fn parses_rustc_dep_info() {

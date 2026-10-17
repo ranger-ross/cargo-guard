@@ -60,7 +60,7 @@ pub fn render_queue(frame: &mut Frame, state: &mut QueueState) {
             let (marker, color) = match entry.status() {
                 "approved" | "already approved" => ("✓", Color::Green),
                 "rejected" => ("×", Color::Red),
-                "conflict" | "load error" | "baseline unavailable" => ("!", Color::Yellow),
+                "load error" | "baseline unavailable" => ("!", Color::Yellow),
                 "fingerprint" => ("?", Color::Yellow),
                 "skipped" => ("–", Color::DarkGray),
                 _ => ("·", Color::DarkGray),
@@ -404,10 +404,8 @@ fn render_help(frame: &mut Frame, app: &App) {
         lines.push(Line::from(format!(
             "r  Reject and {after}; keep existing approvals"
         )));
-    } else if app.decision_blocked.is_some() {
-        lines.push(Line::from(
-            "Conflicting package names are read-only: one approval per name.",
-        ));
+    } else if let Some(reason) = &app.decision_blocked {
+        lines.push(Line::from(reason.as_str()));
     } else if app.is_current_version_approved() {
         lines.push(Line::from(
             "This version is already approved; viewing only.",
@@ -420,7 +418,9 @@ fn render_help(frame: &mut Frame, app: &App) {
     lines.extend([
         Line::default(),
         Line::from("Diff columns: approved / current. Approval covers all scripts in the package."),
-        Line::from("This view shows entry-point files, not their dependencies."),
+        Line::from(
+            "Approvals apply by package name across sources; this view shows entry points only.",
+        ),
         Line::from("? / Esc close help · q / Ctrl+C quit; saved decisions are kept"),
         Line::default(),
         Line::styled(app.approval_status(), muted()),
@@ -484,7 +484,7 @@ mod tests {
             .unwrap();
         let text = screen(&terminal);
         assert!(text.contains("Packages 1/4"));
-        assert!(text.contains("! duplicate"));
+        assert!(text.contains("· duplicate"));
         assert!(text.contains("custom-script v2.0.0"));
         assert!(text.contains("compile_error!"));
         for (width, height) in [(80, 24), (40, 12), (1, 1), (0, 0)] {

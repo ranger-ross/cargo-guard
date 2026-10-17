@@ -44,7 +44,15 @@ pub enum Baseline {
 
 impl Baseline {
     pub fn for_session(session: &ReviewSession) -> Self {
-        match &session.package.approval {
+        match &session
+            .package
+            .approval
+            .as_ref()
+            .and_then(|a| a.for_review(&session.package.version))
+        {
+            Some(ApprovedVersion::Multiple(_)) => {
+                unreachable!("review selects a representative approval")
+            }
             None => Self::NewPackage,
             Some(ApprovedVersion::Fingerprint(_)) => Self::Fingerprint,
             Some(ApprovedVersion::SemVer(version)) if version == &session.package.version => {

@@ -148,7 +148,9 @@ impl App {
                 )
             }
             Decision::Reject if revoke => {
-                self.session.config.remove_approval(&package.name)?;
+                self.session
+                    .config
+                    .remove_version(&package.name, &package.version)?;
                 format!(
                     "Rejected {} v{}; its approval was removed",
                     package.name, package.version
@@ -171,7 +173,7 @@ impl App {
             .config()
             .approved
             .get(&self.session.package.name)
-            .cloned();
+            .and_then(|a| a.for_review(&self.session.package.version));
         if let Some((baseline, files)) = prepared {
             self.replace_files(baseline, files);
         }
@@ -270,6 +272,9 @@ impl App {
                 "Fingerprint approval: version review unsupported".into()
             }
             None => "Not approved: no previous approval".into(),
+            Some(ApprovedVersion::Multiple(_)) => {
+                unreachable!("review selects a representative approval")
+            }
         }
     }
 
@@ -438,6 +443,33 @@ pub(super) mod tests {
             assert_eq!(fs::read(app.session.config.path()).unwrap(), before);
             assert_eq!(app.decision, None);
         }
+    }
+
+    #[test]
+    fn mixed_approvals_allow_version_review_and_preserve_other_entries() {
+        let (_root, mut app) = fixture(&["fn main() {}"]);
+        let name = app.session.package.name.clone();
+        app.session
+            .config
+            .set_approval(&name, ApprovedVersion::Fingerprint("script-hash".into()))
+            .unwrap();
+        app.session
+            .config
+            .set_approval(&name, ApprovedVersion::SemVer("0.0.1".parse().unwrap()))
+            .unwrap();
+        app.session.package.approval =
+            app.session.config.config().approved[&name].for_review(&app.session.package.version);
+        assert!(app.can_decide());
+        app.decide(Decision::Approve).unwrap();
+        let approvals = &app.session.config.config().approved[&name];
+        assert!(approvals.allows_fingerprint("script-hash"));
+        assert!(approvals.allows_version(&"0.0.1".parse().unwrap()));
+        assert!(approvals.allows_version(&app.session.package.version));
+        app.decide(Decision::Reject).unwrap();
+        let approvals = &app.session.config.config().approved[&name];
+        assert!(approvals.allows_fingerprint("script-hash"));
+        assert!(approvals.allows_version(&"0.0.1".parse().unwrap()));
+        assert!(!approvals.allows_version(&app.session.package.version));
     }
 
     #[test]

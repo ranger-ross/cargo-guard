@@ -15,7 +15,6 @@ use crate::config::{ApprovedVersion, edit::ConfigFile};
 
 pub struct Entry {
     pub package: ReviewPackage,
-    pub conflict: bool,
     pub decision: Option<Decision>,
     pub skipped: bool,
     pub error: Option<String>,
@@ -34,16 +33,13 @@ impl Entry {
     fn actionable(&self) -> bool {
         self.decision.is_none()
             && !self.skipped
-            && !self.conflict
             && !self.unsupported()
             && !self.already_approved()
             && self.error.is_none()
     }
 
     pub fn status(&self) -> &str {
-        if self.conflict {
-            "conflict"
-        } else if self.error.is_some() {
+        if self.error.is_some() {
             "load error"
         } else if self.decision == Some(Decision::Approve) {
             "approved"
@@ -101,7 +97,6 @@ impl QueueState {
             .packages
             .into_iter()
             .map(|package| Entry {
-                conflict: queue.conflicts.contains_key(&package.name),
                 package,
                 decision: None,
                 skipped: false,
@@ -159,7 +154,11 @@ impl QueueState {
         // our previous saves while preserving conflict detection during review.
         let config = ConfigFile::open(&self.config_path)?;
         for entry in &mut self.entries {
-            entry.package.approval = config.config().approved.get(&entry.package.name).cloned();
+            entry.package.approval = config
+                .config()
+                .approved
+                .get(&entry.package.name)
+                .and_then(|a| a.for_review(&entry.package.version));
         }
         let entry = &self.entries[self.selected];
         let session = ReviewSession {
@@ -179,23 +178,11 @@ impl QueueState {
         };
         app.queue_mode = true;
         app.decision = entry.decision;
-        if entry.conflict {
-            app.decision_blocked = Some("Multiple versions/sources share this name; one approval entry cannot represent all of them".into());
-        }
-        let loader = if entry.conflict || !matches!(app.baseline, Baseline::Loading(_)) {
+        let loader = if !matches!(app.baseline, Baseline::Loading(_)) {
             None
         } else {
             BaselineLoader::start(&app.session)?
         };
-        if entry.conflict && matches!(app.baseline, Baseline::Loading(_)) {
-            app.set_baseline(Baseline::Unavailable {
-                version: match &entry.package.approval {
-                    Some(ApprovedVersion::SemVer(version)) => version.clone(),
-                    _ => unreachable!(),
-                },
-                reason: "ambiguous package name: historical source selection is unresolved".into(),
-            })?;
-        }
         Ok((app, loader))
     }
 
@@ -269,7 +256,7 @@ impl QueueState {
                 .config()
                 .approved
                 .get(&entry.package.name)
-                .cloned();
+                .and_then(|a| a.for_review(&entry.package.version));
         }
         self.entries[self.selected].decision = Some(decision);
         self.entries[self.selected].skipped = false;
@@ -302,9 +289,7 @@ impl QueueState {
             match entry.decision {
                 Some(Decision::Approve) => summary.approved += 1,
                 Some(Decision::Reject) => summary.rejected += 1,
-                None if entry.conflict || entry.unsupported() || entry.error.is_some() => {
-                    summary.unresolved += 1
-                }
+                None if entry.unsupported() || entry.error.is_some() => summary.unresolved += 1,
                 None if entry.already_approved() => summary.already_approved += 1,
                 None if entry.baseline_unavailable => summary.unresolved += 1,
                 None => summary.skipped += 1,
@@ -464,8 +449,7 @@ mod tests {
             state.summary(),
             Summary {
                 approved: 1,
-                skipped: 1,
-                unresolved: 2,
+                skipped: 3,
                 ..Default::default()
             }
         );
@@ -483,8 +467,7 @@ mod tests {
             reopened.summary(),
             Summary {
                 already_approved: 1,
-                skipped: 1,
-                unresolved: 2,
+                skipped: 3,
                 ..Default::default()
             }
         );
@@ -495,7 +478,7 @@ mod tests {
         let (root, metadata) = super::super::tests::fixture();
         fs::write(
             root.path().join("approved-builds.toml"),
-            "[approved]\ncustom-script='2.0.0'\ndefault-script='fingerprint'\n",
+            "[approved]\ncustom-script='2.0.0'\ndefault-script='fingerprint'\nduplicate=['1.0.0','2.0.0']\n",
         )
         .unwrap();
         let mut state = QueueState::new(ReviewQueue::from_metadata(&metadata).unwrap());
@@ -507,8 +490,8 @@ mod tests {
         assert_eq!(
             state.summary(),
             Summary {
-                already_approved: 1,
-                unresolved: 3,
+                already_approved: 3,
+                unresolved: 1,
                 ..Default::default()
             }
         );
@@ -520,15 +503,19 @@ mod tests {
         assert_eq!(state.entries[state.selected].package.name, "custom-script");
         assert!(!state.decide(Decision::Approve).unwrap());
         assert_eq!(state.entries[state.selected].package.name, "default-script");
+        assert!(!state.decide(Decision::Approve).unwrap());
+        assert_eq!(state.entries[state.selected].package.name, "duplicate");
+        assert!(!state.decide(Decision::Approve).unwrap());
         assert!(state.decide(Decision::Approve).unwrap());
         let saved =
             crate::config::load_config_from(&root.path().join("approved-builds.toml")).unwrap();
-        assert_eq!(saved.approved.len(), 2);
+        assert_eq!(saved.approved.len(), 3);
+        assert!(saved.approved["duplicate"].allows_version(&"1.0.0".parse().unwrap()));
+        assert!(saved.approved["duplicate"].allows_version(&"2.0.0".parse().unwrap()));
         assert_eq!(
             state.summary(),
             Summary {
-                approved: 2,
-                unresolved: 2,
+                approved: 4,
                 ..Default::default()
             }
         );
@@ -538,29 +525,28 @@ mod tests {
     fn reject_skip_and_quit_leave_other_packages_pending() {
         let (root, mut state) = fixture();
         assert!(!state.decide(Decision::Reject).unwrap());
-        assert!(state.skip());
+        assert!(!state.skip());
         assert!(!root.path().join("approved-builds.toml").exists());
         assert_eq!(
             state.summary(),
             Summary {
                 rejected: 1,
-                skipped: 1,
-                unresolved: 2,
+                skipped: 3,
                 ..Default::default()
             }
         );
     }
 
     #[test]
-    fn approved_packages_and_conflicts_remain_browsable_and_read_only() {
+    fn approved_packages_are_read_only_but_other_versions_are_actionable() {
         let (_root, mut state) = fixture();
         state.decide(Decision::Approve).unwrap();
         state.navigate(true);
         assert!(!state.app.as_ref().unwrap().can_decide());
         state.navigate(true);
-        assert!(state.entries[state.selected].conflict);
-        assert!(!state.app.as_ref().unwrap().can_decide());
-        assert!(state.decide(Decision::Approve).is_err());
+        assert_eq!(state.entries[state.selected].package.name, "duplicate");
+        assert!(state.app.as_ref().unwrap().can_decide());
+        assert!(state.decide(Decision::Approve).is_ok());
     }
 
     #[test]
@@ -585,7 +571,7 @@ mod tests {
         state.navigate(false);
         assert!(state.app.is_none());
         assert!(state.entries[state.selected].error.is_some());
-        assert_eq!(state.summary().unresolved, 3);
+        assert_eq!(state.summary().unresolved, 1);
         state.navigate(true);
         assert!(state.app.is_some());
     }

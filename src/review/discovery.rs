@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use cargo_metadata::{CargoOpt, Metadata, MetadataCommand, Package, PackageId};
+use cargo_metadata::{CargoOpt, Metadata, MetadataCommand, Package};
 use eyre::ContextCompat;
 
 use super::ReviewPackage;
@@ -75,7 +75,6 @@ pub fn resolved_packages(metadata: &Metadata) -> eyre::Result<Vec<&Package>> {
 
 pub struct ReviewQueue {
     pub packages: Vec<ReviewPackage>,
-    pub conflicts: BTreeMap<String, Vec<PackageId>>,
     pub config: ConfigFile,
 }
 
@@ -93,19 +92,7 @@ impl ReviewQueue {
             })
             .map(|package| ReviewPackage::from_package(package, &config))
             .collect();
-        let mut conflicts: BTreeMap<String, Vec<PackageId>> = BTreeMap::new();
-        for package in &packages {
-            conflicts
-                .entry(package.name.clone())
-                .or_default()
-                .push(package.id.clone());
-        }
-        conflicts.retain(|_, ids| ids.len() > 1);
-        Ok(Self {
-            packages,
-            conflicts,
-            config,
-        })
+        Ok(Self { packages, config })
     }
 }
 
@@ -258,10 +245,9 @@ mod tests {
     }
 
     #[test]
-    fn reports_duplicate_name_conflicts_without_losing_versions() {
+    fn retains_multiple_versions_for_independent_review() {
         let (root, metadata) = super::super::tests::fixture();
         let queue = ReviewQueue::from_metadata(&metadata).unwrap();
-        assert_eq!(queue.conflicts["duplicate"].len(), 2);
         assert_eq!(
             queue
                 .packages

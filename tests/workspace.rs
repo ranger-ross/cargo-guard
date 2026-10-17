@@ -92,6 +92,43 @@ fn excluded_packages_still_require_approval() {
 }
 
 #[test]
+fn version_lists_match_without_reading_fingerprint_inputs() {
+    let root = fixture();
+    for approvals in ["['0.9.0','1.0.0']", "['wrong-fingerprint','1.0.0']"] {
+        write(
+            root.path(),
+            "approved-builds.toml",
+            &format!("[approved]\nexcluded={approvals}\n"),
+        );
+        let output = runner(
+            root.path(),
+            &root.path().join("excluded/Cargo.toml"),
+            "excluded",
+        )
+        .arg("/bin/true")
+        .output()
+        .unwrap();
+        assert!(output.status.success(), "{:?}", output);
+    }
+    for approvals in ["[]", "['0.9.0','0.8.0']"] {
+        write(
+            root.path(),
+            "approved-builds.toml",
+            &format!("[approved]\nexcluded={approvals}\n"),
+        );
+        let output = runner(
+            root.path(),
+            &root.path().join("excluded/Cargo.toml"),
+            "excluded",
+        )
+        .arg("/bin/true")
+        .output()
+        .unwrap();
+        assert!(!output.status.success());
+    }
+}
+
+#[test]
 fn virtual_workspace_allows_external_members_and_manifest_symlinks() {
     let root = tempfile::tempdir().unwrap();
     write(

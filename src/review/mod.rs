@@ -46,11 +46,12 @@ pub fn run(package: Option<&str>, options: &ReviewOptions) -> eyre::Result<()> {
     let metadata = discovery::metadata_command(options)
         .exec()
         .context("could not load workspace metadata for review")?;
-    if let Some(name) = package {
+    if let Some(selector) = package {
+        let (name, version) = package_selector(selector)?;
         let candidates = discovery::resolved_packages(&metadata)?;
         let named: Vec<_> = candidates
             .into_iter()
-            .filter(|p| p.name.as_str() == name)
+            .filter(|p| p.name.as_str() == name && version.as_ref().is_none_or(|v| v == &p.version))
             .collect();
         if !named.is_empty()
             && named
@@ -62,7 +63,7 @@ pub fn run(package: Option<&str>, options: &ReviewOptions) -> eyre::Result<()> {
             );
             return Ok(());
         }
-        tui::run(ReviewSession::from_metadata(&metadata, name)?)
+        tui::run(ReviewSession::from_metadata(&metadata, selector)?)
     } else {
         let queue = discovery::ReviewQueue::from_metadata(&metadata)?;
         tui::run_queue(queue)
@@ -71,9 +72,11 @@ pub fn run(package: Option<&str>, options: &ReviewOptions) -> eyre::Result<()> {
 
 impl ReviewSession {
     fn from_metadata(metadata: &Metadata, name: &str) -> eyre::Result<Self> {
+        let (name, version) = package_selector(name)?;
         let mut candidates: Vec<_> = discovery::resolved_packages(metadata)?
             .into_iter()
             .filter(|package| package.name.as_str() == name)
+            .filter(|package| version.as_ref().is_none_or(|v| v == &package.version))
             .filter(|package| !crate::workspace::is_member(metadata, package))
             .collect();
         candidates.sort_by(|a, b| {
@@ -87,7 +90,7 @@ impl ReviewSession {
         );
         eyre::ensure!(
             candidates.len() == 1,
-            "package name `{name}` is ambiguous; matching packages:\n{}",
+            "package name `{name}` is ambiguous; use NAME@VERSION to select a version (multiple sources may still be ambiguous). Matching packages:\n{}",
             candidates
                 .iter()
                 .map(|package| format!("  {} v{} ({})", package.name, package.version, package.id))
@@ -108,6 +111,20 @@ impl ReviewSession {
     }
 }
 
+fn package_selector(selector: &str) -> eyre::Result<(&str, Option<semver::Version>)> {
+    match selector.rsplit_once('@') {
+        Some((name, version)) => Ok((
+            name,
+            Some(
+                version
+                    .parse()
+                    .context("invalid package version in selector")?,
+            ),
+        )),
+        None => Ok((selector, None)),
+    }
+}
+
 impl ReviewPackage {
     fn from_package(package: &Package, config: &ConfigFile) -> Self {
         let mut scripts: Vec<_> = package
@@ -120,7 +137,11 @@ impl ReviewPackage {
             })
             .collect();
         scripts.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.name.cmp(&b.name)));
-        let approval = config.config().approved.get(package.name.as_str()).cloned();
+        let approval = config
+            .config()
+            .approved
+            .get(package.name.as_str())
+            .and_then(|a| a.for_review(&package.version));
         Self {
             id: package.id.clone(),
             name: package.name.to_string(),
@@ -139,6 +160,18 @@ mod tests {
     use std::{fs, path::Path};
 
     use super::*;
+
+    #[test]
+    fn version_selector_disambiguates_packages() {
+        let (_root, metadata) = fixture();
+        let session = ReviewSession::from_metadata(&metadata, "duplicate@2.0.0").unwrap();
+        assert_eq!(
+            session.package.version,
+            "2.0.0".parse::<semver::Version>().unwrap()
+        );
+        assert!(ReviewSession::from_metadata(&metadata, "duplicate@3.0.0").is_err());
+        assert!(ReviewSession::from_metadata(&metadata, "duplicate@invalid").is_err());
+    }
 
     fn write(root: &Path, path: &str, content: &str) {
         let path = root.join(path);

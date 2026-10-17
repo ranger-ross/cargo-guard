@@ -57,10 +57,33 @@ impl ConfigFile {
             .or_insert(Item::Table(Table::new()))
             .as_table_like_mut()
             .context("approved must be a TOML table")?;
-        let mut value = Value::from(match approval {
+        let new = match approval {
             ApprovedVersion::SemVer(version) => version.to_string(),
             ApprovedVersion::Fingerprint(fingerprint) => fingerprint,
-        });
+            ApprovedVersion::Multiple(_) => eyre::bail!("add one approval at a time"),
+        };
+        let mut value = if let Some(old) = table.get(package).and_then(Item::as_value) {
+            let mut array = match old {
+                Value::Array(array) => array.clone(),
+                _ => {
+                    let mut array = toml_edit::Array::new();
+                    array.push(old.as_str().context("approval must be a string or array")?);
+                    array
+                }
+            };
+            if array.iter().any(|v| v.as_str() == Some(&new)) {
+                eyre::ensure!(
+                    read_optional(&self.path)? == self.original,
+                    "config {} changed since it was loaded; reload it before saving approvals",
+                    self.path.display()
+                );
+                return Ok(());
+            }
+            array.push(new);
+            Value::Array(array)
+        } else {
+            Value::from(new)
+        };
         // Replacing a value should retain its spacing and trailing comment.
         if let Some(item) = table.get_mut(package) {
             if let Some(old) = item.as_value() {
@@ -84,6 +107,27 @@ impl ConfigFile {
             .context("approved must be a TOML table")?
             .remove(package);
         self.save(document)
+    }
+
+    pub fn remove_version(&mut self, package: &str, version: &semver::Version) -> eyre::Result<()> {
+        let mut document = self.document.clone();
+        let Some(value) = document
+            .get_mut("approved")
+            .and_then(|table| table.get_mut(package))
+            .and_then(Item::as_value_mut)
+        else {
+            return Ok(());
+        };
+        if let Value::Array(array) = value {
+            let target = version.to_string();
+            array.retain(|entry| entry.as_str() != Some(&target));
+            if !array.is_empty() {
+                return self.save(document);
+            }
+        } else if value.as_str() != Some(&version.to_string()) {
+            return Ok(());
+        }
+        self.remove_approval(package)
     }
 
     fn save(&mut self, document: DocumentMut) -> eyre::Result<()> {
@@ -154,6 +198,26 @@ mod tests {
     }
 
     #[test]
+    fn appends_without_duplicates_and_removes_only_selected_version() {
+        let root = tempfile::tempdir().unwrap();
+        let path = config_path(root.path());
+        fs::write(&path, "[approved]\nexample = [\n  'fingerprint', # script one\n  '1.0.0', # old version\n] # package\n").unwrap();
+        let mut file = ConfigFile::open(&path).unwrap();
+        file.set_approval("example", version("2.0.0")).unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("# script one"));
+        assert!(saved.contains("# old version"));
+        assert!(saved.contains("# package"));
+        file.set_approval("example", version("2.0.0")).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), saved);
+        file.remove_version("example", &"2.0.0".parse().unwrap())
+            .unwrap();
+        assert!(file.config.approved["example"].allows_version(&"1.0.0".parse().unwrap()));
+        assert!(file.config.approved["example"].allows_fingerprint("fingerprint"));
+        assert!(!file.config.approved["example"].allows_version(&"2.0.0".parse().unwrap()));
+    }
+
+    #[test]
     fn creates_config_on_first_approval_and_supports_repeated_edits() {
         let root = tempfile::tempdir().unwrap();
         let mut file = ConfigFile::for_workspace(root.path()).unwrap();
@@ -166,9 +230,8 @@ mod tests {
         file.set_approval("another", version("2.0.0")).unwrap();
         file.set_approval("example", version("1.1.0")).unwrap();
         let loaded = super::super::load_config_from(file.path()).unwrap();
-        assert!(
-            matches!(&loaded.approved["example"], ApprovedVersion::SemVer(v) if v.to_string() == "1.1.0")
-        );
+        assert!(loaded.approved["example"].allows_version(&"1.0.0".parse().unwrap()));
+        assert!(loaded.approved["example"].allows_version(&"1.1.0".parse().unwrap()));
         file.remove_approval("example").unwrap();
         assert!(!file.config().approved.contains_key("example"));
         file.remove_approval("another").unwrap();
@@ -198,7 +261,7 @@ mod tests {
         file.set_approval("example", version("1.1.0")).unwrap();
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
-            original.replace("'1.0.0'", "\"1.1.0\"")
+            original.replace("'1.0.0'", "[\"1.0.0\", \"1.1.0\"]")
         );
         file.set_approval("new-package", version("3.0.0")).unwrap();
         file.remove_approval("example").unwrap();

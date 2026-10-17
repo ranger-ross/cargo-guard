@@ -58,35 +58,36 @@ fn check_approval(binary: &Path) -> eyre::Result<()> {
 
     let config = load_config()?;
 
-    match config.approved.get(&build_script.name) {
-        Some(ApprovedVersion::SemVer(version)) => {
-            eyre::ensure!(
-                version.to_string() == build_script.version,
-                "build script for {0} v{1} is not approved: version mismatch\n\n\
-                 Approved version: {2}\n\
-                 Current version:  {1}\n\n\
-                 To approve this version, update the entry under [approved] in approved-builds.toml:\n\n  \
-                 {0} = \"{1}\"",
-                build_script.name,
-                build_script.version,
-                version,
-            );
+    let approval = config.approved.get(&build_script.name);
+    let version: semver::Version = build_script.version.parse()?;
+    if approval.is_some_and(|a| a.allows_version(&version)) {
+        return Ok(());
+    }
+    if approval.is_some_and(|a| {
+        a.entries()
+            .iter()
+            .any(|e| matches!(e, ApprovedVersion::Fingerprint(_)))
+    }) {
+        let fingerprint = build_script.fingerprint()?;
+        if approval.is_some_and(|a| a.allows_fingerprint(&fingerprint)) {
+            return Ok(());
         }
-        Some(ApprovedVersion::Fingerprint(approved)) => {
-            let current = build_script.fingerprint()?;
-            eyre::ensure!(
-                approved == &current,
-                "build script for {0} v{1} is not approved: fingerprint mismatch\n\n\
-                 Approved fingerprint: {2}\n\
-                 Current fingerprint:  {3}\n\n\
-                 To approve this fingerprint, update the entry under [approved] in approved-builds.toml:\n\n  \
-                 {0} = \"{3}\"",
-                build_script.name,
-                build_script.version,
-                approved,
-                current,
-            );
-        }
+        eyre::bail!(
+            "build script for {} v{} is not approved: fingerprint mismatch\nCurrent fingerprint: {}\nExisting approvals: {}\nAppend the current fingerprint or version to this package's approval list in approved-builds.toml.",
+            build_script.name,
+            build_script.version,
+            fingerprint,
+            toml::Value::try_from(approval.unwrap())?
+        );
+    }
+    match approval {
+        Some(approval) => eyre::bail!(
+            "build script for {} v{} is not approved: no matching version\nExisting approvals: {}\nAppend \"{}\" to this package's approval list in approved-builds.toml (convert a single string to an array).",
+            build_script.name,
+            build_script.version,
+            toml::Value::try_from(approval)?,
+            build_script.version
+        ),
         None => eyre::bail!(
             "build script for {0} v{1} is not approved: no approval entry\n\n\
              To approve this version, add this entry under [approved] in approved-builds.toml:\n\n  \
@@ -95,6 +96,4 @@ fn check_approval(binary: &Path) -> eyre::Result<()> {
             build_script.version,
         ),
     }
-
-    Ok(())
 }

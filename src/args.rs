@@ -13,7 +13,7 @@ pub struct Args {
 pub enum Command {
     /// Interactively review and approve build scripts
     Review {
-        /// Package to review; omit to review all packages
+        /// Package name or NAME@VERSION; omit to review all dependency packages
         package: Option<String>,
         #[command(flatten)]
         options: ReviewOptions,
