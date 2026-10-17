@@ -3,14 +3,17 @@ use ratatui::{
     layout::{Constraint, Layout},
     style::{Color, Style},
     text::Line,
-    widgets::{Block, List, ListItem, ListState, Paragraph},
+    widgets::{Block, List, ListItem, ListState, Paragraph, Wrap},
 };
 
 use super::app::App;
+use super::sources::Baseline;
 
 pub fn render(frame: &mut Frame, app: &mut App) {
-    let [header, body, footer] = Layout::vertical([
+    let unavailable = matches!(app.baseline, Baseline::Unavailable { .. });
+    let [header, baseline, body, footer] = Layout::vertical([
         Constraint::Length(5),
+        Constraint::Length(if unavailable { 4 } else { 1 }),
         Constraint::Min(0),
         Constraint::Length(2),
     ])
@@ -33,6 +36,17 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         package.name, package.version
     )));
     frame.render_widget(heading, header);
+    let baseline_style = Style::default().fg(if unavailable {
+        Color::Yellow
+    } else {
+        Color::DarkGray
+    });
+    frame.render_widget(
+        Paragraph::new(app.baseline.message())
+            .wrap(Wrap { trim: false })
+            .style(baseline_style),
+        baseline,
+    );
 
     let [files, source] = if body.width >= 80 {
         Layout::horizontal([Constraint::Length(30), Constraint::Min(0)]).areas(body)

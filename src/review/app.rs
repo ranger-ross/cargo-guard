@@ -3,11 +3,12 @@ use std::fs;
 use eyre::Context;
 use ratatui::text::Line;
 
-use super::{ReviewSession, highlight::Highlighter};
+use super::{ReviewSession, highlight::Highlighter, sources::Baseline};
 use crate::config::ApprovedVersion;
 
 pub struct App {
     pub session: ReviewSession,
+    pub baseline: Baseline,
     pub files: Vec<SourceFile>,
     pub selected: usize,
     pub top: usize,
@@ -50,6 +51,7 @@ impl App {
             .collect::<eyre::Result<Vec<_>>>()?;
         eyre::ensure!(!files.is_empty(), "no build scripts to display");
         Ok(Self {
+            baseline: Baseline::for_session(&session),
             session,
             files,
             selected: 0,

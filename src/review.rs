@@ -8,6 +8,7 @@ use crate::config::{ApprovedVersion, edit::ConfigFile};
 mod app;
 mod highlight;
 mod input;
+mod sources;
 mod tui;
 mod ui;
 
@@ -16,7 +17,7 @@ pub struct ReviewSession {
     pub config: ConfigFile,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ReviewPackage {
     pub id: PackageId,
     pub name: String,
@@ -27,7 +28,7 @@ pub struct ReviewPackage {
     pub scripts: Vec<BuildScript>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct BuildScript {
     pub name: String,
     pub path: PathBuf,
