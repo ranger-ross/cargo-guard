@@ -26,8 +26,10 @@ pub fn render_queue(frame: &mut Frame, state: &mut QueueState) {
         Layout::horizontal([Constraint::Length(sidebar_width), Constraint::Min(0)])
             .areas(frame.area())
     } else {
-        Layout::vertical([Constraint::Length(4), Constraint::Min(0)]).areas(frame.area())
+        Layout::vertical([Constraint::Length(5), Constraint::Min(0)]).areas(frame.area())
     };
+    let [packages, package_help] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(packages);
     let visible = usize::from(packages.height.saturating_sub(if wide { 1 } else { 2 })).max(1);
     let start = state
         .selected
@@ -74,6 +76,18 @@ pub fn render_queue(frame: &mut Frame, state: &mut QueueState) {
         packages,
         &mut ListState::default().with_selected(Some(state.selected - start)),
     );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("j/k", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(" scroll packages", muted()),
+        ]))
+        .block(
+            Block::new()
+                .borders(if wide { Borders::RIGHT } else { Borders::NONE })
+                .border_style(muted()),
+        ),
+        package_help,
+    );
     if let Some(app) = &mut state.app {
         render_area(frame, app, review);
     } else {
@@ -96,7 +110,7 @@ pub fn render_queue(frame: &mut Frame, state: &mut QueueState) {
                     Color::Red,
                 ),
                 Line::default(),
-                Line::styled("j/k packages   s skip   q quit", muted()),
+                Line::styled("s skip   q quit", muted()),
             ])
             .wrap(Wrap { trim: false }),
             review,
@@ -260,8 +274,9 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         keys.push(("r", "reject"));
     }
     if app.queue_mode {
-        keys.extend([("j/k", "packages"), ("s", "skip")]);
+        keys.push(("s", "skip"));
     }
+    keys.push(("↑/↓/←/→", "scroll"));
     if app.files.len() > 1 {
         keys.push(("Tab", "files"));
     }
