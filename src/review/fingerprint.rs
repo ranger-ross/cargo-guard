@@ -91,7 +91,7 @@ fn from_directory(
             .collect();
         let check_fresh = || -> eyre::Result<()> {
             for path in &paths {
-                let modified = fs::metadata(&path)
+                let modified = fs::metadata(path)
                     .with_context(|| format!("could not read tracked input {}", path.display()))?
                     .modified()?;
                 eyre::ensure!(
