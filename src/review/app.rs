@@ -9,6 +9,17 @@ use super::{
 use crate::config::ApprovedVersion;
 use eyre::Context;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decision {
+    Approve,
+    Reject,
+}
+
+pub struct Notice {
+    pub message: String,
+    pub is_error: bool,
+}
+
 pub struct App {
     pub session: ReviewSession,
     pub baseline: Baseline,
@@ -21,6 +32,8 @@ pub struct App {
     pub height: usize,
     pub width: usize,
     change_target: Option<usize>,
+    pub decision: Option<Decision>,
+    pub notice: Option<Notice>,
 }
 
 impl App {
@@ -59,6 +72,8 @@ impl App {
             height: 0,
             width: 0,
             change_target: None,
+            decision: None,
+            notice: None,
         })
     }
 
@@ -68,6 +83,11 @@ impl App {
 
     pub fn set_baseline(&mut self, baseline: Baseline) -> eyre::Result<()> {
         let files = diff::build_files(&self.current, &baseline, &self.highlighter)?;
+        self.replace_files(baseline, files);
+        Ok(())
+    }
+
+    fn replace_files(&mut self, baseline: Baseline, files: Vec<ReviewFile>) {
         self.selected = files
             .iter()
             .position(|file| file.path == self.file().path)
@@ -77,7 +97,88 @@ impl App {
         self.top = 0;
         self.left = 0;
         self.change_target = None;
+    }
+
+    /// Save first; publish the new approval/decision only after persistence
+    /// succeeds. Rendering preparation is also done before modifying the file.
+    pub fn decide(&mut self, decision: Decision) -> eyre::Result<()> {
+        eyre::ensure!(
+            !matches!(
+                self.session.package.approval,
+                Some(ApprovedVersion::Fingerprint(_))
+            ),
+            "fingerprint approvals cannot be changed by version review"
+        );
+        let revoke = matches!(
+            &self.session.package.approval,
+            Some(ApprovedVersion::SemVer(version)) if version == &self.session.package.version
+        );
+        let next_baseline = match decision {
+            Decision::Approve => Some(Baseline::CurrentVersion),
+            Decision::Reject if revoke => Some(Baseline::NewPackage),
+            Decision::Reject => None,
+        };
+        let prepared = next_baseline
+            .map(|baseline| {
+                diff::build_files(&self.current, &baseline, &self.highlighter)
+                    .map(|files| (baseline, files))
+            })
+            .transpose()?;
+        let package = &self.session.package;
+        let message = match decision {
+            Decision::Approve => {
+                self.session.config.set_approval(
+                    &package.name,
+                    ApprovedVersion::SemVer(package.version.clone()),
+                )?;
+                format!(
+                    "Approved {} v{}; saved to {}",
+                    package.name,
+                    package.version,
+                    self.session.config.path().display()
+                )
+            }
+            Decision::Reject if revoke => {
+                self.session.config.remove_approval(&package.name)?;
+                format!(
+                    "Rejected {} v{}; its approval was removed",
+                    package.name, package.version
+                )
+            }
+            Decision::Reject => match &package.approval {
+                Some(ApprovedVersion::SemVer(version)) => format!(
+                    "Rejected {} v{}; approval for v{version} retained",
+                    package.name, package.version
+                ),
+                _ => format!(
+                    "Rejected {} v{}; no approval was added",
+                    package.name, package.version
+                ),
+            },
+        };
+        self.session.package.approval = self
+            .session
+            .config
+            .config()
+            .approved
+            .get(&self.session.package.name)
+            .cloned();
+        if let Some((baseline, files)) = prepared {
+            self.replace_files(baseline, files);
+        }
+        self.decision = Some(decision);
+        self.notice = Some(Notice {
+            message,
+            is_error: false,
+        });
         Ok(())
+    }
+
+    pub fn report_decision_error(&mut self, error: eyre::Report) {
+        self.notice = Some(Notice {
+            message: format!("Decision failed: {error:#}"),
+            is_error: true,
+        });
     }
 
     pub fn baseline_message(&self) -> String {
@@ -114,7 +215,26 @@ impl App {
         }
     }
 
+    pub fn is_current_version_approved(&self) -> bool {
+        matches!(
+            &self.session.package.approval,
+            Some(ApprovedVersion::SemVer(version)) if version == &self.session.package.version
+        )
+    }
+
     pub fn approval_status(&self) -> String {
+        if self.decision == Some(Decision::Reject) {
+            return match &self.session.package.approval {
+                Some(ApprovedVersion::SemVer(version)) => format!(
+                    "Rejected current v{}; v{version} remains approved",
+                    self.session.package.version
+                ),
+                _ => format!(
+                    "Rejected: v{} is not approved",
+                    self.session.package.version
+                ),
+            };
+        }
         match &self.session.package.approval {
             Some(ApprovedVersion::SemVer(version)) if version == &self.session.package.version => {
                 format!("Approved: v{version}")
@@ -207,6 +327,108 @@ pub(super) mod tests {
             config: ConfigFile::for_workspace(root.path()).unwrap(),
         };
         (root, App::new(session).unwrap())
+    }
+
+    #[test]
+    fn approves_package_then_revokes_its_current_version() {
+        let (_root, mut app) = fixture(&["fn main() {}\n", "// second script\n"]);
+        app.decide(Decision::Approve).unwrap();
+        let saved = crate::config::load_config_from(app.session.config.path()).unwrap();
+        assert!(
+            matches!(&saved.approved["example"], ApprovedVersion::SemVer(v) if *v == app.session.package.version)
+        );
+        assert_eq!(saved.approved.len(), 1);
+        assert_eq!(app.decision, Some(Decision::Approve));
+        assert!(matches!(app.baseline, Baseline::CurrentVersion));
+        assert_eq!(app.approval_status(), "Approved: v0.1.0");
+
+        app.decide(Decision::Reject).unwrap();
+        assert!(
+            crate::config::load_config_from(app.session.config.path())
+                .unwrap()
+                .approved
+                .is_empty()
+        );
+        assert!(app.session.package.approval.is_none());
+        assert_eq!(app.decision, Some(Decision::Reject));
+        assert!(matches!(app.baseline, Baseline::NewPackage));
+        assert!(app.approval_status().contains("Rejected"));
+    }
+
+    #[test]
+    fn rejecting_new_or_upgraded_versions_keeps_config_unchanged() {
+        let (_root, mut app) = fixture(&["fn main() {}\n"]);
+        app.decide(Decision::Reject).unwrap();
+        assert!(!app.session.config.path().exists());
+
+        app.session
+            .config
+            .set_approval("example", ApprovedVersion::SemVer("0.0.1".parse().unwrap()))
+            .unwrap();
+        let mut app = App::new(app.session).unwrap();
+        // Reconstruct the package's approval as discovery would do on startup.
+        app.session.package.approval = app.session.config.config().approved.get("example").cloned();
+        app.baseline = Baseline::for_session(&app.session);
+        let before = fs::read(app.session.config.path()).unwrap();
+        app.decide(Decision::Reject).unwrap();
+        assert_eq!(fs::read(app.session.config.path()).unwrap(), before);
+        assert!(app.approval_status().contains("v0.0.1 remains approved"));
+        assert!(matches!(app.baseline, Baseline::Loading(_)));
+        app.decide(Decision::Approve).unwrap();
+        assert!(
+            matches!(&app.session.package.approval, Some(ApprovedVersion::SemVer(v)) if *v == app.session.package.version)
+        );
+    }
+
+    #[test]
+    fn fingerprint_approvals_are_not_overwritten_or_revoked() {
+        let (_root, mut app) = fixture(&["fn main() {}\n"]);
+        app.session
+            .config
+            .set_approval("example", ApprovedVersion::Fingerprint("abc123".into()))
+            .unwrap();
+        app.session.package.approval = app.session.config.config().approved.get("example").cloned();
+        let before = fs::read(app.session.config.path()).unwrap();
+        for decision in [Decision::Approve, Decision::Reject] {
+            assert!(app.decide(decision).is_err());
+            assert_eq!(fs::read(app.session.config.path()).unwrap(), before);
+            assert_eq!(app.decision, None);
+        }
+    }
+
+    #[test]
+    fn save_failures_leave_decisions_and_approvals_unchanged() {
+        let (_root, mut app) = fixture(&["fn main() {}\n"]);
+        fs::write(app.session.config.path(), "[approved]\nother = '1.0.0'\n").unwrap();
+        let before = fs::read(app.session.config.path()).unwrap();
+        let error = app.decide(Decision::Approve).unwrap_err();
+        app.report_decision_error(error);
+        assert!(app.notice.as_ref().unwrap().is_error);
+        assert!(
+            app.notice
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("changed since it was loaded")
+        );
+        assert_eq!(app.decision, None);
+        assert!(app.session.package.approval.is_none());
+        assert_eq!(fs::read(app.session.config.path()).unwrap(), before);
+
+        app.session.config = ConfigFile::open(app.session.config.path()).unwrap();
+        app.decide(Decision::Approve).unwrap();
+        let changed = format!(
+            "{}\n# external edit\n",
+            fs::read_to_string(app.session.config.path()).unwrap()
+        );
+        fs::write(app.session.config.path(), &changed).unwrap();
+        assert!(app.decide(Decision::Reject).is_err());
+        assert_eq!(app.decision, Some(Decision::Approve));
+        assert_eq!(app.approval_status(), "Approved: v0.1.0");
+        assert_eq!(
+            fs::read_to_string(app.session.config.path()).unwrap(),
+            changed
+        );
     }
 
     #[test]

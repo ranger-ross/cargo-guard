@@ -12,8 +12,9 @@ use super::sources::Baseline;
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let unavailable = matches!(app.baseline, Baseline::Unavailable { .. });
-    let [header, baseline, body, footer] = Layout::vertical([
+    let [header, notice, baseline, body, footer] = Layout::vertical([
         Constraint::Length(5),
+        Constraint::Length(if app.notice.is_some() { 3 } else { 0 }),
         Constraint::Length(if unavailable { 4 } else { 1 }),
         Constraint::Min(0),
         Constraint::Length(2),
@@ -33,10 +34,22 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         )),
     ])
     .block(Block::bordered().title(format!(
-        " {} v{} — Read-only review ",
+        " {} v{} — Build script review ",
         package.name, package.version
     )));
     frame.render_widget(heading, header);
+    if let Some(message) = &app.notice {
+        frame.render_widget(
+            Paragraph::new(message.message.as_str())
+                .wrap(Wrap { trim: false })
+                .style(Style::default().fg(if message.is_error {
+                    Color::Red
+                } else {
+                    Color::Green
+                })),
+            notice,
+        );
+    }
     let baseline_style = Style::default().fg(if unavailable {
         Color::Yellow
     } else {
@@ -137,7 +150,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             Line::from(
                 "↑/↓ j/k Scroll · ←/→ h/l Pan · PgUp/PgDn · Home/End · [/] Changes · Tab Files · q Quit",
             ),
-            Line::from(format!("{position} · Read-only: approvals are not changed")),
+            Line::from(if app.is_current_version_approved() {
+                format!("{position} · Current version already approved · q Quit")
+            } else {
+                format!("{position} · a Approve version · r Reject · Decide and exit")
+            }),
         ]),
         footer,
     );
@@ -149,6 +166,26 @@ mod tests {
 
     use super::*;
     use crate::review::app::tests::fixture;
+
+    #[test]
+    fn hides_decision_actions_for_approved_versions() {
+        let (_root, mut app) = fixture(&["fn main() {}"]);
+        app.session.package.approval = Some(crate::config::ApprovedVersion::SemVer(
+            app.session.package.version.clone(),
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("Current version already approved"));
+        assert!(!screen.contains("a Approve"));
+        assert!(!screen.contains("r Reject"));
+    }
 
     #[test]
     fn colors_entire_diff_rows_while_retaining_syntax_foregrounds() {
@@ -204,7 +241,7 @@ mod tests {
             .collect();
         assert!(screen.contains("fn main()"));
         assert!(screen.contains("no previous approval"));
-        assert!(screen.contains("Read-only review"));
+        assert!(screen.contains("Build script review"));
         app.switch_file(false);
         for (width, height) in [(100, 24), (40, 12), (1, 1), (0, 0)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();

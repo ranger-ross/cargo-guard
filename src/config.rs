@@ -7,8 +7,6 @@ use std::{
 use eyre::Context;
 use serde::{Deserialize, Serialize};
 
-// Used by the review command in the next implementation steps.
-#[allow(dead_code)]
 pub mod edit;
 
 #[derive(Debug, Deserialize, Serialize)]

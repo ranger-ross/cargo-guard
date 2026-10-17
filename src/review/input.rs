@@ -6,16 +6,27 @@ use super::app::App;
 pub enum Action {
     Continue,
     Quit,
+    Approve,
+    Reject,
 }
 
 pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
     if key.kind == KeyEventKind::Release {
         return Action::Continue;
     }
+    if matches!(key.code, KeyCode::Char('a' | 'r')) && app.is_current_version_approved() {
+        return Action::Continue;
+    }
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Action::Quit;
     }
     match key.code {
+        KeyCode::Char('a') if key.kind == KeyEventKind::Press && key.modifiers.is_empty() => {
+            return Action::Approve;
+        }
+        KeyCode::Char('r') if key.kind == KeyEventKind::Press && key.modifiers.is_empty() => {
+            return Action::Reject;
+        }
         KeyCode::Char('q') | KeyCode::Esc => return Action::Quit,
         KeyCode::Down | KeyCode::Char('j') => app.scroll(1, 0),
         KeyCode::Up | KeyCode::Char('k') => app.scroll(-1, 0),
@@ -38,6 +49,49 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
 mod tests {
     use super::*;
     use crate::review::app::tests::fixture;
+
+    #[test]
+    fn approved_versions_ignore_approval_and_rejection_keys() {
+        let (_root, mut app) = fixture(&["fn main() {}"]);
+        app.session.package.approval = Some(crate::config::ApprovedVersion::SemVer(
+            app.session.package.version.clone(),
+        ));
+        for character in ['a', 'r'] {
+            assert_eq!(
+                handle_key(
+                    &mut app,
+                    KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)
+                ),
+                Action::Continue
+            );
+        }
+    }
+
+    #[test]
+    fn approval_actions_require_an_unmodified_key_press() {
+        let (_root, mut app) = fixture(&["fn main() {}"]);
+        for (character, action) in [('a', Action::Approve), ('r', Action::Reject)] {
+            let key = KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE);
+            assert_eq!(handle_key(&mut app, key), action);
+            for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+                assert_eq!(
+                    handle_key(&mut app, KeyEvent { kind, ..key }),
+                    Action::Continue
+                );
+            }
+            assert_eq!(
+                handle_key(
+                    &mut app,
+                    KeyEvent {
+                        modifiers: KeyModifiers::CONTROL,
+                        ..key
+                    }
+                ),
+                Action::Continue
+            );
+        }
+        assert!(!app.session.config.path().exists());
+    }
 
     #[test]
     fn handles_navigation_quit_and_key_release() {

@@ -6,7 +6,7 @@ use eyre::Context;
 
 use super::{
     ReviewSession,
-    app::App,
+    app::{App, Decision},
     input::{self, Action},
     sources::BaselineLoader,
     ui,
@@ -35,9 +35,17 @@ pub fn run(session: ReviewSession) -> eyre::Result<()> {
         if !event::poll(Duration::from_millis(100)).context("could not poll terminal events")? {
             continue;
         }
-        match event::read().context("could not read terminal event")? {
-            Event::Key(key) if input::handle_key(&mut app, key) == Action::Quit => break,
-            _ => {}
+        if let Event::Key(key) = event::read().context("could not read terminal event")? {
+            let decision = match input::handle_key(&mut app, key) {
+                Action::Quit => break,
+                Action::Approve => Decision::Approve,
+                Action::Reject => Decision::Reject,
+                Action::Continue => continue,
+            };
+            match app.decide(decision) {
+                Ok(()) => break,
+                Err(error) => app.report_decision_error(error),
+            }
         }
     }
     Ok(())
