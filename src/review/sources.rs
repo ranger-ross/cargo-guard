@@ -82,6 +82,78 @@ impl Baseline {
     }
 }
 
+pub struct BaselineLoader {
+    receiver: mpsc::Receiver<Baseline>,
+    cancelled: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl BaselineLoader {
+    pub fn start(session: &ReviewSession) -> eyre::Result<Option<Self>> {
+        let Baseline::Loading(version) = Baseline::for_session(session) else {
+            return Ok(None);
+        };
+        let request = SourceRequest {
+            name: session.package.name.clone(),
+            version: version.clone(),
+            source: session
+                .package
+                .source
+                .as_ref()
+                .map(|source| source.repr.clone()),
+            workspace_root: session
+                .config
+                .path()
+                .parent()
+                .context("approval file has no parent")?
+                .to_path_buf(),
+        };
+        let (sender, receiver) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = cancelled.clone();
+        let worker = thread::Builder::new()
+            .name("approved-sources".into())
+            .spawn(move || {
+                let result = load_sources(&request, &worker_cancelled);
+                let baseline = match result {
+                    Ok(sources) => Baseline::Ready(sources),
+                    Err(error) => Baseline::Unavailable {
+                        version,
+                        reason: format!("{error:#}"),
+                    },
+                };
+                let _ = sender.send(baseline);
+            })
+            .context("could not start baseline source loader")?;
+        Ok(Some(Self {
+            receiver,
+            cancelled,
+            worker: Some(worker),
+        }))
+    }
+
+    pub fn poll(&self) -> Option<Baseline> {
+        self.receiver.try_recv().ok()
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.worker.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+}
+
+impl Drop for BaselineLoader {
+    fn drop(&mut self) {
+        self.cancel();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 struct SourceRequest {
     name: String,
     version: semver::Version,
@@ -230,78 +302,6 @@ fn execute_metadata(command: &MetadataCommand, cancelled: &AtomicBool) -> eyre::
     );
     MetadataCommand::parse(fs::read_to_string(stdout.path())?)
         .context("could not parse Cargo metadata for the approved release")
-}
-
-pub struct BaselineLoader {
-    receiver: mpsc::Receiver<Baseline>,
-    cancelled: Arc<AtomicBool>,
-    worker: Option<JoinHandle<()>>,
-}
-
-impl BaselineLoader {
-    pub fn start(session: &ReviewSession) -> eyre::Result<Option<Self>> {
-        let Baseline::Loading(version) = Baseline::for_session(session) else {
-            return Ok(None);
-        };
-        let request = SourceRequest {
-            name: session.package.name.clone(),
-            version: version.clone(),
-            source: session
-                .package
-                .source
-                .as_ref()
-                .map(|source| source.repr.clone()),
-            workspace_root: session
-                .config
-                .path()
-                .parent()
-                .context("approval file has no parent")?
-                .to_path_buf(),
-        };
-        let (sender, receiver) = mpsc::channel();
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let worker_cancelled = cancelled.clone();
-        let worker = thread::Builder::new()
-            .name("approved-sources".into())
-            .spawn(move || {
-                let result = load_sources(&request, &worker_cancelled);
-                let baseline = match result {
-                    Ok(sources) => Baseline::Ready(sources),
-                    Err(error) => Baseline::Unavailable {
-                        version,
-                        reason: format!("{error:#}"),
-                    },
-                };
-                let _ = sender.send(baseline);
-            })
-            .context("could not start baseline source loader")?;
-        Ok(Some(Self {
-            receiver,
-            cancelled,
-            worker: Some(worker),
-        }))
-    }
-
-    pub fn poll(&self) -> Option<Baseline> {
-        self.receiver.try_recv().ok()
-    }
-
-    pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Relaxed);
-    }
-
-    pub fn is_finished(&self) -> bool {
-        self.worker.as_ref().is_none_or(JoinHandle::is_finished)
-    }
-}
-
-impl Drop for BaselineLoader {
-    fn drop(&mut self) {
-        self.cancel();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-    }
 }
 
 #[cfg(test)]

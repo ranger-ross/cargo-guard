@@ -9,18 +9,6 @@ use super::{
 use crate::config::ApprovedVersion;
 use eyre::Context;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Decision {
-    Approve,
-    ApproveFingerprint,
-    Reject,
-}
-
-pub struct Notice {
-    pub message: String,
-    pub is_error: bool,
-}
-
 pub struct App {
     pub session: ReviewSession,
     pub baseline: Baseline,
@@ -92,18 +80,6 @@ impl App {
         let files = diff::build_files(&self.current, &baseline, &self.highlighter)?;
         self.replace_files(baseline, files);
         Ok(())
-    }
-
-    fn replace_files(&mut self, baseline: Baseline, files: Vec<ReviewFile>) {
-        self.selected = files
-            .iter()
-            .position(|file| file.path == self.file().path)
-            .unwrap_or(0);
-        self.files = files;
-        self.baseline = baseline;
-        self.top = 0;
-        self.left = 0;
-        self.change_target = None;
     }
 
     /// Save first; publish the new approval/decision only after persistence
@@ -198,39 +174,6 @@ impl App {
             self.session.package.approval,
             Some(ApprovedVersion::Fingerprint(_))
         )
-    }
-
-    fn approve_fingerprints(&mut self) -> eyre::Result<()> {
-        eyre::ensure!(
-            self.can_decide(),
-            "this package is already approved or read-only"
-        );
-        let approvals = super::fingerprint::approvals(&self.session)?;
-        eyre::ensure!(
-            read_sources(&self.session)? == self.current,
-            "build script sources changed since opening review; reopen review before approving"
-        );
-        self.session
-            .config
-            .add_approvals(&self.session.package.name, &approvals)?;
-        self.session.package.approval = self
-            .session
-            .config
-            .config()
-            .approved
-            .get(&self.session.package.name)
-            .and_then(|a| a.for_review(&self.session.package.version));
-        self.decision = Some(Decision::ApproveFingerprint);
-        self.notice = Some(Notice {
-            message: format!(
-                "Approved {} fingerprint(s) for {} v{}",
-                approvals.len(),
-                self.session.package.name,
-                self.session.package.version
-            ),
-            is_error: false,
-        });
-        Ok(())
     }
 
     pub fn baseline_message(&self) -> String {
@@ -330,13 +273,6 @@ impl App {
         self.file().rows.len().saturating_sub(self.height.max(1))
     }
 
-    fn max_left(&self) -> u16 {
-        self.file()
-            .width
-            .saturating_sub(self.width.max(1))
-            .min(u16::MAX as usize) as u16
-    }
-
     pub fn scroll(&mut self, rows: isize, columns: i16) {
         self.change_target = None;
         self.top = self.top.saturating_add_signed(rows).min(self.max_top());
@@ -356,6 +292,70 @@ impl App {
         self.top = 0;
         self.left = 0;
     }
+
+    fn replace_files(&mut self, baseline: Baseline, files: Vec<ReviewFile>) {
+        self.selected = files
+            .iter()
+            .position(|file| file.path == self.file().path)
+            .unwrap_or(0);
+        self.files = files;
+        self.baseline = baseline;
+        self.top = 0;
+        self.left = 0;
+        self.change_target = None;
+    }
+
+    fn approve_fingerprints(&mut self) -> eyre::Result<()> {
+        eyre::ensure!(
+            self.can_decide(),
+            "this package is already approved or read-only"
+        );
+        let approvals = super::fingerprint::approvals(&self.session)?;
+        eyre::ensure!(
+            read_sources(&self.session)? == self.current,
+            "build script sources changed since opening review; reopen review before approving"
+        );
+        self.session
+            .config
+            .add_approvals(&self.session.package.name, &approvals)?;
+        self.session.package.approval = self
+            .session
+            .config
+            .config()
+            .approved
+            .get(&self.session.package.name)
+            .and_then(|a| a.for_review(&self.session.package.version));
+        self.decision = Some(Decision::ApproveFingerprint);
+        self.notice = Some(Notice {
+            message: format!(
+                "Approved {} fingerprint(s) for {} v{}",
+                approvals.len(),
+                self.session.package.name,
+                self.session.package.version
+            ),
+            is_error: false,
+        });
+        Ok(())
+    }
+
+    fn max_left(&self) -> u16 {
+        self.file()
+            .width
+            .saturating_sub(self.width.max(1))
+            .min(u16::MAX as usize) as u16
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decision {
+    Approve,
+    ApproveFingerprint,
+    Reject,
+}
+
+pub struct Notice {
+    pub message: String,
+    pub is_error: bool,
 }
 
 fn read_sources(session: &ReviewSession) -> eyre::Result<Vec<ScriptSource>> {

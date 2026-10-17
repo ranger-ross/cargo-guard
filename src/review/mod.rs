@@ -112,20 +112,6 @@ impl ReviewSession {
     }
 }
 
-fn package_selector(selector: &str) -> eyre::Result<(&str, Option<semver::Version>)> {
-    match selector.rsplit_once('@') {
-        Some((name, version)) => Ok((
-            name,
-            Some(
-                version
-                    .parse()
-                    .context("invalid package version in selector")?,
-            ),
-        )),
-        None => Ok((selector, None)),
-    }
-}
-
 impl ReviewPackage {
     fn from_package(package: &Package, config: &ConfigFile) -> Self {
         let mut scripts: Vec<_> = package
@@ -152,6 +138,20 @@ impl ReviewPackage {
             approval,
             scripts,
         }
+    }
+}
+
+fn package_selector(selector: &str) -> eyre::Result<(&str, Option<semver::Version>)> {
+    match selector.rsplit_once('@') {
+        Some((name, version)) => Ok((
+            name,
+            Some(
+                version
+                    .parse()
+                    .context("invalid package version in selector")?,
+            ),
+        )),
+        None => Ok((selector, None)),
     }
 }
 

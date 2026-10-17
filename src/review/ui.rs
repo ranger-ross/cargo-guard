@@ -15,24 +15,6 @@ use super::{
 };
 use crate::config::ApprovedVersion;
 
-fn muted() -> Style {
-    Style::default().fg(Color::DarkGray)
-}
-
-fn bold(color: Color) -> Style {
-    Style::default().fg(color).add_modifier(Modifier::BOLD)
-}
-
-// Cargo uses right-aligned, bold status verbs and the terminal's own palette.
-fn status_line(label: &str, message: String, color: Color) -> Line<'static> {
-    let label = if matches!(label, "error" | "warning") {
-        format!("{label}: ")
-    } else {
-        format!("{label:>12} ")
-    };
-    Line::from(vec![Span::styled(label, bold(color)), Span::raw(message)])
-}
-
 pub fn render(frame: &mut Frame, app: &mut App) {
     render_area(frame, app, frame.area());
 }
@@ -120,80 +102,6 @@ pub fn render_queue(frame: &mut Frame, state: &mut QueueState) {
             review,
         );
     }
-}
-
-fn heading(app: &App) -> Line<'static> {
-    let package = &app.session.package;
-    let (label, color) = if app.decision_blocked.is_some() {
-        ("Blocked", Color::Yellow)
-    } else if app.decision == Some(Decision::Reject) {
-        ("Rejected", Color::Red)
-    } else if app.is_current_version_approved()
-        || app.decision == Some(Decision::ApproveFingerprint)
-    {
-        ("Approved", Color::Green)
-    } else {
-        ("Reviewing", Color::Green)
-    };
-    let version = match &package.approval {
-        Some(ApprovedVersion::SemVer(old)) if old != &package.version => {
-            format!("{} v{old} -> v{}", package.name, package.version)
-        }
-        _ => format!("{} v{}", package.name, package.version),
-    };
-    let mut line = status_line(label, version, color);
-    let suffix = match &package.approval {
-        None => " (new)",
-        Some(ApprovedVersion::Fingerprint(_)) => " (fingerprint)",
-        _ => "",
-    };
-    line.spans.push(Span::styled(suffix, muted()));
-    line
-}
-
-fn baseline_note(app: &App) -> Option<Line<'static>> {
-    if let Some(reason) = &app.decision_blocked {
-        return Some(status_line("warning", reason.clone(), Color::Yellow));
-    }
-    match &app.baseline {
-        Baseline::Loading(version) => Some(status_line(
-            "Fetching",
-            format!("approved v{version}"),
-            Color::Green,
-        )),
-        Baseline::Unavailable { version, reason } => Some(status_line(
-            "warning",
-            format!("approved v{version} source unavailable: {reason}"),
-            Color::Yellow,
-        )),
-        Baseline::Ready(_)
-            if app
-                .files
-                .iter()
-                .all(|file| file.status == FileStatus::Unchanged) =>
-        {
-            Some(status_line(
-                "Unchanged",
-                "build scripts; the new version still needs approval".into(),
-                Color::Green,
-            ))
-        }
-        _ => None,
-    }
-}
-
-fn message_height(line: Option<&Line<'_>>, width: u16) -> u16 {
-    line.map_or(0, |line| {
-        let text: String = line
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect();
-        text.lines()
-            .map(|line| line.width().div_ceil(usize::from(width).max(1)).max(1))
-            .sum::<usize>()
-            .clamp(1, 4) as u16
-    })
 }
 
 fn render_area(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -473,6 +381,98 @@ fn render_help(frame: &mut Frame, app: &App) {
             .wrap(Wrap { trim: false }),
         popup,
     );
+}
+
+fn heading(app: &App) -> Line<'static> {
+    let package = &app.session.package;
+    let (label, color) = if app.decision_blocked.is_some() {
+        ("Blocked", Color::Yellow)
+    } else if app.decision == Some(Decision::Reject) {
+        ("Rejected", Color::Red)
+    } else if app.is_current_version_approved()
+        || app.decision == Some(Decision::ApproveFingerprint)
+    {
+        ("Approved", Color::Green)
+    } else {
+        ("Reviewing", Color::Green)
+    };
+    let version = match &package.approval {
+        Some(ApprovedVersion::SemVer(old)) if old != &package.version => {
+            format!("{} v{old} -> v{}", package.name, package.version)
+        }
+        _ => format!("{} v{}", package.name, package.version),
+    };
+    let mut line = status_line(label, version, color);
+    let suffix = match &package.approval {
+        None => " (new)",
+        Some(ApprovedVersion::Fingerprint(_)) => " (fingerprint)",
+        _ => "",
+    };
+    line.spans.push(Span::styled(suffix, muted()));
+    line
+}
+
+fn baseline_note(app: &App) -> Option<Line<'static>> {
+    if let Some(reason) = &app.decision_blocked {
+        return Some(status_line("warning", reason.clone(), Color::Yellow));
+    }
+    match &app.baseline {
+        Baseline::Loading(version) => Some(status_line(
+            "Fetching",
+            format!("approved v{version}"),
+            Color::Green,
+        )),
+        Baseline::Unavailable { version, reason } => Some(status_line(
+            "warning",
+            format!("approved v{version} source unavailable: {reason}"),
+            Color::Yellow,
+        )),
+        Baseline::Ready(_)
+            if app
+                .files
+                .iter()
+                .all(|file| file.status == FileStatus::Unchanged) =>
+        {
+            Some(status_line(
+                "Unchanged",
+                "build scripts; the new version still needs approval".into(),
+                Color::Green,
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn message_height(line: Option<&Line<'_>>, width: u16) -> u16 {
+    line.map_or(0, |line| {
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        text.lines()
+            .map(|line| line.width().div_ceil(usize::from(width).max(1)).max(1))
+            .sum::<usize>()
+            .clamp(1, 4) as u16
+    })
+}
+
+fn muted() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
+
+fn bold(color: Color) -> Style {
+    Style::default().fg(color).add_modifier(Modifier::BOLD)
+}
+
+// Cargo uses right-aligned, bold status verbs and the terminal's own palette.
+fn status_line(label: &str, message: String, color: Color) -> Line<'static> {
+    let label = if matches!(label, "error" | "warning") {
+        format!("{label}: ")
+    } else {
+        format!("{label:>12} ")
+    };
+    Line::from(vec![Span::styled(label, bold(color)), Span::raw(message)])
 }
 
 #[cfg(test)]

@@ -13,68 +13,7 @@ use super::{
 };
 use crate::config::{ApprovedVersion, edit::ConfigFile};
 
-pub struct Entry {
-    pub package: ReviewPackage,
-    pub decision: Option<Decision>,
-    pub skipped: bool,
-    pub error: Option<String>,
-    pub baseline_unavailable: bool,
-}
-
-impl Entry {
-    fn already_approved(&self) -> bool {
-        matches!(&self.package.approval, Some(ApprovedVersion::SemVer(version)) if version == &self.package.version)
-    }
-
-    fn fingerprint_only(&self) -> bool {
-        matches!(self.package.approval, Some(ApprovedVersion::Fingerprint(_)))
-    }
-
-    fn actionable(&self) -> bool {
-        self.decision.is_none() && !self.skipped && !self.already_approved() && self.error.is_none()
-    }
-
-    pub fn status(&self) -> &str {
-        if self.error.is_some() {
-            "load error"
-        } else if matches!(
-            self.decision,
-            Some(Decision::Approve | Decision::ApproveFingerprint)
-        ) {
-            "approved"
-        } else if self.decision == Some(Decision::Reject) {
-            "rejected"
-        } else if self.fingerprint_only() {
-            "fingerprint"
-        } else if self.already_approved() {
-            "already approved"
-        } else if self.skipped {
-            "skipped"
-        } else if self.baseline_unavailable {
-            "baseline unavailable"
-        } else {
-            "pending"
-        }
-    }
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct Summary {
-    pub approved: usize,
-    pub rejected: usize,
-    pub skipped: usize,
-    pub unresolved: usize,
-    pub already_approved: usize,
-}
-
-impl Summary {
-    pub fn print(&self) {
-        println!(
-            "Review summary: {} approved, {} rejected, {} skipped, {} unresolved, {} already approved.",
-            self.approved, self.rejected, self.skipped, self.unresolved, self.already_approved
-        );
-    }
-}
+const VIEW_CACHE_CAPACITY: usize = 8;
 
 pub struct QueueState {
     pub entries: Vec<Entry>,
@@ -86,8 +25,6 @@ pub struct QueueState {
     cached_apps: VecDeque<(usize, App)>,
     pub sidebar_width: u16,
 }
-
-const VIEW_CACHE_CAPACITY: usize = 8;
 
 impl QueueState {
     pub fn new(queue: ReviewQueue) -> Self {
@@ -124,6 +61,95 @@ impl QueueState {
             state.open(selected);
         }
         state
+    }
+
+    pub fn poll(&mut self) -> bool {
+        self.retired_loaders.retain(|loader| !loader.is_finished());
+        if let Some(baseline) = self.loader.as_ref().and_then(BaselineLoader::poll) {
+            self.entries[self.selected].baseline_unavailable =
+                matches!(baseline, Baseline::Unavailable { .. });
+            if let Some(app) = &mut self.app
+                && let Err(error) = app.set_baseline(baseline)
+            {
+                self.entries[self.selected].error =
+                    Some(format!("could not display baseline: {error:#}"));
+                self.app = None;
+            }
+            self.retire_loader();
+            return true;
+        }
+        false
+    }
+
+    pub fn navigate(&mut self, backwards: bool) {
+        let len = self.entries.len();
+        let selected = if backwards {
+            (self.selected + len - 1) % len
+        } else {
+            (self.selected + 1) % len
+        };
+        self.open(selected);
+    }
+
+    pub fn skip(&mut self) -> bool {
+        self.entries[self.selected].skipped = true;
+        self.advance()
+    }
+
+    pub fn decide(&mut self, decision: Decision) -> eyre::Result<bool> {
+        let app = self
+            .app
+            .as_mut()
+            .ok_or_else(|| eyre::eyre!("current package sources could not be loaded"))?;
+        eyre::ensure!(app.can_decide(), "this package is read-only");
+        app.decide(decision)?;
+        for entry in &mut self.entries {
+            entry.package.approval = app
+                .session
+                .config
+                .config()
+                .approved
+                .get(&entry.package.name)
+                .and_then(|a| a.for_review(&entry.package.version));
+        }
+        self.entries[self.selected].decision = app.decision;
+        self.entries[self.selected].skipped = false;
+        self.retire_loader();
+        Ok(self.advance())
+    }
+
+    pub fn handle_key(&mut self, key: KeyEvent) -> Action {
+        if let Some(app) = &mut self.app {
+            return input::handle_key(app, key);
+        }
+        if key.kind == KeyEventKind::Release {
+            return Action::Continue;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            return Action::Quit;
+        }
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
+            KeyCode::Char('n') => Action::NextPackage,
+            KeyCode::Char('p') => Action::PreviousPackage,
+            KeyCode::Char('s') => Action::Skip,
+            _ => Action::Continue,
+        }
+    }
+
+    pub fn summary(&self) -> Summary {
+        let mut summary = Summary::default();
+        for entry in &self.entries {
+            match entry.decision {
+                Some(Decision::Approve | Decision::ApproveFingerprint) => summary.approved += 1,
+                Some(Decision::Reject) => summary.rejected += 1,
+                None if entry.error.is_some() => summary.unresolved += 1,
+                None if entry.already_approved() => summary.already_approved += 1,
+                None if entry.baseline_unavailable => summary.unresolved += 1,
+                None => summary.skipped += 1,
+            }
+        }
+        summary
     }
 
     fn open(&mut self, selected: usize) {
@@ -195,34 +221,6 @@ impl QueueState {
         self.retired_loaders.retain(|loader| !loader.is_finished());
     }
 
-    pub fn poll(&mut self) -> bool {
-        self.retired_loaders.retain(|loader| !loader.is_finished());
-        if let Some(baseline) = self.loader.as_ref().and_then(BaselineLoader::poll) {
-            self.entries[self.selected].baseline_unavailable =
-                matches!(baseline, Baseline::Unavailable { .. });
-            if let Some(app) = &mut self.app
-                && let Err(error) = app.set_baseline(baseline)
-            {
-                self.entries[self.selected].error =
-                    Some(format!("could not display baseline: {error:#}"));
-                self.app = None;
-            }
-            self.retire_loader();
-            return true;
-        }
-        false
-    }
-
-    pub fn navigate(&mut self, backwards: bool) {
-        let len = self.entries.len();
-        let selected = if backwards {
-            (self.selected + len - 1) % len
-        } else {
-            (self.selected + 1) % len
-        };
-        self.open(selected);
-    }
-
     /// Returns true when there are no remaining undecided actionable packages.
     fn advance(&mut self) -> bool {
         let len = self.entries.len();
@@ -235,66 +233,68 @@ impl QueueState {
         }
         true
     }
+}
 
-    pub fn skip(&mut self) -> bool {
-        self.entries[self.selected].skipped = true;
-        self.advance()
-    }
+pub struct Entry {
+    pub package: ReviewPackage,
+    pub decision: Option<Decision>,
+    pub skipped: bool,
+    pub error: Option<String>,
+    pub baseline_unavailable: bool,
+}
 
-    pub fn decide(&mut self, decision: Decision) -> eyre::Result<bool> {
-        let app = self
-            .app
-            .as_mut()
-            .ok_or_else(|| eyre::eyre!("current package sources could not be loaded"))?;
-        eyre::ensure!(app.can_decide(), "this package is read-only");
-        app.decide(decision)?;
-        for entry in &mut self.entries {
-            entry.package.approval = app
-                .session
-                .config
-                .config()
-                .approved
-                .get(&entry.package.name)
-                .and_then(|a| a.for_review(&entry.package.version));
-        }
-        self.entries[self.selected].decision = app.decision;
-        self.entries[self.selected].skipped = false;
-        self.retire_loader();
-        Ok(self.advance())
-    }
-
-    pub fn handle_key(&mut self, key: KeyEvent) -> Action {
-        if let Some(app) = &mut self.app {
-            return input::handle_key(app, key);
-        }
-        if key.kind == KeyEventKind::Release {
-            return Action::Continue;
-        }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            return Action::Quit;
-        }
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
-            KeyCode::Char('n') => Action::NextPackage,
-            KeyCode::Char('p') => Action::PreviousPackage,
-            KeyCode::Char('s') => Action::Skip,
-            _ => Action::Continue,
+impl Entry {
+    pub fn status(&self) -> &str {
+        if self.error.is_some() {
+            "load error"
+        } else if matches!(
+            self.decision,
+            Some(Decision::Approve | Decision::ApproveFingerprint)
+        ) {
+            "approved"
+        } else if self.decision == Some(Decision::Reject) {
+            "rejected"
+        } else if self.fingerprint_only() {
+            "fingerprint"
+        } else if self.already_approved() {
+            "already approved"
+        } else if self.skipped {
+            "skipped"
+        } else if self.baseline_unavailable {
+            "baseline unavailable"
+        } else {
+            "pending"
         }
     }
 
-    pub fn summary(&self) -> Summary {
-        let mut summary = Summary::default();
-        for entry in &self.entries {
-            match entry.decision {
-                Some(Decision::Approve | Decision::ApproveFingerprint) => summary.approved += 1,
-                Some(Decision::Reject) => summary.rejected += 1,
-                None if entry.error.is_some() => summary.unresolved += 1,
-                None if entry.already_approved() => summary.already_approved += 1,
-                None if entry.baseline_unavailable => summary.unresolved += 1,
-                None => summary.skipped += 1,
-            }
-        }
-        summary
+    fn already_approved(&self) -> bool {
+        matches!(&self.package.approval, Some(ApprovedVersion::SemVer(version)) if version == &self.package.version)
+    }
+
+    fn fingerprint_only(&self) -> bool {
+        matches!(self.package.approval, Some(ApprovedVersion::Fingerprint(_)))
+    }
+
+    fn actionable(&self) -> bool {
+        self.decision.is_none() && !self.skipped && !self.already_approved() && self.error.is_none()
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Summary {
+    pub approved: usize,
+    pub rejected: usize,
+    pub skipped: usize,
+    pub unresolved: usize,
+    pub already_approved: usize,
+}
+
+impl Summary {
+    pub fn print(&self) {
+        println!(
+            "Review summary: {} approved, {} rejected, {} skipped, {} unresolved, {} already approved.",
+            self.approved, self.rejected, self.skipped, self.unresolved, self.already_approved
+        );
     }
 }
 

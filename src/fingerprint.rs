@@ -88,6 +88,59 @@ pub(crate) fn from_dep_info(
     )
 }
 
+// rustc emits Make-style rules, including escaped spaces, line continuations,
+// repeated prerequisite lists, empty rules, and env-dep comments.
+pub(crate) fn parse_dep_info(contents: &str) -> eyre::Result<BTreeSet<PathBuf>> {
+    let contents = contents.replace("\\\r\n", " ").replace("\\\n", " ");
+    let mut paths = BTreeSet::new();
+    let mut saw_rule = false;
+    for line in contents.lines() {
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        let mut chars = line.chars().peekable();
+        let mut prerequisites = false;
+        let mut word = String::new();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' if chars
+                    .peek()
+                    .is_some_and(|c| c.is_whitespace() || matches!(c, '#' | ':' | '\\')) =>
+                {
+                    word.push(chars.next().unwrap());
+                }
+                ':' if !prerequisites && chars.peek().is_none_or(|c| c.is_whitespace()) => {
+                    prerequisites = true;
+                    saw_rule = true;
+                    word.clear();
+                }
+                '#' => break,
+                '$' if chars.peek() == Some(&'$') => {
+                    chars.next();
+                    word.push('$');
+                }
+                c if c.is_whitespace() => {
+                    if prerequisites && !word.is_empty() {
+                        paths.insert(PathBuf::from(std::mem::take(&mut word)));
+                    } else {
+                        word.clear();
+                    }
+                }
+                c => word.push(c),
+            }
+        }
+        eyre::ensure!(prerequisites, "invalid dep-info rule: {line}");
+        if !word.is_empty() {
+            paths.insert(PathBuf::from(word));
+        }
+    }
+    eyre::ensure!(
+        saw_rule && !paths.is_empty(),
+        "dep-info contains no tracked files"
+    );
+    Ok(paths)
+}
+
 fn read_manifest(path: &Path) -> eyre::Result<toml::Value> {
     let contents = fs::read_to_string(path)
         .with_context(|| format!("could not read manifest {}", path.display()))?;
@@ -142,16 +195,6 @@ fn inherit_dependencies(manifest: &mut toml::Value, workspace: &toml::Value) -> 
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-fn fingerprint(
-    manifest: &toml::Value,
-    dependencies: &toml::Value,
-    manifest_dir: &Path,
-    dep_info: &str,
-) -> eyre::Result<String> {
-    fingerprint_inputs(manifest, dependencies, manifest_dir, dep_info, manifest_dir)
 }
 
 fn fingerprint_inputs(
@@ -233,62 +276,18 @@ fn hash_field(hash: &mut Sha256, bytes: &[u8]) {
     hash.update(bytes);
 }
 
-// rustc emits Make-style rules, including escaped spaces, line continuations,
-// repeated prerequisite lists, empty rules, and env-dep comments.
-pub(crate) fn parse_dep_info(contents: &str) -> eyre::Result<BTreeSet<PathBuf>> {
-    let contents = contents.replace("\\\r\n", " ").replace("\\\n", " ");
-    let mut paths = BTreeSet::new();
-    let mut saw_rule = false;
-    for line in contents.lines() {
-        if line.trim().is_empty() || line.trim_start().starts_with('#') {
-            continue;
-        }
-        let mut chars = line.chars().peekable();
-        let mut prerequisites = false;
-        let mut word = String::new();
-        while let Some(c) = chars.next() {
-            match c {
-                '\\' if chars
-                    .peek()
-                    .is_some_and(|c| c.is_whitespace() || matches!(c, '#' | ':' | '\\')) =>
-                {
-                    word.push(chars.next().unwrap());
-                }
-                ':' if !prerequisites && chars.peek().is_none_or(|c| c.is_whitespace()) => {
-                    prerequisites = true;
-                    saw_rule = true;
-                    word.clear();
-                }
-                '#' => break,
-                '$' if chars.peek() == Some(&'$') => {
-                    chars.next();
-                    word.push('$');
-                }
-                c if c.is_whitespace() => {
-                    if prerequisites && !word.is_empty() {
-                        paths.insert(PathBuf::from(std::mem::take(&mut word)));
-                    } else {
-                        word.clear();
-                    }
-                }
-                c => word.push(c),
-            }
-        }
-        eyre::ensure!(prerequisites, "invalid dep-info rule: {line}");
-        if !word.is_empty() {
-            paths.insert(PathBuf::from(word));
-        }
-    }
-    eyre::ensure!(
-        saw_rule && !paths.is_empty(),
-        "dep-info contains no tracked files"
-    );
-    Ok(paths)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fingerprint(
+        manifest: &toml::Value,
+        dependencies: &toml::Value,
+        manifest_dir: &Path,
+        dep_info: &str,
+    ) -> eyre::Result<String> {
+        fingerprint_inputs(manifest, dependencies, manifest_dir, dep_info, manifest_dir)
+    }
 
     #[test]
     fn multiple_scripts_track_only_their_own_workspace_relative_inputs() {
