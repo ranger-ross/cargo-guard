@@ -24,7 +24,7 @@ pub fn run(session: ReviewSession) -> eyre::Result<()> {
     let mut app = App::new(session)?;
     let mut loader = BaselineLoader::start(&app.session)?;
     let _restore = RestoreTerminal;
-    // Ratatui installs a panic hook which restores before printing the panic.
+    // ratatui installs a panic hook which restores before printing the panic.
     let mut terminal = ratatui::try_init().context("could not initialize review terminal")?;
     let mut dirty = true;
     loop {
