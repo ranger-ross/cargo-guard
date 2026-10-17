@@ -6,7 +6,17 @@ use crate::config::{ApprovedVersion, load_config};
 
 mod config;
 
-fn main() -> eyre::Result<()> {
+fn main() {
+    if let Err(error) = run() {
+        for line in format!("{error:#}").lines() {
+            println!("cargo::error= {line}");
+        }
+        println!("cargo::error= ");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> eyre::Result<()> {
     let build_script = BuildScriptVersion::current()?;
 
     let config = load_config()?;
@@ -16,7 +26,9 @@ fn main() -> eyre::Result<()> {
             config.approved.get(&build_script.name),
             Some(ApprovedVersion::SemVer(version)) if version == &build_script.version
         ),
-        "unapproved build script for {} v{}; approve this version in approved-builds.toml",
+        "build script for {0} v{1} is not approved\n\n\
+         To approve it, add this entry under [approved] in approved-builds.toml:\n\n  \
+         {0} = \"{1}\"",
         build_script.name,
         build_script.version
     );

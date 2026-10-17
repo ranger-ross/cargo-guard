@@ -41,8 +41,11 @@ fn determine_workspace_root() -> eyre::Result<PathBuf> {
     // return the workspace root of the registry package, not the actual workspace being built.
     eyre::ensure!(
         env::var_os("OUT_DIR").is_none(),
-        "set CARGO_GUARD_WORKSPACE_ROOT in .cargo/config.toml: \
-         [env] CARGO_GUARD_WORKSPACE_ROOT = {{ value = \".\", relative = true }}"
+        "set CARGO_GUARD_WORKSPACE_ROOT in .cargo/config.toml:\n\
+         ```\n\
+         [env]\n\
+         CARGO_GUARD_WORKSPACE_ROOT = {{ value = \".\", relative = true }}\n\
+         ```"
     );
 
     let metadata = cargo_metadata::MetadataCommand::new()
