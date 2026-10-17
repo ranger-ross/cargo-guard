@@ -26,7 +26,7 @@ pub fn run(session: ReviewSession) -> eyre::Result<()> {
     let mut terminal = ratatui::try_init().context("could not initialize review terminal")?;
     loop {
         if let Some(baseline) = loader.as_ref().and_then(BaselineLoader::poll) {
-            app.baseline = baseline;
+            app.set_baseline(baseline)?;
             loader = None;
         }
         terminal

@@ -1,33 +1,33 @@
 use std::fs;
 
-use eyre::Context;
-use ratatui::text::Line;
-
-use super::{ReviewSession, highlight::Highlighter, sources::Baseline};
+use super::{
+    ReviewSession,
+    diff::{self, FileStatus, ReviewFile},
+    highlight::Highlighter,
+    sources::{Baseline, ScriptSource},
+};
 use crate::config::ApprovedVersion;
+use eyre::Context;
 
 pub struct App {
     pub session: ReviewSession,
     pub baseline: Baseline,
-    pub files: Vec<SourceFile>,
+    pub files: Vec<ReviewFile>,
+    current: Vec<ScriptSource>,
+    highlighter: Highlighter,
     pub selected: usize,
     pub top: usize,
     pub left: u16,
     pub height: usize,
     pub width: usize,
-}
-
-pub struct SourceFile {
-    pub label: String,
-    pub lines: Vec<Line<'static>>,
-    pub width: usize,
+    change_target: Option<usize>,
 }
 
 impl App {
     pub fn new(session: ReviewSession) -> eyre::Result<Self> {
         let highlighter = Highlighter::new()?;
         let root = session.package.manifest_path.parent();
-        let files = session
+        let current = session
             .package
             .scripts
             .iter()
@@ -38,32 +38,80 @@ impl App {
                 let path = root
                     .and_then(|root| script.path.strip_prefix(root).ok())
                     .unwrap_or(&script.path);
-                let lines = highlighter.highlight(&contents).with_context(|| {
-                    format!("could not highlight build script {}", script.path.display())
-                })?;
-                let width = lines.iter().map(|line| line.width()).max().unwrap_or(0);
-                Ok(SourceFile {
-                    label: format!("{} ({})", path.display(), script.name),
-                    lines,
-                    width,
+                Ok(ScriptSource {
+                    path: path.to_path_buf(),
+                    contents,
                 })
             })
             .collect::<eyre::Result<Vec<_>>>()?;
-        eyre::ensure!(!files.is_empty(), "no build scripts to display");
+        eyre::ensure!(!current.is_empty(), "no build scripts to display");
+        let baseline = Baseline::for_session(&session);
+        let files = diff::build_files(&current, &baseline, &highlighter)?;
         Ok(Self {
-            baseline: Baseline::for_session(&session),
+            baseline,
             session,
             files,
+            current,
+            highlighter,
             selected: 0,
             top: 0,
             left: 0,
             height: 0,
             width: 0,
+            change_target: None,
         })
     }
 
-    pub fn file(&self) -> &SourceFile {
+    pub fn file(&self) -> &ReviewFile {
         &self.files[self.selected]
+    }
+
+    pub fn set_baseline(&mut self, baseline: Baseline) -> eyre::Result<()> {
+        let files = diff::build_files(&self.current, &baseline, &self.highlighter)?;
+        self.selected = files
+            .iter()
+            .position(|file| file.path == self.file().path)
+            .unwrap_or(0);
+        self.files = files;
+        self.baseline = baseline;
+        self.top = 0;
+        self.left = 0;
+        self.change_target = None;
+        Ok(())
+    }
+
+    pub fn baseline_message(&self) -> String {
+        let mut message = self.baseline.message();
+        if matches!(self.baseline, Baseline::Ready(_))
+            && self
+                .files
+                .iter()
+                .all(|file| file.status == FileStatus::Unchanged)
+        {
+            message.push_str(" · Build scripts unchanged");
+        }
+        message
+    }
+
+    pub fn jump_change(&mut self, backwards: bool) {
+        let changes = &self.file().changes;
+        let position = self.change_target.unwrap_or(self.top);
+        let next = if backwards {
+            changes
+                .iter()
+                .rev()
+                .find(|&&row| row < position)
+                .or_else(|| changes.last())
+        } else {
+            changes
+                .iter()
+                .find(|&&row| row > position)
+                .or_else(|| changes.first())
+        };
+        if let Some(&row) = next {
+            self.change_target = Some(row);
+            self.top = row.min(self.max_top());
+        }
     }
 
     pub fn approval_status(&self) -> String {
@@ -92,7 +140,7 @@ impl App {
     }
 
     pub fn max_top(&self) -> usize {
-        self.file().lines.len().saturating_sub(self.height.max(1))
+        self.file().rows.len().saturating_sub(self.height.max(1))
     }
 
     fn max_left(&self) -> u16 {
@@ -103,6 +151,7 @@ impl App {
     }
 
     pub fn scroll(&mut self, rows: isize, columns: i16) {
+        self.change_target = None;
         self.top = self.top.saturating_add_signed(rows).min(self.max_top());
         self.left = self
             .left
@@ -111,6 +160,7 @@ impl App {
     }
 
     pub fn switch_file(&mut self, backwards: bool) {
+        self.change_target = None;
         self.selected = if backwards {
             (self.selected + self.files.len() - 1) % self.files.len()
         } else {
@@ -160,8 +210,35 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn change_navigation_wraps_even_when_last_change_is_near_bottom() {
+        use crate::review::sources::PackageSources;
+
+        let (_root, mut app) = fixture(&["a\nB\nc\nd\nE\n"]);
+        app.set_baseline(Baseline::Ready(PackageSources {
+            version: "0.0.1".parse().unwrap(),
+            scripts: vec![ScriptSource {
+                path: "script0.rs".into(),
+                contents: "a\nb\nc\nd\ne\n".into(),
+            }],
+        }))
+        .unwrap();
+        app.set_viewport(4, 80);
+        let changes = app.file().changes.clone();
+        assert_eq!(changes.len(), 2);
+        app.jump_change(false);
+        assert_eq!(app.change_target, Some(changes[0]));
+        app.jump_change(false);
+        assert_eq!(app.change_target, Some(changes[1]));
+        assert!(app.top < changes[1]);
+        app.jump_change(false);
+        assert_eq!(app.change_target, Some(changes[0]));
+        app.jump_change(true);
+        assert_eq!(app.change_target, Some(changes[1]));
+    }
+
+    #[test]
     fn scrolling_is_bounded_and_clamped_on_resize() {
-        let (_root, mut app) = fixture(&["0123456789\na\nb\nc\nd", ""]);
+        let (_root, mut app) = fixture(&["0123456789\na\nb\nc\nd\n", ""]);
         app.set_viewport(2, 5);
         app.scroll(100, 100);
         assert_eq!((app.top, app.left), (3, 5));

@@ -25,10 +25,7 @@ pub struct PackageSources {
 
 #[derive(Debug)]
 pub struct ScriptSource {
-    // Retained for the next step's diff model, including removed/renamed scripts.
-    #[allow(dead_code)]
     pub path: PathBuf,
-    #[allow(dead_code)]
     pub contents: String,
 }
 

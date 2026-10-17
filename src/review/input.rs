@@ -23,10 +23,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
         KeyCode::Left | KeyCode::Char('h') => app.scroll(0, -4),
         KeyCode::PageDown => app.scroll(app.height.max(1) as isize, 0),
         KeyCode::PageUp => app.scroll(-(app.height.max(1) as isize), 0),
-        KeyCode::Home | KeyCode::Char('g') => app.top = 0,
-        KeyCode::End | KeyCode::Char('G') => app.top = app.max_top(),
+        KeyCode::Home | KeyCode::Char('g') => app.scroll(isize::MIN, 0),
+        KeyCode::End | KeyCode::Char('G') => app.scroll(isize::MAX, 0),
         KeyCode::Tab => app.switch_file(false),
         KeyCode::BackTab => app.switch_file(true),
+        KeyCode::Char(']') => app.jump_change(false),
+        KeyCode::Char('[') => app.jump_change(true),
         _ => {}
     }
     Action::Continue

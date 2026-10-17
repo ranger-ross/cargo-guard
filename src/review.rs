@@ -6,6 +6,7 @@ use eyre::{Context, ContextCompat};
 use crate::config::{ApprovedVersion, edit::ConfigFile};
 
 mod app;
+mod diff;
 mod highlight;
 mod input;
 mod sources;

@@ -1,12 +1,13 @@
 use ratatui::{
     Frame,
-    layout::{Constraint, Layout},
+    layout::{Constraint, Layout, Rect},
     style::{Color, Style},
     text::Line,
     widgets::{Block, List, ListItem, ListState, Paragraph, Wrap},
 };
 
 use super::app::App;
+use super::diff::FileStatus;
 use super::sources::Baseline;
 
 pub fn render(frame: &mut Frame, app: &mut App) {
@@ -42,7 +43,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Color::DarkGray
     });
     frame.render_widget(
-        Paragraph::new(app.baseline.message())
+        Paragraph::new(app.baseline_message())
             .wrap(Wrap { trim: false })
             .style(baseline_style),
         baseline,
@@ -68,45 +69,73 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         &mut ListState::default().with_selected(Some(app.selected)),
     );
 
-    let block = Block::bordered().title(format!(" {} ", app.file().label));
+    let comparing = app.file().status != FileStatus::Current;
+    let numbers_label = if comparing { " · old / new" } else { "" };
+    let block = Block::bordered().title(format!(" {}{numbers_label} ", app.file().label));
     let inner = block.inner(source);
     frame.render_widget(block, source);
-    let gutter_width = app.file().lines.len().max(1).to_string().len() as u16 + 2;
+    let digits = app
+        .file()
+        .rows
+        .iter()
+        .flat_map(|row| [row.old_number, row.new_number])
+        .flatten()
+        .max()
+        .unwrap_or(1)
+        .to_string()
+        .len();
+    let gutter_width = if comparing {
+        digits * 2 + 4
+    } else {
+        digits + 2
+    } as u16;
     let [gutter, code] =
         Layout::horizontal([Constraint::Length(gutter_width), Constraint::Min(0)]).areas(inner);
     app.set_viewport(code.height, code.width);
-    let lines: Vec<_> = app
+    for (offset, row) in app
         .file()
-        .lines
+        .rows
         .iter()
         .skip(app.top)
         .take(app.height)
-        .cloned()
-        .collect();
-    let numbers: Vec<_> = (app.top..app.top + lines.len())
-        .map(|line| {
-            Line::from(format!(
-                "{:>width$} ",
-                line + 1,
-                width = usize::from(gutter_width) - 1
-            ))
-        })
-        .collect();
-    frame.render_widget(
-        Paragraph::new(numbers).style(Style::default().fg(Color::DarkGray)),
-        gutter,
-    );
-    frame.render_widget(Paragraph::new(lines).scroll((0, app.left)), code);
+        .enumerate()
+    {
+        let number = |value: Option<usize>| value.map(|n| n.to_string()).unwrap_or_default();
+        let numbers = if comparing {
+            format!(
+                "{:>digits$} {:>digits$} {} ",
+                number(row.old_number),
+                number(row.new_number),
+                row.kind.marker()
+            )
+        } else {
+            format!("{:>digits$}  ", number(row.new_number))
+        };
+        let gutter_row = Rect::new(gutter.x, gutter.y + offset as u16, gutter.width, 1);
+        let code_row = Rect::new(code.x, code.y + offset as u16, code.width, 1);
+        // Widget styles fill the whole row, including trailing blank columns.
+        // Syntax spans only supply foreground colors, so they retain this tint.
+        frame.render_widget(
+            Paragraph::new(numbers).style(row.kind.style().fg(Color::Gray)),
+            gutter_row,
+        );
+        frame.render_widget(
+            Paragraph::new(row.text.clone())
+                .style(row.kind.style())
+                .scroll((0, app.left)),
+            code_row,
+        );
+    }
 
-    let position = if app.file().lines.is_empty() {
+    let position = if app.file().rows.is_empty() {
         "Empty file".into()
     } else {
-        format!("Line {} / {}", app.top + 1, app.file().lines.len())
+        format!("Row {} / {}", app.top + 1, app.file().rows.len())
     };
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(
-                "↑/↓ j/k Scroll · ←/→ h/l Pan · PgUp/PgDn · Home/End · Tab Files · q/Esc Quit",
+                "↑/↓ j/k Scroll · ←/→ h/l Pan · PgUp/PgDn · Home/End · [/] Changes · Tab Files · q Quit",
             ),
             Line::from(format!("{position} · Read-only: approvals are not changed")),
         ]),
@@ -120,6 +149,46 @@ mod tests {
 
     use super::*;
     use crate::review::app::tests::fixture;
+
+    #[test]
+    fn colors_entire_diff_rows_while_retaining_syntax_foregrounds() {
+        use crate::review::{
+            diff::LineKind,
+            sources::{PackageSources, ScriptSource},
+        };
+
+        let (_root, mut app) = fixture(&["fn main() {\n    let new = 2;\n}\n"]);
+        app.set_baseline(Baseline::Ready(PackageSources {
+            version: "0.0.1".parse().unwrap(),
+            scripts: vec![ScriptSource {
+                path: "script0.rs".into(),
+                contents: "fn main() {\n    let old = 1;\n}\n".into(),
+            }],
+        }))
+        .unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        for kind in [LineKind::Addition, LineKind::Deletion] {
+            let bg = kind.style().bg.unwrap();
+            assert!(
+                buffer
+                    .content
+                    .iter()
+                    .any(|cell| cell.bg == bg && matches!(cell.fg, Color::Rgb(..)))
+            );
+            assert!(
+                buffer
+                    .content
+                    .iter()
+                    .any(|cell| cell.bg == bg && cell.symbol() == " ")
+            );
+        }
+        for (width, height) in [(45, 15), (1, 1), (0, 0)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        }
+    }
 
     #[test]
     fn renders_source_status_and_empty_files_at_small_sizes() {
