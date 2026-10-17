@@ -1,31 +1,46 @@
-use std::{env, process::Command};
+use std::{ffi::OsString, path::Path, process::Command};
 
 use eyre::Context;
 
 use crate::{
+    args::{Args, Command as GuardCommand},
     config::{ApprovedVersion, load_config},
     fingerprint::BuildScriptFingerprint,
 };
 
+mod args;
 mod config;
 mod fingerprint;
 
 fn main() {
-    if let Err(error) = run() {
-        for line in format!("{error:#}").lines() {
-            println!("cargo::error= {line}");
+    let args = Args::parse_args();
+    let is_runner = matches!(&args.command, GuardCommand::BuildScript(_));
+    let result = match args.command {
+        GuardCommand::Review { package } => review(package.as_deref()),
+        GuardCommand::BuildScript(args) => run(&args),
+    };
+    if let Err(error) = result {
+        if is_runner {
+            for line in format!("{error:#}").lines() {
+                println!("cargo::error= {line}");
+            }
+            println!("cargo::error= ");
+        } else {
+            eprintln!("error: {error:#}");
         }
-        println!("cargo::error= ");
         std::process::exit(1);
     }
 }
 
-fn run() -> eyre::Result<()> {
-    let mut args = env::args_os().skip(1);
-    let binary = args.next().ok_or_else(|| {
+fn review(_package: Option<&str>) -> eyre::Result<()> {
+    eyre::bail!("interactive build script review is not implemented yet")
+}
+
+fn run(args: &[OsString]) -> eyre::Result<()> {
+    let (binary, args) = args.split_first().ok_or_else(|| {
         eyre::eyre!("expected the build script binary path as the first argument")
     })?;
-    let build_script = BuildScriptFingerprint::current(std::path::Path::new(&binary))?;
+    let build_script = BuildScriptFingerprint::current(Path::new(binary))?;
 
     let config = load_config()?;
 
@@ -67,7 +82,7 @@ fn run() -> eyre::Result<()> {
         ),
     }
 
-    let status = Command::new(&binary)
+    let status = Command::new(binary)
         .args(args)
         .status()
         .with_context(|| format!("could not run build script {}", binary.to_string_lossy()))?;
