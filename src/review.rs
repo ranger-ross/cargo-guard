@@ -13,6 +13,7 @@ mod diff;
 mod discovery;
 mod highlight;
 mod input;
+mod queue;
 mod sources;
 mod tui;
 mod ui;
@@ -49,8 +50,7 @@ pub fn run(package: Option<&str>, options: &ReviewOptions) -> eyre::Result<()> {
         tui::run(ReviewSession::from_metadata(&metadata, name)?)
     } else {
         let queue = discovery::ReviewQueue::from_metadata(&metadata)?;
-        queue.print();
-        Ok(())
+        tui::run_queue(queue)
     }
 }
 

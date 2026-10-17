@@ -4,10 +4,7 @@ use cargo_metadata::{CargoOpt, Metadata, MetadataCommand, Package, PackageId};
 use eyre::ContextCompat;
 
 use super::ReviewPackage;
-use crate::{
-    args::ReviewOptions,
-    config::{ApprovedVersion, edit::ConfigFile},
-};
+use crate::{args::ReviewOptions, config::edit::ConfigFile};
 
 pub fn metadata_command(options: &ReviewOptions) -> MetadataCommand {
     let mut command = MetadataCommand::new();
@@ -108,54 +105,6 @@ impl ReviewQueue {
             conflicts,
             config,
         })
-    }
-
-    pub fn print(&self) {
-        if self.packages.is_empty() {
-            println!("No build scripts found in the selected dependency graph.");
-            return;
-        }
-        println!(
-            "Build-script review queue ({} packages)",
-            self.packages.len()
-        );
-        println!("Resolved normal/build/dev dependencies; not an exact build-unit graph.");
-        println!("Approvals: {}\n", self.config.path().display());
-        for package in &self.packages {
-            let status = if self.conflicts.contains_key(&package.name) {
-                "conflicting package name".to_owned()
-            } else {
-                match &package.approval {
-                    Some(ApprovedVersion::SemVer(version)) if version == &package.version => {
-                        "approved".into()
-                    }
-                    Some(ApprovedVersion::SemVer(version)) => {
-                        format!("v{version} approved; version change")
-                    }
-                    Some(ApprovedVersion::Fingerprint(_)) => {
-                        "fingerprint approval; version review unsupported".into()
-                    }
-                    None => "not approved".into(),
-                }
-            };
-            println!(
-                "  {} v{} — {} build script(s) — {status}",
-                package.name,
-                package.version,
-                package.scripts.len()
-            );
-        }
-        for (name, ids) in &self.conflicts {
-            println!(
-                "\nConflict: `{name}` has multiple versions/sources, but the approval file has only one entry per name:"
-            );
-            for id in ids {
-                println!("  {id}");
-            }
-        }
-        println!(
-            "\nInteractive queue navigation is not implemented yet. Review a unique package with `cargo guard review <PACKAGE>`."
-        );
     }
 }
 

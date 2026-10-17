@@ -7,7 +7,9 @@ use eyre::Context;
 use super::{
     ReviewSession,
     app::{App, Decision},
+    discovery::ReviewQueue,
     input::{self, Action},
+    queue::QueueState,
     sources::BaselineLoader,
     ui,
 };
@@ -40,7 +42,9 @@ pub fn run(session: ReviewSession) -> eyre::Result<()> {
                 Action::Quit => break,
                 Action::Approve => Decision::Approve,
                 Action::Reject => Decision::Reject,
-                Action::Continue => continue,
+                Action::Continue | Action::NextPackage | Action::PreviousPackage | Action::Skip => {
+                    continue;
+                }
             };
             match app.decide(decision) {
                 Ok(()) => break,
@@ -48,6 +52,63 @@ pub fn run(session: ReviewSession) -> eyre::Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+pub fn run_queue(queue: ReviewQueue) -> eyre::Result<()> {
+    if queue.packages.is_empty() {
+        println!("No build scripts found in the selected dependency graph.");
+        return Ok(());
+    }
+    eyre::ensure!(
+        io::stdin().is_terminal() && io::stdout().is_terminal(),
+        "interactive review requires a terminal on stdin and stdout"
+    );
+    let mut state = QueueState::new(queue);
+    {
+        let _restore = RestoreTerminal;
+        let mut terminal = ratatui::try_init().context("could not initialize review terminal")?;
+        loop {
+            state.poll();
+            terminal
+                .draw(|frame| ui::render_queue(frame, &mut state))
+                .context("could not render review queue")?;
+            if !event::poll(Duration::from_millis(100)).context("could not poll terminal events")? {
+                continue;
+            }
+            let Event::Key(key) = event::read().context("could not read terminal event")? else {
+                continue;
+            };
+            match state.handle_key(key) {
+                Action::Quit => break,
+                Action::NextPackage => state.navigate(false),
+                Action::PreviousPackage => state.navigate(true),
+                Action::Skip => {
+                    if state.skip() {
+                        break;
+                    }
+                }
+                action @ (Action::Approve | Action::Reject) => {
+                    let decision = if action == Action::Approve {
+                        Decision::Approve
+                    } else {
+                        Decision::Reject
+                    };
+                    match state.decide(decision) {
+                        Ok(true) => break,
+                        Ok(false) => {}
+                        Err(error) => {
+                            if let Some(app) = &mut state.app {
+                                app.report_decision_error(error);
+                            }
+                        }
+                    }
+                }
+                Action::Continue => {}
+            }
+        }
+    }
+    state.summary().print();
     Ok(())
 }
 

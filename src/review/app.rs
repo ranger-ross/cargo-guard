@@ -35,6 +35,8 @@ pub struct App {
     pub decision: Option<Decision>,
     pub notice: Option<Notice>,
     pub show_help: bool,
+    pub queue_mode: bool,
+    pub decision_blocked: Option<String>,
 }
 
 impl App {
@@ -76,6 +78,8 @@ impl App {
             decision: None,
             notice: None,
             show_help: false,
+            queue_mode: false,
+            decision_blocked: None,
         })
     }
 
@@ -104,6 +108,9 @@ impl App {
     /// Save first; publish the new approval/decision only after persistence
     /// succeeds. Rendering preparation is also done before modifying the file.
     pub fn decide(&mut self, decision: Decision) -> eyre::Result<()> {
+        if let Some(reason) = &self.decision_blocked {
+            eyre::bail!("{reason}");
+        }
         eyre::ensure!(
             !matches!(
                 self.session.package.approval,
@@ -225,7 +232,8 @@ impl App {
     }
 
     pub fn can_decide(&self) -> bool {
-        !self.is_current_version_approved()
+        self.decision_blocked.is_none()
+            && !self.is_current_version_approved()
             && !matches!(
                 self.session.package.approval,
                 Some(ApprovedVersion::Fingerprint(_))
@@ -233,6 +241,9 @@ impl App {
     }
 
     pub fn approval_status(&self) -> String {
+        if let Some(reason) = &self.decision_blocked {
+            return format!("Read-only: {reason}");
+        }
         if self.decision == Some(Decision::Reject) {
             return match &self.session.package.approval {
                 Some(ApprovedVersion::SemVer(version)) => format!(

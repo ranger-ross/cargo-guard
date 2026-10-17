@@ -8,9 +8,58 @@ use ratatui::{
 
 use super::app::App;
 use super::diff::FileStatus;
+use super::queue::QueueState;
 use super::sources::Baseline;
 
 pub fn render(frame: &mut Frame, app: &mut App) {
+    render_area(frame, app, frame.area());
+}
+
+pub fn render_queue(frame: &mut Frame, state: &mut QueueState) {
+    let [packages, review] = if frame.area().width >= 120 {
+        Layout::horizontal([Constraint::Length(36), Constraint::Min(0)]).areas(frame.area())
+    } else {
+        Layout::vertical([Constraint::Length(6), Constraint::Min(0)]).areas(frame.area())
+    };
+    let items: Vec<_> = state
+        .entries
+        .iter()
+        .map(|entry| {
+            ListItem::new(vec![
+                Line::from(format!("{} v{}", entry.package.name, entry.package.version)),
+                Line::from(format!("  [{}]", entry.status())),
+            ])
+        })
+        .collect();
+    let list = List::new(items)
+        .block(
+            Block::bordered()
+                .title(format!(
+                    " Packages {}/{} · n/p ",
+                    state.selected + 1,
+                    state.entries.len()
+                ))
+                .title_bottom(" s Skip · q Summary "),
+        )
+        .highlight_symbol("› ")
+        .highlight_style(Style::default().fg(Color::Cyan));
+    frame.render_stateful_widget(
+        list,
+        packages,
+        &mut ListState::default().with_selected(Some(state.selected)),
+    );
+    if let Some(app) = &mut state.app {
+        render_area(frame, app, review);
+    } else {
+        let entry = &state.entries[state.selected];
+        frame.render_widget(Paragraph::new(format!(
+            "{}\n\nCould not load sources:\n{}\n\nn/p: another package · s: skip · q: exit with summary",
+            entry.package.id, entry.error.as_deref().unwrap_or("unknown error")
+        )).wrap(Wrap { trim: false }).block(Block::bordered().title(" Unresolved package ")), review);
+    }
+}
+
+fn render_area(frame: &mut Frame, app: &mut App, area: Rect) {
     let unavailable = matches!(app.baseline, Baseline::Unavailable { .. });
     let [header, notice, baseline, body, footer] = Layout::vertical([
         Constraint::Length(5),
@@ -19,7 +68,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         Constraint::Min(0),
         Constraint::Length(2),
     ])
-    .areas(frame.area());
+    .areas(area);
     let package = &app.session.package;
     let source = package
         .source
@@ -150,12 +199,14 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             Line::from(
                 "↑/↓ j/k Scroll · ←/→ h/l Pan · PgUp/PgDn · Home/End · [/] Changes · Tab Files · ? Help · q Quit",
             ),
-            Line::from(if app.is_current_version_approved() {
+            Line::from(if app.decision_blocked.is_some() {
+                format!("{position} · Conflicting package name: read-only · ? Help")
+            } else if app.is_current_version_approved() {
                 format!("{position} · Current version already approved · q Quit")
             } else if !app.can_decide() {
                 format!("{position} · Fingerprint approval: read-only · q Quit")
             } else {
-                format!("{position} · a Approve version · r Reject · Decide and exit")
+                format!("{position} · a Approve version · r Reject · {}", if app.queue_mode { "Decide and advance · n/p Packages · s Skip" } else { "Decide and exit" })
             }),
         ]),
         footer,
@@ -168,7 +219,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 fn render_help(frame: &mut Frame, app: &App) {
     let area = frame.area();
     let width = area.width.min(78);
-    let height = area.height.min(18);
+    let height = area.height.min(if app.queue_mode { 20 } else { 18 });
     let popup = Rect::new(
         area.x + (area.width - width) / 2,
         area.y + (area.height - height) / 2,
@@ -184,12 +235,25 @@ fn render_help(frame: &mut Frame, app: &App) {
         Line::from("Tab / Shift+Tab  Next / previous file"),
         Line::from(""),
     ];
-    if app.can_decide() {
+    if app.queue_mode {
         lines.push(Line::from(
-            "a  Save this package version's approval and exit",
+            "n / p            Next / previous package (including approved)",
         ));
         lines.push(Line::from(
-            "r  Reject this version and exit; keep existing approvals",
+            "s                Skip and advance to the next pending package",
+        ));
+    }
+    if app.can_decide() {
+        let after = if app.queue_mode { "advance" } else { "exit" };
+        lines.push(Line::from(format!(
+            "a  Save this package version's approval and {after}"
+        )));
+        lines.push(Line::from(format!(
+            "r  Reject and {after}; keep existing approvals"
+        )));
+    } else if app.decision_blocked.is_some() {
+        lines.push(Line::from(
+            "Conflicting package names are read-only: one approval per name.",
         ));
     } else if app.is_current_version_approved() {
         lines.push(Line::from(
@@ -204,7 +268,11 @@ fn render_help(frame: &mut Frame, app: &App) {
         Line::from(""),
         Line::from("Approval covers every build script in this package version."),
         Line::from("This view shows entry-point files, not their dependencies."),
-        Line::from("? / Esc  Close help     q / Ctrl+C  Exit without changes"),
+        Line::from(if app.queue_mode {
+            "? / Esc  Close help     q / Ctrl+C  Exit; saved decisions are kept"
+        } else {
+            "? / Esc  Close help     q / Ctrl+C  Exit without changes"
+        }),
     ]);
     frame.render_widget(Clear, popup);
     frame.render_widget(
@@ -221,6 +289,34 @@ mod tests {
 
     use super::*;
     use crate::review::app::tests::fixture;
+
+    #[test]
+    fn renders_queue_and_selected_package_at_different_sizes() {
+        let (_root, metadata) = crate::review::tests::fixture();
+        let queue = crate::review::discovery::ReviewQueue::from_metadata(&metadata).unwrap();
+        let mut state = QueueState::new(queue);
+        let mut terminal = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        terminal
+            .draw(|frame| render_queue(frame, &mut state))
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("Packages 1/4"));
+        assert!(screen.contains("[conflict]"));
+        assert!(screen.contains("custom-script v2.0.0"));
+        assert!(screen.contains("compile_error!"));
+        for (width, height) in [(80, 24), (40, 12), (1, 1), (0, 0)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| render_queue(frame, &mut state))
+                .unwrap();
+        }
+    }
 
     #[test]
     fn renders_context_aware_help_and_fingerprint_read_only_controls() {

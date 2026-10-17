@@ -8,6 +8,9 @@ pub enum Action {
     Quit,
     Approve,
     Reject,
+    NextPackage,
+    PreviousPackage,
+    Skip,
 }
 
 pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
@@ -33,6 +36,11 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
         return Action::Continue;
     }
     match key.code {
+        KeyCode::Char('n') if app.queue_mode => return Action::NextPackage,
+        KeyCode::Char('p') if app.queue_mode => return Action::PreviousPackage,
+        KeyCode::Char('s') if app.queue_mode && key.kind == KeyEventKind::Press => {
+            return Action::Skip;
+        }
         KeyCode::Char('a') if key.kind == KeyEventKind::Press && key.modifiers.is_empty() => {
             return Action::Approve;
         }
