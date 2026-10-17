@@ -201,11 +201,12 @@ impl QueueState {
             self.entries[self.selected].baseline_unavailable =
                 matches!(baseline, Baseline::Unavailable { .. });
             if let Some(app) = &mut self.app
-                && let Err(error) = app.set_baseline(baseline) {
-                    self.entries[self.selected].error =
-                        Some(format!("could not display baseline: {error:#}"));
-                    self.app = None;
-                }
+                && let Err(error) = app.set_baseline(baseline)
+            {
+                self.entries[self.selected].error =
+                    Some(format!("could not display baseline: {error:#}"));
+                self.app = None;
+            }
             self.retire_loader();
             return true;
         }
