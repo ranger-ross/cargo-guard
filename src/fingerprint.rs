@@ -221,7 +221,11 @@ fn fingerprint_inputs(
         );
         hash_field(&mut hash, &content);
     }
-    Ok(format!("{:x}", hash.finalize()))
+    Ok(hash
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 fn hash_field(hash: &mut Sha256, bytes: &[u8]) {
