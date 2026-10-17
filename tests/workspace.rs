@@ -105,7 +105,7 @@ fn version_lists_match_without_reading_fingerprint_inputs() {
             &root.path().join("excluded/Cargo.toml"),
             "excluded",
         )
-        .arg("/bin/true")
+        .args(["/bin/sh", "-c", "true"])
         .output()
         .unwrap();
         assert!(output.status.success(), "{:?}", output);
@@ -121,7 +121,7 @@ fn version_lists_match_without_reading_fingerprint_inputs() {
             &root.path().join("excluded/Cargo.toml"),
             "excluded",
         )
-        .arg("/bin/true")
+        .args(["/bin/sh", "-c", "true"])
         .output()
         .unwrap();
         assert!(!output.status.success());
@@ -145,7 +145,7 @@ fn virtual_workspace_allows_external_members_and_manifest_symlinks() {
     let workspace = root.path().join("workspace");
     let manifest = root.path().join("member/Cargo.toml");
     let output = runner(&workspace, &manifest, "member")
-        .arg("/bin/true")
+        .args(["/bin/sh", "-c", "true"])
         .output()
         .unwrap();
     assert!(output.status.success(), "{:?}", output);
@@ -154,7 +154,7 @@ fn virtual_workspace_allows_external_members_and_manifest_symlinks() {
         let link = root.path().join("linked-manifest");
         std::os::unix::fs::symlink(&manifest, &link).unwrap();
         let output = runner(&workspace, &link, "member")
-            .arg("/bin/true")
+            .args(["/bin/sh", "-c", "true"])
             .output()
             .unwrap();
         assert!(output.status.success(), "{:?}", output);
