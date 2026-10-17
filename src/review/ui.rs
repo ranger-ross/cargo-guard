@@ -1,48 +1,91 @@
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::{Color, Style},
-    text::Line,
-    widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
+use unicode_width::UnicodeWidthStr;
 
-use super::app::App;
-use super::diff::FileStatus;
-use super::queue::QueueState;
-use super::sources::Baseline;
+use super::{
+    app::{App, Decision},
+    diff::{FileStatus, LineKind},
+    queue::QueueState,
+    sources::Baseline,
+};
+use crate::config::ApprovedVersion;
+
+fn muted() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
+
+fn bold(color: Color) -> Style {
+    Style::default().fg(color).add_modifier(Modifier::BOLD)
+}
+
+// Cargo uses right-aligned, bold status verbs and the terminal's own palette.
+fn status_line(label: &str, message: String, color: Color) -> Line<'static> {
+    let label = if matches!(label, "error" | "warning") {
+        format!("{label}: ")
+    } else {
+        format!("{label:>12} ")
+    };
+    Line::from(vec![Span::styled(label, bold(color)), Span::raw(message)])
+}
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     render_area(frame, app, frame.area());
 }
 
 pub fn render_queue(frame: &mut Frame, state: &mut QueueState) {
-    let [packages, review] = if frame.area().width >= 120 {
-        Layout::horizontal([Constraint::Length(36), Constraint::Min(0)]).areas(frame.area())
+    let wide = frame.area().width >= 100;
+    let sidebar_width = state
+        .entries
+        .iter()
+        .map(|entry| format!("{} v{}", entry.package.name, entry.package.version).width() + 5)
+        .max()
+        .unwrap_or(24)
+        .clamp(24, 36) as u16;
+    let [packages, review] = if wide {
+        Layout::horizontal([Constraint::Length(sidebar_width), Constraint::Min(0)])
+            .areas(frame.area())
     } else {
-        Layout::vertical([Constraint::Length(6), Constraint::Min(0)]).areas(frame.area())
+        Layout::vertical([Constraint::Length(4), Constraint::Min(0)]).areas(frame.area())
     };
     let items: Vec<_> = state
         .entries
         .iter()
         .map(|entry| {
-            ListItem::new(vec![
-                Line::from(format!("{} v{}", entry.package.name, entry.package.version)),
-                Line::from(format!("  [{}]", entry.status())),
-            ])
+            let (marker, color) = match entry.status() {
+                "approved" | "already approved" => ("✓", Color::Green),
+                "rejected" => ("×", Color::Red),
+                "conflict" | "load error" | "baseline unavailable" => ("!", Color::Yellow),
+                "fingerprint" => ("?", Color::Yellow),
+                "skipped" => ("–", Color::DarkGray),
+                _ => ("·", Color::DarkGray),
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{marker} "), Style::default().fg(color)),
+                Span::raw(format!("{} v{}", entry.package.name, entry.package.version)),
+            ]))
         })
         .collect();
     let list = List::new(items)
         .block(
-            Block::bordered()
-                .title(format!(
-                    " Packages {}/{} · n/p ",
-                    state.selected + 1,
-                    state.entries.len()
-                ))
-                .title_bottom(" s Skip · q Summary "),
+            Block::new()
+                .borders(if wide {
+                    Borders::RIGHT
+                } else {
+                    Borders::BOTTOM
+                })
+                .border_style(muted())
+                .title(Line::styled(
+                    format!("Packages {}/{}", state.selected + 1, state.entries.len()),
+                    muted(),
+                )),
         )
-        .highlight_symbol("› ")
-        .highlight_style(Style::default().fg(Color::Cyan));
+        .highlight_symbol("> ")
+        .highlight_style(bold(Color::Green));
     frame.render_stateful_widget(
         list,
         packages,
@@ -52,90 +95,193 @@ pub fn render_queue(frame: &mut Frame, state: &mut QueueState) {
         render_area(frame, app, review);
     } else {
         let entry = &state.entries[state.selected];
-        frame.render_widget(Paragraph::new(format!(
-            "{}\n\nCould not load sources:\n{}\n\nn/p: another package · s: skip · q: exit with summary",
-            entry.package.id, entry.error.as_deref().unwrap_or("unknown error")
-        )).wrap(Wrap { trim: false }).block(Block::bordered().title(" Unresolved package ")), review);
+        frame.render_widget(
+            Paragraph::new(vec![
+                status_line(
+                    "Reviewing",
+                    format!("{} v{}", entry.package.name, entry.package.version),
+                    Color::Green,
+                ),
+                Line::default(),
+                status_line(
+                    "error",
+                    entry
+                        .error
+                        .as_deref()
+                        .unwrap_or("could not load sources")
+                        .to_owned(),
+                    Color::Red,
+                ),
+                Line::default(),
+                Line::styled("n/p packages   s skip   q quit", muted()),
+            ])
+            .wrap(Wrap { trim: false }),
+            review,
+        );
     }
 }
 
+fn heading(app: &App) -> Line<'static> {
+    let package = &app.session.package;
+    let (label, color) = if app.decision_blocked.is_some() {
+        ("Blocked", Color::Yellow)
+    } else if app.decision == Some(Decision::Reject) {
+        ("Rejected", Color::Red)
+    } else if app.is_current_version_approved() {
+        ("Approved", Color::Green)
+    } else {
+        ("Reviewing", Color::Green)
+    };
+    let version = match &package.approval {
+        Some(ApprovedVersion::SemVer(old)) if old != &package.version => {
+            format!("{} v{old} -> v{}", package.name, package.version)
+        }
+        _ => format!("{} v{}", package.name, package.version),
+    };
+    let mut line = status_line(label, version, color);
+    let suffix = match &package.approval {
+        None => " (new)",
+        Some(ApprovedVersion::Fingerprint(_)) => " (fingerprint, read-only)",
+        _ => "",
+    };
+    line.spans.push(Span::styled(suffix, muted()));
+    line
+}
+
+fn baseline_note(app: &App) -> Option<Line<'static>> {
+    if let Some(reason) = &app.decision_blocked {
+        return Some(status_line("warning", reason.clone(), Color::Yellow));
+    }
+    match &app.baseline {
+        Baseline::Loading(version) => Some(status_line(
+            "Fetching",
+            format!("approved v{version}"),
+            Color::Green,
+        )),
+        Baseline::Unavailable { version, reason } => Some(status_line(
+            "warning",
+            format!("approved v{version} source unavailable: {reason}"),
+            Color::Yellow,
+        )),
+        Baseline::Ready(_)
+            if app
+                .files
+                .iter()
+                .all(|file| file.status == FileStatus::Unchanged) =>
+        {
+            Some(status_line(
+                "Unchanged",
+                "build scripts; the new version still needs approval".into(),
+                Color::Green,
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn message_height(line: Option<&Line<'_>>, width: u16) -> u16 {
+    line.map_or(0, |line| {
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        text.lines()
+            .map(|line| line.width().div_ceil(usize::from(width).max(1)).max(1))
+            .sum::<usize>()
+            .clamp(1, 4) as u16
+    })
+}
+
 fn render_area(frame: &mut Frame, app: &mut App, area: Rect) {
-    let unavailable = matches!(app.baseline, Baseline::Unavailable { .. });
-    let [header, notice, baseline, body, footer] = Layout::vertical([
-        Constraint::Length(5),
-        Constraint::Length(if app.notice.is_some() { 3 } else { 0 }),
-        Constraint::Length(if unavailable { 4 } else { 1 }),
-        Constraint::Min(0),
+    let note = baseline_note(app);
+    let notice = app.notice.as_ref().map(|notice| {
+        status_line(
+            if notice.is_error { "error" } else { "Finished" },
+            notice.message.clone(),
+            if notice.is_error {
+                Color::Red
+            } else {
+                Color::Green
+            },
+        )
+    });
+    let multiple = app.files.len() > 1;
+    let [header, notice_area, baseline, tabs, title, source, footer] = Layout::vertical([
         Constraint::Length(2),
+        Constraint::Length(message_height(notice.as_ref(), area.width)),
+        Constraint::Length(message_height(note.as_ref(), area.width)),
+        Constraint::Length(if multiple { 2 } else { 0 }),
+        Constraint::Length(2),
+        Constraint::Min(0),
+        Constraint::Length(1),
     ])
     .areas(area);
-    let package = &app.session.package;
-    let source = package
-        .source
-        .as_ref()
-        .map_or("local path", |source| source.repr.as_str());
-    let heading = Paragraph::new(vec![
-        Line::from(app.approval_status()),
-        Line::from(format!("Source: {source} | {}", package.id)),
-        Line::from(format!(
-            "Approvals: {}",
-            app.session.config.path().display()
-        )),
-    ])
-    .block(Block::bordered().title(format!(
-        " {} v{} — Build script review ",
-        package.name, package.version
-    )));
-    frame.render_widget(heading, header);
-    if let Some(message) = &app.notice {
+    frame.render_widget(Paragraph::new(heading(app)), header);
+    if let Some(notice) = notice {
         frame.render_widget(
-            Paragraph::new(message.message.as_str())
-                .wrap(Wrap { trim: false })
-                .style(Style::default().fg(if message.is_error {
-                    Color::Red
-                } else {
-                    Color::Green
-                })),
-            notice,
+            Paragraph::new(notice).wrap(Wrap { trim: false }),
+            notice_area,
         );
     }
-    let baseline_style = Style::default().fg(if unavailable {
-        Color::Yellow
-    } else {
-        Color::DarkGray
-    });
-    frame.render_widget(
-        Paragraph::new(app.baseline_message())
-            .wrap(Wrap { trim: false })
-            .style(baseline_style),
-        baseline,
-    );
+    if let Some(note) = note {
+        frame.render_widget(Paragraph::new(note).wrap(Wrap { trim: false }), baseline);
+    }
+    if multiple {
+        let labels: Vec<_> = app
+            .files
+            .iter()
+            .map(|file| file.path.display().to_string())
+            .collect();
+        frame.render_widget(
+            Tabs::new(labels)
+                .select(app.selected)
+                .style(muted())
+                .highlight_style(bold(Color::Green).add_modifier(Modifier::UNDERLINED)),
+            tabs,
+        );
+    }
 
-    let [files, source] = if body.width >= 80 {
-        Layout::horizontal([Constraint::Length(30), Constraint::Min(0)]).areas(body)
-    } else {
-        Layout::vertical([Constraint::Length(4), Constraint::Min(0)]).areas(body)
-    };
-    let items: Vec<_> = app
-        .files
+    let file = app.file();
+    let added = file
+        .rows
         .iter()
-        .map(|file| ListItem::new(file.label.clone()))
-        .collect();
-    let list = List::new(items)
-        .block(Block::bordered().title(" Files (Tab / Shift+Tab) "))
-        .highlight_symbol("› ")
-        .highlight_style(Style::default().fg(Color::Cyan));
-    frame.render_stateful_widget(
-        list,
-        files,
-        &mut ListState::default().with_selected(Some(app.selected)),
-    );
+        .filter(|row| row.kind == LineKind::Addition)
+        .count();
+    let removed = file
+        .rows
+        .iter()
+        .filter(|row| row.kind == LineKind::Deletion)
+        .count();
+    let mut label = vec![Span::styled(
+        format!("  {}", file.path.display()),
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
+    if added > 0 {
+        label.push(Span::styled(
+            format!("  +{added}"),
+            Style::default().fg(Color::Green),
+        ));
+    }
+    if removed > 0 {
+        label.push(Span::styled(
+            format!("  -{removed}"),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    if file.rows.is_empty() {
+        label.push(Span::styled(
+            match file.status {
+                FileStatus::Added => "  (new empty file)",
+                FileStatus::Removed => "  (deleted empty file)",
+                _ => "  (empty)",
+            },
+            muted(),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(label)), title);
 
     let comparing = app.file().status != FileStatus::Current;
-    let numbers_label = if comparing { " · old / new" } else { "" };
-    let block = Block::bordered().title(format!(" {}{numbers_label} ", app.file().label));
-    let inner = block.inner(source);
-    frame.render_widget(block, source);
     let digits = app
         .file()
         .rows
@@ -152,7 +298,7 @@ fn render_area(frame: &mut Frame, app: &mut App, area: Rect) {
         digits + 2
     } as u16;
     let [gutter, code] =
-        Layout::horizontal([Constraint::Length(gutter_width), Constraint::Min(0)]).areas(inner);
+        Layout::horizontal([Constraint::Length(gutter_width), Constraint::Min(0)]).areas(source);
     app.set_viewport(code.height, code.width);
     for (offset, row) in app
         .file()
@@ -175,10 +321,8 @@ fn render_area(frame: &mut Frame, app: &mut App, area: Rect) {
         };
         let gutter_row = Rect::new(gutter.x, gutter.y + offset as u16, gutter.width, 1);
         let code_row = Rect::new(code.x, code.y + offset as u16, code.width, 1);
-        // Widget styles fill the whole row, including trailing blank columns.
-        // Syntax spans only supply foreground colors, so they retain this tint.
         frame.render_widget(
-            Paragraph::new(numbers).style(row.kind.style().fg(Color::Gray)),
+            Paragraph::new(numbers).style(row.kind.style().fg(Color::DarkGray)),
             gutter_row,
         );
         frame.render_widget(
@@ -188,38 +332,50 @@ fn render_area(frame: &mut Frame, app: &mut App, area: Rect) {
             code_row,
         );
     }
-
-    let position = if app.file().rows.is_empty() {
-        "Empty file".into()
-    } else {
-        format!("Row {} / {}", app.top + 1, app.file().rows.len())
-    };
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(
-                "↑/↓ j/k Scroll · ←/→ h/l Pan · PgUp/PgDn · Home/End · [/] Changes · Tab Files · ? Help · q Quit",
-            ),
-            Line::from(if app.decision_blocked.is_some() {
-                format!("{position} · Conflicting package name: read-only · ? Help")
-            } else if app.is_current_version_approved() {
-                format!("{position} · Current version already approved · q Quit")
-            } else if !app.can_decide() {
-                format!("{position} · Fingerprint approval: read-only · q Quit")
-            } else {
-                format!("{position} · a Approve version · r Reject · {}", if app.queue_mode { "Decide and advance · n/p Packages · s Skip" } else { "Decide and exit" })
-            }),
-        ]),
-        footer,
-    );
+    render_footer(frame, app, footer);
     if app.show_help {
         render_help(frame, app);
     }
 }
 
+fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
+    let [actions, help] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(16)]).areas(area);
+    let mut keys = Vec::new();
+    if app.can_decide() {
+        keys.extend([("a", "approve"), ("r", "reject")]);
+    }
+    if app.queue_mode {
+        keys.extend([("n/p", "packages"), ("s", "skip")]);
+    }
+    if app.files.len() > 1 {
+        keys.push(("Tab", "files"));
+    }
+    let spans: Vec<_> = keys
+        .into_iter()
+        .flat_map(|(key, action)| {
+            [
+                Span::styled(key, Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" {action}   "), muted()),
+            ]
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(Line::from(spans)), actions);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw("?"),
+            Span::styled(" help  ", muted()),
+            Span::raw("q"),
+            Span::styled(" quit", muted()),
+        ])),
+        help,
+    );
+}
+
 fn render_help(frame: &mut Frame, app: &App) {
     let area = frame.area();
-    let width = area.width.min(78);
-    let height = area.height.min(if app.queue_mode { 20 } else { 18 });
+    let width = area.width.min(90);
+    let height = area.height.min(if app.queue_mode { 30 } else { 27 });
     let popup = Rect::new(
         area.x + (area.width - width) / 2,
         area.y + (area.height - height) / 2,
@@ -233,16 +389,20 @@ fn render_help(frame: &mut Frame, app: &App) {
         Line::from("Home / End       First / last page (also g / G)"),
         Line::from("[ / ]            Previous / next change"),
         Line::from("Tab / Shift+Tab  Next / previous file"),
-        Line::from(""),
     ];
     if app.queue_mode {
         lines.push(Line::from(
             "n / p            Next / previous package (including approved)",
         ));
         lines.push(Line::from(
-            "s                Skip and advance to the next pending package",
+            "s                Skip to the next pending package",
+        ));
+        lines.push(Line::styled(
+            "✓ approved  × rejected  ! unresolved  ? fingerprint  – skipped",
+            muted(),
         ));
     }
+    lines.push(Line::default());
     if app.can_decide() {
         let after = if app.queue_mode { "advance" } else { "exit" };
         lines.push(Line::from(format!(
@@ -265,19 +425,39 @@ fn render_help(frame: &mut Frame, app: &App) {
         ));
     }
     lines.extend([
-        Line::from(""),
-        Line::from("Approval covers every build script in this package version."),
+        Line::default(),
+        Line::from("Diff columns: approved / current. Approval covers all scripts in the package."),
         Line::from("This view shows entry-point files, not their dependencies."),
-        Line::from(if app.queue_mode {
-            "? / Esc  Close help     q / Ctrl+C  Exit; saved decisions are kept"
-        } else {
-            "? / Esc  Close help     q / Ctrl+C  Exit without changes"
-        }),
+        Line::from("? / Esc close help · q / Ctrl+C quit; saved decisions are kept"),
+        Line::default(),
+        Line::styled(app.approval_status(), muted()),
+        Line::styled(app.baseline_message(), muted()),
+        Line::styled(format!("File: {}", app.file().label), muted()),
+        Line::styled(format!("Package: {}", app.session.package.id), muted()),
+        Line::styled(
+            format!(
+                "Source: {}",
+                app.session
+                    .package
+                    .source
+                    .as_ref()
+                    .map_or("local path", |source| source.repr.as_str())
+            ),
+            muted(),
+        ),
+        Line::styled(
+            format!("Approvals: {}", app.session.config.path().display()),
+            muted(),
+        ),
     ]);
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::bordered().title(" Review help "))
+            .block(
+                Block::bordered()
+                    .border_style(muted())
+                    .title(Span::styled(" Review help ", bold(Color::Green))),
+            )
             .wrap(Wrap { trim: false }),
         popup,
     );
@@ -285,10 +465,19 @@ fn render_help(frame: &mut Frame, app: &App) {
 
 #[cfg(test)]
 mod tests {
-    use ratatui::{Terminal, backend::TestBackend};
-
     use super::*;
     use crate::review::app::tests::fixture;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn screen(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
 
     #[test]
     fn renders_queue_and_selected_package_at_different_sizes() {
@@ -299,17 +488,11 @@ mod tests {
         terminal
             .draw(|frame| render_queue(frame, &mut state))
             .unwrap();
-        let screen: String = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect();
-        assert!(screen.contains("Packages 1/4"));
-        assert!(screen.contains("[conflict]"));
-        assert!(screen.contains("custom-script v2.0.0"));
-        assert!(screen.contains("compile_error!"));
+        let text = screen(&terminal);
+        assert!(text.contains("Packages 1/4"));
+        assert!(text.contains("! duplicate"));
+        assert!(text.contains("custom-script v2.0.0"));
+        assert!(text.contains("compile_error!"));
         for (width, height) in [(80, 24), (40, 12), (1, 1), (0, 0)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
@@ -321,31 +504,19 @@ mod tests {
     #[test]
     fn renders_context_aware_help_and_fingerprint_read_only_controls() {
         let (_root, mut app) = fixture(&["fn main() {}"]);
-        app.session.package.approval =
-            Some(crate::config::ApprovedVersion::Fingerprint("hash".into()));
-        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        app.session.package.approval = Some(ApprovedVersion::Fingerprint("hash".into()));
+        let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let screen: String = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect();
-        assert!(screen.contains("Fingerprint approval: read-only"));
-        assert!(!screen.contains("a Approve"));
+        let text = screen(&terminal);
+        assert!(text.contains("fingerprint, read-only"));
+        assert!(!text.contains("a approve"));
+        assert!(!text.contains("Approvals:"));
         app.show_help = true;
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let screen: String = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect();
-        assert!(screen.contains("Review help"));
-        assert!(screen.contains("Fingerprint approvals are read-only"));
-        assert!(!screen.contains("Save this package"));
+        let text = screen(&terminal);
+        assert!(text.contains("Review help"));
+        assert!(text.contains("Fingerprint approvals are read-only"));
+        assert!(text.contains("Approvals:"));
         for (width, height) in [(40, 12), (1, 1), (0, 0)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal.draw(|frame| render(frame, &mut app)).unwrap();
@@ -355,30 +526,19 @@ mod tests {
     #[test]
     fn hides_decision_actions_for_approved_versions() {
         let (_root, mut app) = fixture(&["fn main() {}"]);
-        app.session.package.approval = Some(crate::config::ApprovedVersion::SemVer(
-            app.session.package.version.clone(),
-        ));
+        app.session.package.approval =
+            Some(ApprovedVersion::SemVer(app.session.package.version.clone()));
         let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let screen: String = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect();
-        assert!(screen.contains("Current version already approved"));
-        assert!(!screen.contains("a Approve"));
-        assert!(!screen.contains("r Reject"));
+        let text = screen(&terminal);
+        assert!(text.contains("Approved example v0.1.0"));
+        assert!(!text.contains("a approve"));
+        assert!(!text.contains("r reject"));
     }
 
     #[test]
     fn colors_entire_diff_rows_while_retaining_syntax_foregrounds() {
-        use crate::review::{
-            diff::LineKind,
-            sources::{PackageSources, ScriptSource},
-        };
-
+        use crate::review::sources::{PackageSources, ScriptSource};
         let (_root, mut app) = fixture(&["fn main() {\n    let new = 2;\n}\n"]);
         app.set_baseline(Baseline::Ready(PackageSources {
             version: "0.0.1".parse().unwrap(),
@@ -413,20 +573,46 @@ mod tests {
     }
 
     #[test]
+    fn keeps_the_main_view_minimal_and_uses_cargo_status_colors() {
+        let (_root, mut app) = fixture(&["fn main() {}\n"]);
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(text.contains("Reviewing example v0.1.0 (new)"));
+        assert!(text.contains("fn main()"));
+        for removed in [
+            "Source:",
+            "Approvals:",
+            "Baseline:",
+            "Files (",
+            "Build script review",
+            "┌",
+            "┐",
+        ] {
+            assert!(!text.contains(removed), "unexpected chrome: {removed}");
+        }
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .any(|cell| cell.symbol() == "R"
+                    && cell.fg == Color::Green
+                    && cell.modifier.contains(Modifier::BOLD))
+        );
+        app.session.package.approval = Some(ApprovedVersion::SemVer(semver::Version::new(0, 0, 1)));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert!(screen(&terminal).contains("v0.0.1 -> v0.1.0"));
+    }
+
+    #[test]
     fn renders_source_status_and_empty_files_at_small_sizes() {
         let (_root, mut app) = fixture(&["fn main() {\n    println!(\"hello\");\n}", ""]);
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let screen: String = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect();
-        assert!(screen.contains("fn main()"));
-        assert!(screen.contains("no previous approval"));
-        assert!(screen.contains("Build script review"));
+        assert!(screen(&terminal).contains("fn main()"));
+        assert!(screen(&terminal).contains("script1.rs"));
         app.switch_file(false);
         for (width, height) in [(100, 24), (40, 12), (1, 1), (0, 0)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
