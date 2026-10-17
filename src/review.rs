@@ -5,6 +5,11 @@ use eyre::{Context, ContextCompat};
 
 use crate::config::{ApprovedVersion, edit::ConfigFile};
 
+mod app;
+mod input;
+mod tui;
+mod ui;
+
 pub struct ReviewSession {
     pub package: ReviewPackage,
     pub config: ConfigFile,
@@ -37,40 +42,7 @@ pub fn run(package: Option<&str>) -> eyre::Result<()> {
         .exec()
         .context("could not load workspace metadata for review")?;
     let session = ReviewSession::from_metadata(&metadata, name)?;
-    let package = &session.package;
-
-    println!("{} v{}", package.name, package.version);
-    println!("Package ID: {}", package.id);
-    println!(
-        "Source: {}",
-        package
-            .source
-            .as_ref()
-            .map_or("local path", |source| source.repr.as_str())
-    );
-    println!("Manifest: {}", package.manifest_path.display());
-    println!("Approvals: {}", session.config.path().display());
-    match &package.approval {
-        Some(ApprovedVersion::SemVer(version)) if version == &package.version => {
-            println!("Status: approved");
-        }
-        Some(ApprovedVersion::SemVer(version)) => {
-            println!(
-                "Status: version change ({version} approved → {} current)",
-                package.version
-            );
-        }
-        Some(ApprovedVersion::Fingerprint(_)) => {
-            println!("Status: fingerprint approval (not supported by version review)");
-        }
-        None => println!("Status: no previous approval"),
-    }
-    println!("Build scripts:");
-    for script in &package.scripts {
-        println!("  {}: {}", script.name, script.path.display());
-    }
-    println!("\nInteractive review is not implemented yet.");
-    Ok(())
+    tui::run(session)
 }
 
 impl ReviewSession {
