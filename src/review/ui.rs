@@ -96,7 +96,7 @@ pub fn render_queue(frame: &mut Frame, state: &mut QueueState) {
                     Color::Red,
                 ),
                 Line::default(),
-                Line::styled("n/p packages   s skip   q quit", muted()),
+                Line::styled("j/k packages   s skip   q quit", muted()),
             ])
             .wrap(Wrap { trim: false }),
             review,
@@ -260,7 +260,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         keys.push(("r", "reject"));
     }
     if app.queue_mode {
-        keys.extend([("n/p", "packages"), ("s", "skip")]);
+        keys.extend([("j/k", "packages"), ("s", "skip")]);
     }
     if app.files.len() > 1 {
         keys.push(("Tab", "files"));
@@ -297,7 +297,7 @@ fn render_help(frame: &mut Frame, app: &App) {
         height,
     );
     let mut lines = vec![
-        Line::from("↑/↓ or j/k       Scroll source"),
+        Line::from("Up / Down        Scroll source"),
         Line::from("←/→ or h/l       Pan long lines"),
         Line::from("PgUp / PgDn      Scroll a page"),
         Line::from("Home / End       First / last page (also g / G)"),
@@ -306,7 +306,7 @@ fn render_help(frame: &mut Frame, app: &App) {
     ];
     if app.queue_mode {
         lines.push(Line::from(
-            "n / p            Next / previous package (including approved)",
+            "j / k            Next / previous package (including approved)",
         ));
         lines.push(Line::from(
             "s                Skip to the next pending package",

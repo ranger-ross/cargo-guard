@@ -35,8 +35,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
         return Action::Continue;
     }
     match key.code {
-        KeyCode::Char('n') if app.queue_mode => return Action::NextPackage,
-        KeyCode::Char('p') if app.queue_mode => return Action::PreviousPackage,
+        KeyCode::Char('j') if app.queue_mode => return Action::NextPackage,
+        KeyCode::Char('k') if app.queue_mode => return Action::PreviousPackage,
         KeyCode::Char('s') if app.queue_mode && key.kind == KeyEventKind::Press => {
             return Action::Skip;
         }
@@ -50,8 +50,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
             return Action::Decide(Decision::ApproveFingerprint);
         }
         KeyCode::Char('q') | KeyCode::Esc => return Action::Quit,
-        KeyCode::Down | KeyCode::Char('j') => app.scroll(1, 0),
-        KeyCode::Up | KeyCode::Char('k') => app.scroll(-1, 0),
+        KeyCode::Down => app.scroll(1, 0),
+        KeyCode::Up => app.scroll(-1, 0),
         KeyCode::Right | KeyCode::Char('l') => app.scroll(0, 4),
         KeyCode::Left | KeyCode::Char('h') => app.scroll(0, -4),
         KeyCode::PageDown => app.scroll(app.height.max(1) as isize, 0),
@@ -146,6 +146,41 @@ mod tests {
             );
         }
         assert!(!app.session.config.path().exists());
+    }
+
+    #[test]
+    fn package_navigation_does_not_scroll_source() {
+        let (_root, mut app) = fixture(&["a\nb\nc\nd\ne\nf"]);
+        app.set_viewport(2, 10);
+        app.scroll(1, 0);
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        for queue_mode in [false, true] {
+            app.queue_mode = queue_mode;
+            for (character, action) in [('j', Action::NextPackage), ('k', Action::PreviousPackage)]
+            {
+                assert_eq!(
+                    handle_key(&mut app, key(character)),
+                    if queue_mode { action } else { Action::Continue }
+                );
+                assert_eq!(app.top, 1);
+            }
+            for character in ['n', 'p'] {
+                assert_eq!(handle_key(&mut app, key(character)), Action::Continue);
+                assert_eq!(app.top, 1);
+            }
+        }
+        for (code, top) in [
+            (KeyCode::Down, 2),
+            (KeyCode::Up, 1),
+            (KeyCode::PageDown, 3),
+            (KeyCode::PageUp, 1),
+        ] {
+            assert_eq!(
+                handle_key(&mut app, KeyEvent::new(code, KeyModifiers::NONE)),
+                Action::Continue
+            );
+            assert_eq!(app.top, top);
+        }
     }
 
     #[test]

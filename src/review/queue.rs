@@ -130,8 +130,8 @@ impl QueueState {
         }
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
-            KeyCode::Char('n') => Action::NextPackage,
-            KeyCode::Char('p') => Action::PreviousPackage,
+            KeyCode::Char('j') => Action::NextPackage,
+            KeyCode::Char('k') => Action::PreviousPackage,
             KeyCode::Char('s') => Action::Skip,
             _ => Action::Continue,
         }
@@ -307,6 +307,28 @@ mod tests {
         let (root, metadata) = super::super::tests::fixture();
         let queue = ReviewQueue::from_metadata(&metadata).unwrap();
         (root, QueueState::new(queue))
+    }
+
+    #[test]
+    fn navigation_remains_available_without_sources() {
+        let (_root, mut state) = fixture();
+        state.app = None;
+        for (character, action) in [
+            ('j', Action::NextPackage),
+            ('k', Action::PreviousPackage),
+            ('n', Action::Continue),
+            ('p', Action::Continue),
+        ] {
+            let key = KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE);
+            assert_eq!(state.handle_key(key), action);
+            assert_eq!(
+                state.handle_key(KeyEvent {
+                    kind: KeyEventKind::Release,
+                    ..key
+                }),
+                Action::Continue
+            );
+        }
     }
 
     #[test]
