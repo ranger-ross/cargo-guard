@@ -16,7 +16,7 @@ pub struct Config {
     pub approved: BTreeMap<String, ApprovedVersion>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum ApprovedVersion {
     SemVer(semver::Version),
