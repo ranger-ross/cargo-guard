@@ -234,7 +234,7 @@ impl QueueState {
                 entry.approvals = approvals.cloned();
                 entry.package.approval =
                     approvals.and_then(|approval| approval.for_review(&entry.package.version));
-                if entry.decision == Some(Decision::Approve)
+                if entry.decision == Some(Decision::PinVersion)
                     && !approvals
                         .is_some_and(|approval| approval.allows_version(&entry.package.version))
                 {
@@ -304,6 +304,9 @@ impl QueueState {
                 };
             }
         }
+        if !app.can_decide() {
+            app.pin_dialog = None;
+        }
         Ok(())
     }
 
@@ -349,7 +352,9 @@ impl QueueState {
             .as_mut()
             .ok_or_else(|| eyre::eyre!("current package sources could not be loaded"))?;
         eyre::ensure!(app.can_decide(), "this package is read-only");
-        app.decide(decision)?;
+        if !app.decide(decision)? {
+            return Ok(false);
+        }
         let decision = app.decision;
         let verified = (decision == Some(Decision::ApproveFingerprint)).then(|| app.sources());
         let config = ConfigFile::open(&self.config_path)?;
@@ -388,7 +393,10 @@ impl QueueState {
         }
     }
 
-    pub fn handle_mouse(&mut self, event: MouseEvent) -> bool {
+    pub fn handle_mouse(&mut self, event: MouseEvent) -> (bool, Action) {
+        if let Some(dialog) = self.app.as_mut().and_then(|app| app.pin_dialog.as_mut()) {
+            return dialog.handle_mouse(event);
+        }
         let previous_hover = self.hovered_package();
         self.package_pointer = (!event.modifiers.contains(KeyModifiers::SHIFT)
             && !matches!(event.kind, MouseEventKind::Drag(_)))
@@ -397,25 +405,29 @@ impl QueueState {
         if event.modifiers.contains(KeyModifiers::SHIFT)
             || self.app.as_ref().is_some_and(|app| app.show_help)
         {
-            return hover_changed;
+            return (hover_changed, Action::Continue);
         }
         if event.kind == MouseEventKind::Down(MouseButton::Left)
             && let Some(selected) = self.hovered_package()
             && selected != self.selected
         {
             self.open(selected);
-            return true;
+            return (true, Action::Continue);
         }
         let source_changed = if let Some(app) = &mut self.app {
             app.handle_mouse(event)
         } else {
             self.error_diagnostic.handle_mouse(event).unwrap_or(false)
         };
-        hover_changed || source_changed
+        (hover_changed || source_changed, Action::Continue)
     }
 
     pub fn hovered_package(&self) -> Option<usize> {
-        if self.app.as_ref().is_some_and(|app| app.show_help) {
+        if self
+            .app
+            .as_ref()
+            .is_some_and(|app| app.show_help || app.pin_dialog.is_some())
+        {
             return None;
         }
         let pointer = self.package_pointer?;
@@ -428,6 +440,9 @@ impl QueueState {
 
     pub fn selected_text(&self) -> Option<String> {
         if let Some(app) = &self.app {
+            if let Some(dialog) = &app.pin_dialog {
+                return dialog.diagnostic.selected_text();
+            }
             app.diagnostic
                 .selected_text()
                 .or_else(|| app.selection.text(&app.file().rows))
@@ -440,7 +455,7 @@ impl QueueState {
         let mut summary = Summary::default();
         for entry in &self.entries {
             match entry.decision {
-                Some(Decision::Approve | Decision::ApproveFingerprint) => summary.approved += 1,
+                Some(Decision::PinVersion | Decision::ApproveFingerprint) => summary.approved += 1,
                 Some(Decision::Reject) => summary.rejected += 1,
                 None if entry.error.is_some() => summary.unresolved += 1,
                 None if entry.already_approved() => summary.already_approved += 1,
@@ -550,7 +565,7 @@ impl Entry {
             "load error"
         } else if matches!(
             self.decision,
-            Some(Decision::Approve | Decision::ApproveFingerprint)
+            Some(Decision::PinVersion | Decision::ApproveFingerprint)
         ) {
             "approved"
         } else if self.decision == Some(Decision::Reject) {
@@ -631,6 +646,18 @@ mod tests {
         let queue =
             ReviewQueue::from_metadata(&metadata, &crate::args::ReviewOptions::default()).unwrap();
         (root, QueueState::new(queue))
+    }
+
+    #[test]
+    fn failed_fingerprint_does_not_advance_or_record_approval() {
+        let (root, mut state) = fixture();
+        let selected = state.selected;
+        assert!(!state.decide(Decision::ApproveFingerprint).unwrap());
+        assert_eq!(state.selected, selected);
+        assert!(state.app.as_ref().unwrap().pin_dialog.is_some());
+        assert_eq!(state.entries[selected].decision, None);
+        assert_eq!(state.summary().approved, 0);
+        assert!(!root.path().join("approved-builds.toml").exists());
     }
 
     fn fingerprint_fixture() -> (tempfile::TempDir, QueueState, PathBuf) {
@@ -943,7 +970,7 @@ mod tests {
         state.navigate(true);
         let external = "[approved]\nother='1.0.0'\n";
         fs::write(root.path().join("approved-builds.toml"), external).unwrap();
-        assert!(state.decide(Decision::Approve).is_err());
+        assert!(state.decide(Decision::PinVersion).is_err());
         assert_eq!(
             fs::read_to_string(root.path().join("approved-builds.toml")).unwrap(),
             external
@@ -1042,7 +1069,7 @@ mod tests {
     #[test]
     fn partial_completion_survives_reopening_the_queue() {
         let (root, mut state) = fixture();
-        state.decide(Decision::Approve).unwrap();
+        state.decide(Decision::PinVersion).unwrap();
         assert_eq!(
             state.summary(),
             Summary {
@@ -1102,12 +1129,12 @@ mod tests {
     fn decisions_advance_and_preserve_previous_saves() {
         let (root, mut state) = fixture();
         assert_eq!(state.entries[state.selected].package.name, "custom-script");
-        assert!(!state.decide(Decision::Approve).unwrap());
+        assert!(!state.decide(Decision::PinVersion).unwrap());
         assert_eq!(state.entries[state.selected].package.name, "default-script");
-        assert!(!state.decide(Decision::Approve).unwrap());
+        assert!(!state.decide(Decision::PinVersion).unwrap());
         assert_eq!(state.entries[state.selected].package.name, "duplicate");
-        assert!(!state.decide(Decision::Approve).unwrap());
-        assert!(state.decide(Decision::Approve).unwrap());
+        assert!(!state.decide(Decision::PinVersion).unwrap());
+        assert!(state.decide(Decision::PinVersion).unwrap());
         let saved =
             crate::config::load_config_from(&root.path().join("approved-builds.toml")).unwrap();
         assert_eq!(saved.approved.len(), 3);
@@ -1141,13 +1168,13 @@ mod tests {
     #[test]
     fn approved_packages_are_read_only_but_other_versions_are_actionable() {
         let (_root, mut state) = fixture();
-        state.decide(Decision::Approve).unwrap();
+        state.decide(Decision::PinVersion).unwrap();
         state.navigate(true);
         assert!(!state.app.as_ref().unwrap().can_decide());
         state.navigate(true);
         assert_eq!(state.entries[state.selected].package.name, "duplicate");
         assert!(state.app.as_ref().unwrap().can_decide());
-        assert!(state.decide(Decision::Approve).is_ok());
+        assert!(state.decide(Decision::PinVersion).is_ok());
     }
 
     #[test]
@@ -1156,7 +1183,7 @@ mod tests {
         let external = "[approved]\nother='1.0.0'\n";
         fs::write(root.path().join("approved-builds.toml"), external).unwrap();
         let index = state.selected;
-        assert!(state.decide(Decision::Approve).is_err());
+        assert!(state.decide(Decision::PinVersion).is_err());
         assert_eq!(state.selected, index);
         assert_eq!(state.entries[index].decision, None);
         assert_eq!(

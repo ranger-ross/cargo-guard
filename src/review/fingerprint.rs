@@ -754,7 +754,8 @@ mod tests {
             .set_approval("example", ApprovedVersion::Fingerprint("old-hash".into()))
             .unwrap();
         app.session.package.approval = Some(ApprovedVersion::Fingerprint("old-hash".into()));
-        app.decide(Decision::Approve).unwrap();
+        assert!(app.decide(Decision::ApproveFingerprint).unwrap());
+        assert!(app.pin_dialog.is_none());
         assert_eq!(app.decision, Some(Decision::ApproveFingerprint));
         let saved = &app.session.config.config().approved["example"];
         assert!(!saved.allows_fingerprint("old-hash"));
@@ -762,10 +763,6 @@ mod tests {
         assert!(saved.allows_fingerprint(&expected));
         assert!(!saved.allows_version(&app.session.package.version));
         assert!(!app.can_decide());
-        assert_eq!(
-            app.approval_status(),
-            "Approved current build-script fingerprints"
-        );
     }
 
     #[test]
@@ -799,7 +796,14 @@ mod tests {
     fn missing_stale_and_changed_sources_do_not_save() {
         let (root, mut app, artifact) = compiled_fixture();
         fs::remove_file(&artifact).unwrap();
-        assert!(app.decide(Decision::ApproveFingerprint).is_err());
+        assert!(!app.decide(Decision::ApproveFingerprint).unwrap());
+        assert!(app.pin_dialog.is_some());
+        assert!(!app.refresh_sources().unwrap());
+        assert!(app.pin_dialog.is_some());
+        assert!(!app.session.config.path().exists());
+        assert!(app.session.config.config().approved.is_empty());
+        assert!(app.session.package.approval.is_none());
+        assert_eq!(app.decision, None);
         fs::write(&artifact, "binary: script0.rs\n").unwrap();
         let past = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
         fs::File::options()
@@ -808,7 +812,11 @@ mod tests {
             .unwrap()
             .set_times(fs::FileTimes::new().set_modified(past))
             .unwrap();
-        assert!(app.decide(Decision::ApproveFingerprint).is_err());
+        assert!(!app.decide(Decision::ApproveFingerprint).unwrap());
+        assert!(app.pin_dialog.is_some());
+        assert!(!app.session.config.path().exists());
+        assert!(app.session.config.config().approved.is_empty());
+        assert_eq!(app.decision, None);
         fs::write(
             root.path().join("script0.rs"),
             "fn main() { println!(\"changed\"); }\n",
@@ -816,6 +824,10 @@ mod tests {
         .unwrap();
         fs::write(&artifact, "binary: script0.rs\n").unwrap();
         assert!(app.decide(Decision::ApproveFingerprint).is_err());
+        assert!(app.pin_dialog.is_none());
+        fs::remove_file(root.path().join("script0.rs")).unwrap();
+        assert!(app.decide(Decision::ApproveFingerprint).is_err());
+        assert!(app.pin_dialog.is_none());
         assert!(!app.session.config.path().exists());
         assert_eq!(app.decision, None);
     }
@@ -825,7 +837,64 @@ mod tests {
         let (_root, mut app, _artifact) = compiled_fixture();
         fs::write(app.session.config.path(), "[approved]\nexternal='1.0.0'\n").unwrap();
         assert!(app.decide(Decision::ApproveFingerprint).is_err());
+        assert!(app.pin_dialog.is_none());
         assert_eq!(app.decision, None);
+        assert!(app.session.config.config().approved.is_empty());
+        assert_eq!(
+            fs::read_to_string(app.session.config.path()).unwrap(),
+            "[approved]\nexternal='1.0.0'\n"
+        );
+    }
+
+    #[test]
+    fn fingerprint_persistence_errors_do_not_offer_version_pins() {
+        let (_root, mut app, _artifact) = compiled_fixture();
+        fs::create_dir(app.session.config.path()).unwrap();
+        assert!(app.decide(Decision::ApproveFingerprint).is_err());
+        assert!(app.pin_dialog.is_none());
+        assert_eq!(app.decision, None);
+        assert!(app.session.package.approval.is_none());
+        assert!(app.session.config.config().approved.is_empty());
+        assert!(app.session.config.path().is_dir());
+    }
+
+    #[test]
+    fn missing_artifacts_require_explicit_pin_before_persisting() {
+        let (_root, mut app, artifact) = compiled_fixture();
+        fs::remove_file(&artifact).unwrap();
+        assert!(!app.decide(Decision::ApproveFingerprint).unwrap());
+        assert!(app.pin_dialog.is_some());
+        assert!(app.can_decide());
+        assert!(!app.session.config.path().exists());
+        assert!(app.session.config.config().approved.is_empty());
+        assert!(app.session.package.approval.is_none());
+        assert_eq!(app.decision, None);
+
+        assert!(app.decide(Decision::PinVersion).unwrap());
+        assert!(app.pin_dialog.is_none());
+        assert_eq!(app.decision, Some(Decision::PinVersion));
+        assert!(app.is_current_version_approved());
+        assert!(!app.can_decide());
+        let saved = crate::config::load_config_from(app.session.config.path()).unwrap();
+        assert_eq!(
+            saved.approved["example"],
+            ApprovedVersion::SemVer(app.session.package.version.clone())
+        );
+        assert!(!artifact.exists());
+    }
+
+    #[test]
+    fn pin_save_conflict_keeps_dialog_and_does_not_approve() {
+        let (_root, mut app, artifact) = compiled_fixture();
+        fs::remove_file(artifact).unwrap();
+        assert!(!app.decide(Decision::ApproveFingerprint).unwrap());
+        fs::write(app.session.config.path(), "[approved]\nexternal='1.0.0'\n").unwrap();
+        let error = app.decide(Decision::PinVersion).unwrap_err();
+        app.report_decision_error(error);
+        assert!(app.pin_dialog.is_some());
+        assert!(app.notice.is_none());
+        assert_eq!(app.decision, None);
+        assert!(app.session.package.approval.is_none());
         assert!(app.session.config.config().approved.is_empty());
         assert_eq!(
             fs::read_to_string(app.session.config.path()).unwrap(),

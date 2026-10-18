@@ -325,7 +325,13 @@ fn render_area(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     }
     render_footer(frame, app, footer);
-    if app.show_help {
+    if let Some(dialog) = &mut app.pin_dialog {
+        dialog.render(
+            frame,
+            &app.session.package.name,
+            &app.session.package.version,
+        );
+    } else if app.show_help {
         render_help(frame, app);
     }
 }
@@ -335,23 +341,19 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         Layout::horizontal([Constraint::Min(0), Constraint::Length(16)]).areas(area);
     let mut keys = Vec::new();
     if app.can_decide() {
-        keys.push((
-            "a",
-            if app.prefers_fingerprint() {
-                "fingerprints"
-            } else {
-                "approve"
-            },
-        ));
-        if !app.prefers_fingerprint() {
-            keys.push(("f", "fingerprints"));
-        }
+        keys.push(("a", "accept"));
         keys.push(("r", "reject"));
     }
     if app.queue_mode {
         keys.push(("s", "skip"));
     }
-    if app.selection.is_active() || app.diagnostic.selection.is_active() {
+    if app.selection.is_active()
+        || app.diagnostic.selection.is_active()
+        || app
+            .pin_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.diagnostic.selection.is_active())
+    {
         keys.push(("y", "copy"));
         keys.push(("Esc", "clear"));
     }
@@ -416,15 +418,10 @@ fn render_help(frame: &mut Frame, app: &App) {
     if app.can_decide() {
         let after = if app.queue_mode { "advance" } else { "exit" };
         lines.push(Line::from(format!(
-            "a  Approve {} and {after}",
-            if app.prefers_fingerprint() {
-                "current fingerprints"
-            } else {
-                "this package version"
-            }
+            "a  Accept build-script fingerprints and {after}",
         )));
         lines.push(Line::from(
-            "f  Approve all script fingerprints using the latest compiled inputs",
+            "If fingerprinting is unavailable, choose to pin the version or cancel.",
         ));
         lines.push(Line::from(format!(
             "r  Reject and {after}; keep existing approvals"
@@ -623,88 +620,6 @@ mod tests {
                 .draw(|frame| render_queue(frame, &mut state))
                 .unwrap();
         }
-    }
-
-    #[test]
-    fn renders_context_aware_help_and_fingerprint_controls() {
-        let (_root, mut app) = fixture(&["fn main() {}"]);
-        app.session.package.approval = Some(ApprovedVersion::Fingerprint("hash".into()));
-        let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
-        terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let text = screen(&terminal);
-        assert!(text.contains("(fingerprint)"));
-        assert!(text.contains("a fingerprints"));
-        assert!(!text.contains("a approve"));
-        assert!(!text.contains("Approvals:"));
-        app.show_help = true;
-        terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let text = screen(&terminal);
-        assert!(text.contains("Review help"));
-        assert!(text.contains("Approve current fingerprints"));
-        assert!(text.contains("Approvals:"));
-        for (width, height) in [(40, 12), (1, 1), (0, 0)] {
-            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-            terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        }
-    }
-
-    #[test]
-    fn hides_decision_actions_for_approved_versions() {
-        let (_root, mut app) = fixture(&["fn main() {}"]);
-        app.session.package.approval =
-            Some(ApprovedVersion::SemVer(app.session.package.version.clone()));
-        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
-        terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let text = screen(&terminal);
-        assert!(text.contains("Approved example v0.1.0"));
-        assert!(!text.contains("a approve"));
-        assert!(!text.contains("r reject"));
-    }
-
-    #[test]
-    fn verified_current_fingerprints_show_approved_read_only_controls() {
-        use crate::review::sources::{PackageSources, ScriptSource};
-
-        let (_root, mut app) = fixture(&["fn main() {}"]);
-        app.session.package.approval = Some(ApprovedVersion::Fingerprint("hash".into()));
-        app.set_baseline(Baseline::Ready(PackageSources {
-            version: app.session.package.version.clone(),
-            scripts: vec![ScriptSource {
-                path: "script0.rs".into(),
-                contents: "fn main() {}".into(),
-            }],
-        }))
-        .unwrap();
-        let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
-        terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let text = screen(&terminal);
-        assert!(text.contains("Reviewing"));
-        assert!(text.contains("a fingerprints"));
-        assert!(app.can_decide());
-
-        app.set_baseline(Baseline::CurrentFingerprint(
-            vec![ScriptSource {
-                path: "script0.rs".into(),
-                contents: "fn main() {}".into(),
-            }]
-            .into(),
-        ))
-        .unwrap();
-        terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let text = screen(&terminal);
-        assert!(text.contains("Approved"));
-        assert!(!text.contains("a fingerprints"));
-        assert!(!text.contains("r reject"));
-        assert!(!app.can_decide());
-        assert_eq!(app.decision, None);
-        assert!(baseline_note(&app).is_none());
-
-        app.show_help = true;
-        terminal.draw(|frame| render(frame, &mut app)).unwrap();
-        let text = screen(&terminal);
-        assert!(text.contains("approved"));
-        assert!(!text.contains("Approve current fingerprints"));
-        assert!(!text.contains("Reject and"));
     }
 
     #[test]

@@ -79,10 +79,14 @@ impl Diagnostic {
             .border_style(Style::default().fg(color))
             .title(title);
         let inner = block.inner(area);
+        frame.render_widget(block, area);
+        self.render_body(frame, inner);
+    }
+
+    pub fn render_body(&mut self, frame: &mut Frame, inner: Rect) {
         self.wrap(inner.width);
         self.selection.area = inner;
         self.top = self.top.min(self.max_top());
-        frame.render_widget(block, area);
         for (offset, range) in self
             .rows
             .iter()
@@ -147,7 +151,7 @@ impl Diagnostic {
             .saturating_sub(usize::from(self.selection.area.height).max(1))
     }
 
-    fn scroll(&mut self, rows: isize) {
+    pub fn scroll(&mut self, rows: isize) {
         self.top = self.top.saturating_add_signed(rows).min(self.max_top());
     }
 

@@ -58,54 +58,18 @@ fn run_review(queue: ReviewQueue, queue_mode: bool) -> eyre::Result<()> {
                 match event {
                     Event::Resize(..) => dirty = true,
                     Event::Mouse(mouse) => {
-                        dirty |= state.handle_mouse(mouse);
+                        let (changed, action) = state.handle_mouse(mouse);
+                        dirty |= changed;
+                        if apply_action(&mut state, action) {
+                            break 'review;
+                        }
+                        set_mode(&mut state, queue_mode);
                     }
                     Event::Key(key) => {
                         dirty = true;
-                        match state.handle_key(key) {
-                            Action::Quit => break 'review,
-                            Action::NextPackage => state.navigate(false),
-                            Action::PreviousPackage => state.navigate(true),
-                            Action::Skip => {
-                                if state.skip() {
-                                    break 'review;
-                                }
-                            }
-                            Action::Decide(decision) => match state.decide(decision) {
-                                Ok(true) => break 'review,
-                                Ok(false) => {}
-                                Err(error) => {
-                                    if let Some(app) = &mut state.app {
-                                        app.report_decision_error(error);
-                                    }
-                                }
-                            },
-                            Action::CopySelection => {
-                                if let Some(text) = state.selected_text()
-                                    && !text.is_empty()
-                                {
-                                    let result = crossterm::execute!(
-                                        io::stdout(),
-                                        CopyToClipboard::to_clipboard_from(text)
-                                    );
-                                    if let Err(error) = result {
-                                        let message = format!("Could not copy text: {error}");
-                                        if let Some(app) = &mut state.app {
-                                            app.notice = Some(Notice {
-                                                message,
-                                                is_error: true,
-                                            });
-                                        } else {
-                                            let entry = &mut state.entries[state.selected];
-                                            entry.error = Some(format!(
-                                                "{message}\n\n{}",
-                                                entry.error.as_deref().unwrap_or_default()
-                                            ));
-                                        }
-                                    }
-                                }
-                            }
-                            Action::Continue => {}
+                        let action = state.handle_key(key);
+                        if apply_action(&mut state, action) {
+                            break 'review;
                         }
                         set_mode(&mut state, queue_mode);
                     }
@@ -135,6 +99,53 @@ fn run_review(queue: ReviewQueue, queue_mode: bool) -> eyre::Result<()> {
         state.summary().print();
     }
     Ok(())
+}
+
+fn apply_action(state: &mut QueueState, action: Action) -> bool {
+    match action {
+        Action::Quit => return true,
+        Action::NextPackage => state.navigate(false),
+        Action::PreviousPackage => state.navigate(true),
+        Action::Skip => return state.skip(),
+        Action::CancelPin => {
+            if let Some(app) = &mut state.app {
+                app.pin_dialog = None;
+            }
+        }
+        Action::Decide(decision) => match state.decide(decision) {
+            Ok(exit) => return exit,
+            Err(error) => {
+                if let Some(app) = &mut state.app {
+                    app.report_decision_error(error);
+                }
+            }
+        },
+        Action::CopySelection => {
+            if let Some(text) = state.selected_text()
+                && !text.is_empty()
+            {
+                let result =
+                    crossterm::execute!(io::stdout(), CopyToClipboard::to_clipboard_from(text));
+                if let Err(error) = result {
+                    let message = format!("Could not copy text: {error}");
+                    if let Some(app) = &mut state.app {
+                        app.notice = Some(Notice {
+                            message,
+                            is_error: true,
+                        });
+                    } else {
+                        let entry = &mut state.entries[state.selected];
+                        entry.error = Some(format!(
+                            "{message}\n\n{}",
+                            entry.error.as_deref().unwrap_or_default()
+                        ));
+                    }
+                }
+            }
+        }
+        Action::Continue => {}
+    }
+    false
 }
 
 fn set_mode(state: &mut QueueState, queue_mode: bool) {

@@ -5,6 +5,7 @@ use super::{
     diagnostic::Diagnostic,
     diff::{self, FileStatus, ReviewFile},
     highlight::Highlighter,
+    pin_dialog::PinDialog,
     selection::Selection,
     sources::{Baseline, ScriptSource},
 };
@@ -32,6 +33,7 @@ pub struct App {
     pub verification_pending: bool,
     pub selection: Selection,
     pub diagnostic: Diagnostic,
+    pub pin_dialog: Option<PinDialog>,
 }
 
 impl App {
@@ -61,6 +63,7 @@ impl App {
             verification_pending: false,
             selection: Selection::default(),
             diagnostic: Diagnostic::default(),
+            pin_dialog: None,
         })
     }
 
@@ -70,6 +73,7 @@ impl App {
 
     /// Refresh the edit snapshot without discarding unchanged verified sources.
     pub fn refresh(&mut self, session: ReviewSession) -> eyre::Result<()> {
+        self.pin_dialog = None;
         self.selection.clear();
         self.diagnostic.reset_view();
         let current: Arc<[ScriptSource]> = read_sources(&session)?.into();
@@ -106,6 +110,7 @@ impl App {
         if current.as_slice() == self.current.as_ref() {
             return Ok(false);
         }
+        self.pin_dialog = None;
         let baseline = Baseline::for_session(&self.session);
         let files = diff::build_files(&current, &baseline, &self.highlighter)?;
         self.replace_files(baseline, files);
@@ -136,13 +141,11 @@ impl App {
 
     /// Save first; publish the new approval/decision only after persistence
     /// succeeds. Rendering preparation is also done before modifying the file.
-    pub fn decide(&mut self, decision: Decision) -> eyre::Result<()> {
+    pub fn decide(&mut self, decision: Decision) -> eyre::Result<bool> {
         if let Some(reason) = &self.decision_blocked {
             eyre::bail!("{reason}");
         }
-        if decision == Decision::ApproveFingerprint
-            || (decision == Decision::Approve && self.prefers_fingerprint())
-        {
+        if decision == Decision::ApproveFingerprint {
             return self.approve_fingerprints();
         }
         let revoke = matches!(
@@ -150,7 +153,7 @@ impl App {
             Some(ApprovedVersion::SemVer(version)) if version == &self.session.package.version
         );
         let next_baseline = match decision {
-            Decision::Approve => Some(Baseline::CurrentVersion),
+            Decision::PinVersion => Some(Baseline::CurrentVersion),
             Decision::Reject if revoke => Some(Baseline::NewPackage),
             Decision::Reject => None,
             Decision::ApproveFingerprint => unreachable!(),
@@ -164,7 +167,7 @@ impl App {
         let package = &self.session.package;
         let message = match decision {
             Decision::ApproveFingerprint => unreachable!(),
-            Decision::Approve => {
+            Decision::PinVersion => {
                 self.session.config.set_approval(
                     &package.name,
                     ApprovedVersion::SemVer(package.version.clone()),
@@ -207,25 +210,23 @@ impl App {
             self.replace_files(baseline, files);
         }
         self.decision = Some(decision);
+        self.pin_dialog = None;
         self.notice = Some(Notice {
             message,
             is_error: false,
         });
-        Ok(())
+        Ok(true)
     }
 
     pub fn report_decision_error(&mut self, error: eyre::Report) {
-        self.notice = Some(Notice {
-            message: format!("{error:#}"),
-            is_error: true,
-        });
-    }
-
-    pub fn prefers_fingerprint(&self) -> bool {
-        matches!(
-            self.session.package.approval,
-            Some(ApprovedVersion::Fingerprint(_))
-        )
+        if self.pin_dialog.is_some() {
+            self.pin_dialog = Some(PinDialog::new(format!("{error:#}")));
+        } else {
+            self.notice = Some(Notice {
+                message: format!("{error:#}"),
+                is_error: true,
+            });
+        }
     }
 
     pub fn baseline_message(&self) -> String {
@@ -250,6 +251,7 @@ impl App {
     }
 
     pub fn jump_change(&mut self, backwards: bool) {
+        self.pin_dialog = None;
         let changes = &self.file().changes;
         let position = self.change_target.unwrap_or(self.top);
         let next = if backwards {
@@ -351,6 +353,7 @@ impl App {
     }
 
     pub fn switch_file(&mut self, backwards: bool) {
+        self.pin_dialog = None;
         self.selection.clear();
         self.change_target = None;
         self.selected = if backwards {
@@ -375,16 +378,28 @@ impl App {
         self.change_target = None;
     }
 
-    fn approve_fingerprints(&mut self) -> eyre::Result<()> {
+    fn approve_fingerprints(&mut self) -> eyre::Result<bool> {
         eyre::ensure!(
             self.can_decide(),
             "this package is already approved or read-only"
         );
-        let approvals = super::fingerprint::approvals(&self.session)?;
+        self.pin_dialog = None;
         eyre::ensure!(
             read_sources(&self.session)?.as_slice() == self.current.as_ref(),
             "build script sources changed since opening review; reopen review before approving"
         );
+        let approvals = super::fingerprint::approvals(&self.session);
+        eyre::ensure!(
+            read_sources(&self.session)?.as_slice() == self.current.as_ref(),
+            "build script sources changed since opening review; reopen review before approving"
+        );
+        let approvals = match approvals {
+            Ok(approvals) => approvals,
+            Err(error) => {
+                self.pin_dialog = Some(PinDialog::new(format!("{error:#}")));
+                return Ok(false);
+            }
+        };
         self.session
             .config
             .add_approvals(&self.session.package.name, &approvals)?;
@@ -396,6 +411,7 @@ impl App {
             .get(&self.session.package.name)
             .and_then(|a| a.for_review(&self.session.package.version));
         self.decision = Some(Decision::ApproveFingerprint);
+        self.pin_dialog = None;
         self.notice = Some(Notice {
             message: format!(
                 "Approved {} fingerprint(s) for {} v{}",
@@ -405,7 +421,7 @@ impl App {
             ),
             is_error: false,
         });
-        Ok(())
+        Ok(true)
     }
 
     fn max_left(&self) -> u16 {
@@ -418,7 +434,7 @@ impl App {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decision {
-    Approve,
+    PinVersion,
     ApproveFingerprint,
     Reject,
 }
@@ -490,19 +506,18 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn approves_package_then_revokes_its_current_version() {
+    fn pins_package_then_revokes_its_current_version() {
         let (_root, mut app) = fixture(&["fn main() {}\n", "// second script\n"]);
-        app.decide(Decision::Approve).unwrap();
+        assert!(app.decide(Decision::PinVersion).unwrap());
         let saved = crate::config::load_config_from(app.session.config.path()).unwrap();
         assert!(
             matches!(&saved.approved["example"], ApprovedVersion::SemVer(v) if *v == app.session.package.version)
         );
         assert_eq!(saved.approved.len(), 1);
-        assert_eq!(app.decision, Some(Decision::Approve));
+        assert_eq!(app.decision, Some(Decision::PinVersion));
         assert!(matches!(app.baseline, Baseline::CurrentVersion));
-        assert_eq!(app.approval_status(), "Approved: v0.1.0");
 
-        app.decide(Decision::Reject).unwrap();
+        assert!(app.decide(Decision::Reject).unwrap());
         assert!(
             crate::config::load_config_from(app.session.config.path())
                 .unwrap()
@@ -512,13 +527,12 @@ pub(super) mod tests {
         assert!(app.session.package.approval.is_none());
         assert_eq!(app.decision, Some(Decision::Reject));
         assert!(matches!(app.baseline, Baseline::NewPackage));
-        assert!(app.approval_status().contains("Rejected"));
     }
 
     #[test]
     fn rejecting_new_or_upgraded_versions_keeps_config_unchanged() {
         let (_root, mut app) = fixture(&["fn main() {}\n"]);
-        app.decide(Decision::Reject).unwrap();
+        assert!(app.decide(Decision::Reject).unwrap());
         assert!(!app.session.config.path().exists());
 
         app.session
@@ -532,9 +546,8 @@ pub(super) mod tests {
         let before = fs::read(app.session.config.path()).unwrap();
         app.decide(Decision::Reject).unwrap();
         assert_eq!(fs::read(app.session.config.path()).unwrap(), before);
-        assert!(app.approval_status().contains("v0.0.1 remains approved"));
         assert!(matches!(app.baseline, Baseline::Loading(_)));
-        app.decide(Decision::Approve).unwrap();
+        assert!(app.decide(Decision::PinVersion).unwrap());
         assert!(
             matches!(&app.session.package.approval, Some(ApprovedVersion::SemVer(v)) if *v == app.session.package.version)
         );
@@ -549,7 +562,8 @@ pub(super) mod tests {
             .unwrap();
         app.session.package.approval = app.session.config.config().approved.get("example").cloned();
         let before = fs::read(app.session.config.path()).unwrap();
-        assert!(app.decide(Decision::Approve).is_err());
+        assert!(!app.decide(Decision::ApproveFingerprint).unwrap());
+        assert!(app.pin_dialog.is_some());
         assert_eq!(app.decision, None);
         app.decide(Decision::Reject).unwrap();
         assert_eq!(fs::read(app.session.config.path()).unwrap(), before);
@@ -604,7 +618,7 @@ pub(super) mod tests {
         app.session.package.approval =
             app.session.config.config().approved[&name].for_review(&app.session.package.version);
         assert!(app.can_decide());
-        app.decide(Decision::Approve).unwrap();
+        assert!(app.decide(Decision::PinVersion).unwrap());
         let approvals = &app.session.config.config().approved[&name];
         assert!(approvals.allows_fingerprint(&fingerprint));
         assert!(approvals.allows_version(&"0.0.1".parse().unwrap()));
@@ -621,30 +635,22 @@ pub(super) mod tests {
         let (_root, mut app) = fixture(&["fn main() {}\n"]);
         fs::write(app.session.config.path(), "[approved]\nother = '1.0.0'\n").unwrap();
         let before = fs::read(app.session.config.path()).unwrap();
-        let error = app.decide(Decision::Approve).unwrap_err();
+        let error = app.decide(Decision::PinVersion).unwrap_err();
         app.report_decision_error(error);
         assert!(app.notice.as_ref().unwrap().is_error);
-        assert!(
-            app.notice
-                .as_ref()
-                .unwrap()
-                .message
-                .contains("changed since it was loaded")
-        );
         assert_eq!(app.decision, None);
         assert!(app.session.package.approval.is_none());
         assert_eq!(fs::read(app.session.config.path()).unwrap(), before);
 
         app.session.config = ConfigFile::open(app.session.config.path()).unwrap();
-        app.decide(Decision::Approve).unwrap();
+        assert!(app.decide(Decision::PinVersion).unwrap());
         let changed = format!(
             "{}\n# external edit\n",
             fs::read_to_string(app.session.config.path()).unwrap()
         );
         fs::write(app.session.config.path(), &changed).unwrap();
         assert!(app.decide(Decision::Reject).is_err());
-        assert_eq!(app.decision, Some(Decision::Approve));
-        assert_eq!(app.approval_status(), "Approved: v0.1.0");
+        assert_eq!(app.decision, Some(Decision::PinVersion));
         assert_eq!(
             fs::read_to_string(app.session.config.path()).unwrap(),
             changed

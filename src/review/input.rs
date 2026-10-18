@@ -11,6 +11,7 @@ pub enum Action {
     PreviousPackage,
     Skip,
     CopySelection,
+    CancelPin,
 }
 
 pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
@@ -19,6 +20,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return Action::Quit;
+    }
+    if let Some(dialog) = &mut app.pin_dialog {
+        return dialog.handle_key(key);
     }
     if key.code == KeyCode::Char('?') && key.kind == KeyEventKind::Press {
         app.show_help = !app.show_help;
@@ -33,7 +37,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
         }
         return Action::Continue;
     }
-    if matches!(key.code, KeyCode::Char('a' | 'r' | 'f')) && !app.can_decide() {
+    if matches!(key.code, KeyCode::Char('a' | 'r')) && !app.can_decide() {
         return Action::Continue;
     }
     match key.code {
@@ -43,13 +47,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
             return Action::Skip;
         }
         KeyCode::Char('a') if key.kind == KeyEventKind::Press && key.modifiers.is_empty() => {
-            return Action::Decide(Decision::Approve);
+            return Action::Decide(Decision::ApproveFingerprint);
         }
         KeyCode::Char('r') if key.kind == KeyEventKind::Press && key.modifiers.is_empty() => {
             return Action::Decide(Decision::Reject);
-        }
-        KeyCode::Char('f') if key.kind == KeyEventKind::Press && key.modifiers.is_empty() => {
-            return Action::Decide(Decision::ApproveFingerprint);
         }
         KeyCode::Char('y') if key.kind == KeyEventKind::Press && key.modifiers.is_empty() => {
             return Action::CopySelection;
@@ -80,7 +81,7 @@ mod tests {
     use crate::review::app::tests::fixture;
 
     #[test]
-    fn help_blocks_decisions_and_fingerprint_actions_are_enabled() {
+    fn accept_uses_fingerprints_and_help_blocks_decisions() {
         let (_root, mut app) = fixture(&["fn main() {}"]);
         let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
         handle_key(&mut app, key('?'));
@@ -90,18 +91,15 @@ mod tests {
         assert!(!app.show_help);
         assert_eq!(
             handle_key(&mut app, key('a')),
-            Action::Decide(Decision::Approve)
+            Action::Decide(Decision::ApproveFingerprint)
         );
         app.session.package.approval =
             Some(crate::config::ApprovedVersion::Fingerprint("hash".into()));
         assert_eq!(
             handle_key(&mut app, key('a')),
-            Action::Decide(Decision::Approve)
-        );
-        assert_eq!(
-            handle_key(&mut app, key('f')),
             Action::Decide(Decision::ApproveFingerprint)
         );
+        assert_eq!(handle_key(&mut app, key('f')), Action::Continue);
         assert_eq!(
             handle_key(&mut app, key('r')),
             Action::Decide(Decision::Reject)
@@ -129,9 +127,8 @@ mod tests {
     fn approval_actions_require_an_unmodified_key_press() {
         let (_root, mut app) = fixture(&["fn main() {}"]);
         for (character, action) in [
-            ('a', Action::Decide(Decision::Approve)),
+            ('a', Action::Decide(Decision::ApproveFingerprint)),
             ('r', Action::Decide(Decision::Reject)),
-            ('f', Action::Decide(Decision::ApproveFingerprint)),
         ] {
             let key = KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE);
             assert_eq!(handle_key(&mut app, key), action);
