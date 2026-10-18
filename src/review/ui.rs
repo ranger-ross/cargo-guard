@@ -450,7 +450,7 @@ fn render_help(frame: &mut Frame, app: &mut App) {
             "Global approval is informational here; workspace review still saves only workspace approvals.",
         ));
         lines.push(Line::from(
-            "Build precedence is unchanged: an existing workspace approval file remains authoritative for builds configured with that workspace root.",
+            "Build precedence is unchanged: an existing workspace approval file remains authoritative for builds in that workspace.",
         ));
     }
     lines.extend([

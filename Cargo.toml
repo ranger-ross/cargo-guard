@@ -30,6 +30,7 @@ toml_edit = "0.25"
 unicode-width = "0.2"
 unicode-segmentation = "1"
 cargo-config2 = "0.1.45"
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 
 [dev-dependencies]
 portable-pty = "0.9.0"

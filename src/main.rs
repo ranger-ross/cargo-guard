@@ -11,6 +11,7 @@ use crate::{
 mod args;
 mod config;
 mod fingerprint;
+mod invocation;
 mod review;
 mod workspace;
 
@@ -38,27 +39,42 @@ fn run(args: &[OsString]) -> eyre::Result<()> {
     let (binary, args) = args.split_first().ok_or_else(|| {
         eyre::eyre!("expected the build script binary path as the first argument")
     })?;
-    let paths = RunnerPaths::from_env()?;
-    let is_member = if let Some(root) = &paths.workspace_root {
-        let manifest = std::env::var_os("CARGO_MANIFEST_PATH")
-            .ok_or_else(|| eyre::eyre!("could not read CARGO_MANIFEST_PATH"))?;
-        workspace::contains_manifest(root, Path::new(&manifest))?
-    } else {
-        false
-    };
-    if !is_member {
-        check_approval(Path::new(binary), &config::load_runner_approvals(&paths)?)?;
+    let invocation = invocation::discover()?;
+    let policy_workspace = invocation
+        .policy_workspace
+        .as_ref()
+        .unwrap_or(&invocation.workspace);
+    let paths = RunnerPaths::from_env(policy_workspace.workspace_root.as_std_path())?;
+    let manifest = std::env::var_os("CARGO_MANIFEST_PATH")
+        .ok_or_else(|| eyre::eyre!("could not read CARGO_MANIFEST_PATH"))?;
+    if !workspace::contains_manifest(policy_workspace, Path::new(&manifest))? {
+        check_approval(
+            Path::new(binary),
+            &config::load_runner_approvals(&paths)?,
+            invocation.workspace.workspace_root.as_std_path(),
+        )?;
     }
 
     let status = Command::new(binary)
         .args(args)
+        .env(
+            invocation::POLICY_PID,
+            invocation
+                .policy_owner
+                .unwrap_or_else(std::process::id)
+                .to_string(),
+        )
         .status()
         .with_context(|| format!("could not run build script {}", binary.to_string_lossy()))?;
 
     std::process::exit(status.code().unwrap_or(1));
 }
 
-fn check_approval(binary: &Path, approvals: &LoadedApprovals) -> eyre::Result<()> {
+fn check_approval(
+    binary: &Path,
+    approvals: &LoadedApprovals,
+    dep_info_root: &Path,
+) -> eyre::Result<()> {
     let build_script = BuildScriptFingerprint::current(binary)?;
     let target = &approvals.target;
     let flag = if target.scope == ApprovalScope::Global {
@@ -87,7 +103,7 @@ fn check_approval(binary: &Path, approvals: &LoadedApprovals) -> eyre::Result<()
             .iter()
             .any(|e| matches!(e, ApprovedVersion::Fingerprint(_)))
     }) {
-        let fingerprint = build_script.fingerprint()?;
+        let fingerprint = build_script.fingerprint(dep_info_root)?;
         if approval.is_some_and(|a| a.allows_fingerprint(&fingerprint)) {
             return Ok(());
         }

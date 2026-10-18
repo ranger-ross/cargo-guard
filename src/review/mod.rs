@@ -230,18 +230,21 @@ fn policy_notes(
     match target.scope {
         ApprovalScope::Global => {
             notes.push("Global approvals apply across projects; version pins apply by package name and version across sources.".into());
-            notes.push("Fingerprints with relative compiler inputs require CARGO_GUARD_WORKSPACE_ROOT during builds.".into());
             if global_path.is_none() {
                 notes.push(format!("Global approvals are not enabled for builds. Set CARGO_GUARD_GLOBAL_APPROVED_BUILDS_PATH to {} in Cargo [env] configuration.", target.path.display()));
             }
             if workspace_exists {
-                notes.push(format!("Builds configured with CARGO_GUARD_WORKSPACE_ROOT={} use {} instead of this global file.", root.display(), workspace_path.display()));
+                notes.push(format!(
+                    "Builds in {} use {} instead of this global file.",
+                    root.display(),
+                    workspace_path.display()
+                ));
             }
         }
         ApprovalScope::Workspace => {
-            notes.push("Workspace approvals require CARGO_GUARD_WORKSPACE_ROOT during builds; use --global for a global-only setup.".into());
+            notes.push("Workspace members run without approval. Dependency approvals are read from the automatically discovered workspace.".into());
             if global_path.is_some() && !workspace_exists {
-                notes.push(format!("The first workspace approval makes {} authoritative for builds configured with this workspace root; global approvals will no longer fill missing entries.", workspace_path.display()));
+                notes.push(format!("The first workspace approval makes {} authoritative for this workspace; global approvals will no longer fill missing entries.", workspace_path.display()));
             }
         }
     }

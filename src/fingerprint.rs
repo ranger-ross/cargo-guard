@@ -76,7 +76,7 @@ impl BuildScriptFingerprint {
         })
     }
 
-    pub fn fingerprint(&self) -> eyre::Result<String> {
+    pub fn fingerprint(&self, dep_info_root: &Path) -> eyre::Result<String> {
         if let Some(fingerprint) = self.fingerprint.borrow().as_ref() {
             return Ok(fingerprint.clone());
         }
@@ -84,11 +84,10 @@ impl BuildScriptFingerprint {
         let dep_info = fs::read_to_string(&self.dep_info_path)
             .with_context(|| format!("could not read dep-info {}", self.dep_info_path.display()))?;
 
-        let dep_info_root = env::var_os("CARGO_GUARD_WORKSPACE_ROOT").map(PathBuf::from);
         let fingerprint = from_dep_info(
             &self.manifest_path,
             &dep_info,
-            dep_info_root.as_deref(),
+            Some(dep_info_root),
             &self.version,
         )?;
         *self.fingerprint.borrow_mut() = Some(fingerprint.clone());
@@ -281,7 +280,7 @@ fn fingerprint_inputs(
             None => {
                 eyre::ensure!(
                     file.is_absolute(),
-                    "cannot resolve relative build-script input {} without CARGO_GUARD_WORKSPACE_ROOT; set it to the consuming workspace's absolute path (no workspace approval file is required)",
+                    "cannot resolve relative build-script input {} without its compiler working directory",
                     file.display()
                 );
                 file.canonicalize()
@@ -493,7 +492,7 @@ mod tests {
             dep_info_path: root.join("build_script_build.d"),
             fingerprint: RefCell::new(None),
         };
-        assert!(script.fingerprint().is_err());
+        assert!(script.fingerprint(&root).is_err());
         assert!(script.fingerprint.borrow().is_none());
 
         fs::create_dir_all(&root).unwrap();
@@ -504,11 +503,11 @@ mod tests {
         )
         .unwrap();
         fs::write(root.join("build.rs"), "fn main() {}\n").unwrap();
-        let hash = script.fingerprint().unwrap();
+        let hash = script.fingerprint(&root).unwrap();
         assert_eq!(script.fingerprint.borrow().as_ref(), Some(&hash));
 
         fs::remove_dir_all(&root).unwrap();
-        assert_eq!(script.fingerprint().unwrap(), hash);
+        assert_eq!(script.fingerprint(&root).unwrap(), hash);
     }
 
     #[test]
@@ -691,8 +690,7 @@ mod tests {
                 root.path().join("build.rs").display()
             ),
         ] {
-            let error = from_dep_info(&manifest, &inputs, None, "1.0.0").unwrap_err();
-            assert!(error.to_string().contains("CARGO_GUARD_WORKSPACE_ROOT"));
+            assert!(from_dep_info(&manifest, &inputs, None, "1.0.0").is_err());
             assert_eq!(
                 from_dep_info(&manifest, &inputs, Some(root.path()), "1.0.0").unwrap(),
                 expected

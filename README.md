@@ -25,12 +25,6 @@ target-applies-to-host = true
 
 [host]
 runner = "cargo-guard"
-
-# `relative = true` makes Cargo resolve `.` to the directory containing `.cargo`.
-# This tells Cargo Guard where to find the approval file, even when Cargo runs it
-# from a dependency's source directory.
-[env]
-CARGO_GUARD_WORKSPACE_ROOT = { value = ".", relative = true }
 ```
 
 To setup cargo guard globally add the following to your `~/.cargo/config.toml`
@@ -42,6 +36,9 @@ target-applies-to-host = true
 
 [host]
 runner = "cargo-guard"
+
+[env]
+CARGO_GUARD_GLOBAL_APPROVED_BUILDS_PATH = { value = ".cargo/approved-builds.toml", relative = true }
 ```
 
 This configuration will tell Cargo to build your projects will cargo-guard as middleware between your Cargo and your build scripts.
@@ -89,7 +86,7 @@ foo = ["1.0.0", "f7609b919173e7121493266d0f89db724a1e47bb105ebd05397f869639603ee
 foo = "approved"
 ```
 
-### Security and Limitations
+## Security
 
 Regarding the security of these options, they all come with trades offs.
 Pinning to a single version is the most secure, but the most demanding in terms of maintenance.
@@ -105,4 +102,8 @@ taking a fingerprint of a build script and only requiring a re-approval if it ha
 The fingerprint attempts to track the most common attack vectors for build.rs attacks but does not guarantee to
 capture everything.
 
+
+## Limitations
+
+* Requires nightly Rust to use `host.runner`
 
