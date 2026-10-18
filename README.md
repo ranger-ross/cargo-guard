@@ -64,10 +64,10 @@ It is recommended to use `cargo guard review` to automate this process.
 
 ```toml
 [approved]
-# Pin a single version
+# Allow a single version
 foo = "0.9.12"
 
-# Pin to a fingerprint of the build script (not tied to single package version)
+# Allow all build scripts that match a fingerprint of the build script (not tied to single package version)
 # The format is {build.rs hash}+{metadata}#{package version}
 #
 # The build.rs hash is the sha256 hash of the build script source file.
@@ -78,6 +78,12 @@ foo = "0.9.12"
 # The `#{version}` is only a hint for `cargo guard review` to give better diffs in the UI.
 # It does not pin to a specific version
 foo = "f7609b919173e7121493266d0f89db724a1e47bb105ebd05397f869639603eec+61d8c10f3feb6de7#1.1.5"
+
+# Allow multiple versions
+foo = ["1.0.0", "1.2.0"]
+
+# Allow multiple version and fingeprints mixed
+foo = ["1.0.0", "f7609b919173e7121493266d0f89db724a1e47bb105ebd05397f869639603eec+61d8c10f3feb6de7#1.1.5"]
 ```
 
 
