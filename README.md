@@ -89,4 +89,20 @@ foo = ["1.0.0", "f7609b919173e7121493266d0f89db724a1e47bb105ebd05397f869639603ee
 foo = "approved"
 ```
 
+### Security and Limitations
+
+Regarding the security of these options, they all come with trades offs.
+Pinning to a single version is the most secure, but the most demanding in terms of maintenance.
+Everytime you update a dependency (including transitively) that has a build script, you must re-review
+and approve it even if it has not changed. This can to reviewers rubber stamping approvals due to [alarm fatigue](https://en.wikipedia.org/wiki/Alarm_fatigue).
+
+On the other end of the spectrum is `"approved"` which blanket approves the build scripts for a given
+crate regardless of the version. This is the least secure and will not protect you if an attack takes control
+of a crate with an existing build script and adds malicious code to it.
+
+The fingerprint is meant to serve as a middleground between version pinning and blanket approvals by
+taking a fingerprint of a build script and only requiring a re-approval if it has changed.
+The fingerprint attempts to track the most common attack vectors for build.rs attacks but does not garentee to
+capture everything.
+
 
