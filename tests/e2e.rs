@@ -768,7 +768,9 @@ fn approve_review(command: &Command) {
                 Ok(Ok(bytes)) => {
                     terminal.process(&bytes);
                     if let Some((row, column)) = terminal.callbacks_mut().cursor.take() {
-                        write!(writer, "\x1b[{};{}R", row + 1, column + 1)?;
+                        // ConPTY's startup reply must not be split across writes.
+                        let response = format!("\x1b[{};{}R", row + 1, column + 1);
+                        writer.write_all(response.as_bytes())?;
                         writer.flush()?;
                     }
                     let screen = terminal.screen().contents();
