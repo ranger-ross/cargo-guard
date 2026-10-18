@@ -7,14 +7,14 @@ use ratatui::{
 };
 use syntect::{
     easy::HighlightLines,
-    highlighting::{Theme, ThemeSet},
+    highlighting::{Color as SyntaxColor, StyleModifier, Theme, ThemeItem, ThemeSettings},
     parsing::SyntaxSet,
     util::LinesWithEndings,
 };
 use unicode_width::UnicodeWidthChar;
 
 static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
-static THEMES: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
+static TITANIUM: LazyLock<Theme> = LazyLock::new(titanium_theme);
 
 /// Share syntax data and compiled regexes across the entire review session.
 /// Parser state remains fresh for each source file.
@@ -25,13 +25,9 @@ pub struct Highlighter {
 
 impl Highlighter {
     pub fn new() -> eyre::Result<Self> {
-        let theme = THEMES
-            .themes
-            .get("base16-eighties.dark")
-            .context("bundled syntax theme is missing")?;
         Ok(Self {
             syntaxes: &SYNTAXES,
-            theme,
+            theme: &TITANIUM,
         })
     }
 
@@ -65,6 +61,55 @@ impl Highlighter {
             lines.push(Line::from(spans));
         }
         Ok(lines)
+    }
+}
+
+/// Inspired by https://github.com/can1357/oh-my-pi/blob/main/packages/tui/src/theme/defaults/titanium.json
+fn titanium_theme() -> Theme {
+    let rgb = |hex: u32| SyntaxColor {
+        r: (hex >> 16) as u8,
+        g: (hex >> 8) as u8,
+        b: hex as u8,
+        a: 255,
+    };
+    // Titanium syntax colors mapped to Syntect's TextMate scopes.
+    let scopes = [
+        ("variable", 0xe8ecf4),
+        ("keyword, storage, constant.language", 0x00b4ff),
+        ("keyword.operator", 0x00b4ff),
+        (
+            "entity.name.type, entity.name.struct, entity.name.enum, entity.name.trait, entity.name.impl, support.type",
+            0x00b4ff,
+        ),
+        (
+            "entity.name.function, variable.function, support.function, support.macro",
+            0x00ff88,
+        ),
+        ("constant.numeric", 0xffb347),
+        ("punctuation", 0x9ca3b0),
+        (
+            "string, string punctuation, string storage, constant.character",
+            0xd4c090,
+        ),
+        ("comment, comment punctuation", 0x6b7280),
+    ]
+    .into_iter()
+    .map(|(scope, foreground)| ThemeItem {
+        scope: scope.parse().expect("valid Titanium scope selector"),
+        style: StyleModifier {
+            foreground: Some(rgb(foreground)),
+            ..StyleModifier::default()
+        },
+    })
+    .collect();
+    Theme {
+        name: Some("Titanium".into()),
+        settings: ThemeSettings {
+            foreground: Some(rgb(0xe8ecf4)),
+            ..ThemeSettings::default()
+        },
+        scopes,
+        ..Theme::default()
     }
 }
 
