@@ -641,13 +641,14 @@ mod tests {
     #[test]
     fn global_edits_follow_symlinks_and_reject_dangling_links() {
         let root = tempfile::tempdir().unwrap();
-        let real = root.path().join("real");
+        let root_path = root.path().canonicalize().unwrap();
+        let real = root_path.join("real");
         fs::create_dir(&real).unwrap();
-        let alias = root.path().join("alias");
+        let alias = root_path.join("alias");
         std::os::unix::fs::symlink(&real, &alias).unwrap();
         let path = real.join("approvals.toml");
         fs::write(&path, format!("# keep\n[approved]\nexample='{}' # reviewed\nother='3.0.0'\n[settings]\nenabled=true\n", fingerprint(1))).unwrap();
-        let link = root.path().join("linked.toml");
+        let link = root_path.join("linked.toml");
         std::os::unix::fs::symlink(&path, &link).unwrap();
         let mut file = ConfigFile::open(ApprovalTarget {
             path: link.clone(),

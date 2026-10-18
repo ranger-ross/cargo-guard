@@ -123,13 +123,35 @@ fn diagnostics(output: &Output) -> String {
     )
 }
 
-fn assert_destination(output: &Output, destination: &Path) {
+fn reported_destination(output: &Output) -> &Path {
     let text = diagnostics(output);
     assert!(output.status.success(), "{text}");
-    assert!(
-        text.contains(destination.to_str().unwrap()),
-        "missing destination {}\n{text}",
-        destination.display()
+    std::str::from_utf8(&output.stdout)
+        .unwrap()
+        .lines()
+        .find_map(|line| {
+            let (_, path) = line.strip_prefix("Approvals (")?.split_once("): ")?;
+            Some(Path::new(path))
+        })
+        .unwrap_or_else(|| panic!("missing approval destination\n{text}"))
+}
+
+fn resolved_destination(path: &Path) -> PathBuf {
+    assert!(path.is_absolute(), "expected an absolute path: {path:?}");
+    // Approval files and their immediate parents may not exist yet.
+    let ancestor = path.ancestors().find(|ancestor| ancestor.exists()).unwrap();
+    ancestor
+        .canonicalize()
+        .unwrap()
+        .join(path.strip_prefix(ancestor).unwrap())
+}
+
+fn assert_destination(output: &Output, destination: &Path) {
+    assert_eq!(
+        resolved_destination(reported_destination(output)),
+        resolved_destination(destination),
+        "{}",
+        diagnostics(output)
     );
 }
 
@@ -240,14 +262,7 @@ fn relative_cargo_home_default_is_resolved_against_invocation_directory() {
         .env("CARGO_HOME", "../cargo-home")
         .output()
         .unwrap();
-    let text = diagnostics(&output);
-    assert!(output.status.success(), "{text}");
-    let joined = fixture.workspace.join("../cargo-home/approved-builds.toml");
-    assert!(
-        text.contains(fixture.default_global().to_str().unwrap())
-            || text.contains(joined.to_str().unwrap()),
-        "missing absolute Cargo-home destination\n{text}"
-    );
+    assert_destination(&output, &fixture.default_global());
     fixture.assert_no_approvals_written(&[]);
 }
 
