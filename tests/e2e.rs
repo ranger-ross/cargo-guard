@@ -585,33 +585,176 @@ fn member_directory_build_autoapproves_members_but_not_excluded_dependencies() {
 }
 
 #[test]
-fn alias_hiding_manifest_path_is_rejected_even_with_global_approval() {
+fn builtin_and_recursive_project_aliases_preserve_workspace_policy() {
+    for alias in ["b", "c", "guarded-build", "guarded-chain", "local-b"] {
+        let fixture = Fixture::global();
+        let root = fixture.temp.path().join("workspace");
+        fixture.approve_global("[approved]\nguarded-dep = 'approved'\n");
+        write(&root, "approved-builds.toml", "[approved]\n");
+        let config_path = fixture.temp.path().join("cargo-home/config.toml");
+        let config = fs::read_to_string(&config_path).unwrap();
+        fs::write(
+            config_path,
+            format!("{config}\n[alias]\nguarded-build = 'build --manifest-path dep/Cargo.toml'\n"),
+        )
+        .unwrap();
+        write(
+            &root,
+            ".cargo/config.toml",
+            "[alias]\nguarded-build = 'build --offline'\nguarded-chain = 'guarded-build'\n",
+        );
+        let command = if alias == "local-b" {
+            write(
+                &root,
+                ".cargo/config.toml",
+                "[alias]\nb = 'check --offline'\n",
+            );
+            "b"
+        } else {
+            alias
+        };
+        let build = || {
+            fixture.cargo(
+                "workspace",
+                &fixture.marker(),
+                &[command, "--color", "never"],
+            )
+        };
+        let rejected = build();
+        assert_rejected(&rejected, &fixture.marker(), "guarded-dep v1.0.0");
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr).contains("no approval entry"),
+            "{rejected:?}"
+        );
+        write(
+            &root,
+            "approved-builds.toml",
+            "[approved]\nguarded-dep = '1.0.0'\n",
+        );
+        assert_success(&build());
+        assert_eq!(fs::read(fixture.marker()).unwrap(), b"executed\n");
+    }
+}
+
+#[test]
+fn array_alias_manifest_with_spaces_ignores_late_cli_alias_override() {
     let fixture = Fixture::global();
+    let root = fixture.temp.path().join("workspace with spaces");
+    fs::rename(fixture.temp.path().join("workspace"), &root).unwrap();
     fixture.approve_global("[approved]\nguarded-dep = 'approved'\n");
+    write(&root, "approved-builds.toml", "[approved]\n");
     let config_path = fixture.temp.path().join("cargo-home/config.toml");
     let config = fs::read_to_string(&config_path).unwrap();
-    let manifest = toml::Value::String(
-        fixture
-            .temp
-            .path()
-            .join("workspace/Cargo.toml")
-            .to_str()
-            .unwrap()
-            .into(),
-    );
+    let manifest = toml::Value::String(root.join("Cargo.toml").to_str().unwrap().into());
     fs::write(
         config_path,
         format!("{config}\n[alias]\nguarded-build = ['build', '--offline', '--manifest-path', {manifest}]\n"),
     )
     .unwrap();
-    let output = fixture
-        .command("workspace", &fixture.marker())
-        .current_dir(fixture.temp.path().join("workspace/dep"))
-        .args(["cargo", "guarded-build"])
-        .output()
-        .unwrap();
-    assert!(!output.status.success(), "{output:?}");
-    assert!(!fixture.marker().exists(), "{output:?}");
+    let build = || {
+        fixture
+            .command("workspace with spaces", &fixture.marker())
+            .current_dir(root.join("dep"))
+            .args([
+                "cargo",
+                "--config",
+                "alias.guarded-build=['build','--offline','--manifest-path','Cargo.toml']",
+                "guarded-build",
+            ])
+            .output()
+            .unwrap()
+    };
+    let rejected = build();
+    assert_rejected(&rejected, &fixture.marker(), "guarded-dep v1.0.0");
+    let stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert!(stderr.contains("no approval entry"), "{stderr}");
+    assert!(
+        stderr.contains(root.join("approved-builds.toml").to_str().unwrap()),
+        "{stderr}"
+    );
+    write(
+        &root,
+        "approved-builds.toml",
+        "[approved]\nguarded-dep = '1.0.0'\n",
+    );
+    assert_success(&build());
+    assert_eq!(fs::read(fixture.marker()).unwrap(), b"executed\n");
+}
+
+#[test]
+fn environment_aliases_use_invoking_cargo_environment_and_merge_rules() {
+    for source in [
+        "environment-only",
+        "string",
+        "array",
+        "forced-runner-env",
+        "advanced-array",
+    ] {
+        let fixture = Fixture::global();
+        let root = fixture.temp.path().join("workspace");
+        fixture.approve_global("[approved]\nguarded-dep = 'approved'\n");
+        write(&root, "approved-builds.toml", "[approved]\n");
+        let config_path = fixture.temp.path().join("cargo-home/config.toml");
+        let mut config = fs::read_to_string(&config_path).unwrap();
+        match source {
+            "string" => config.push_str(
+                "\n[alias]\nguarded-build = 'build --offline --manifest-path Cargo.toml'\n",
+            ),
+            "array" | "advanced-array" => {
+                config.push_str("\n[alias]\nguarded-build = ['build', '--offline']\n");
+                if source == "advanced-array" {
+                    config = config.replace(
+                        "host-config = true",
+                        "host-config = true\nadvanced-env = true",
+                    );
+                }
+            }
+            "forced-runner-env" => {
+                // This is in the existing [env] table. Cargo expands its alias
+                // before applying this value to the build-script runner.
+                config.push_str(
+                    "CARGO_ALIAS_GUARDED_BUILD = { value = 'build --offline --manifest-path Cargo.toml', force = true }\n",
+                );
+            }
+            _ => {}
+        }
+        fs::write(config_path, config).unwrap();
+        let expansion = if source == "advanced-array" {
+            "['--manifest-path', '../Cargo.toml']"
+        } else if source == "array" {
+            "--manifest-path ../Cargo.toml"
+        } else {
+            "build --offline --manifest-path ../Cargo.toml"
+        };
+        let build = || {
+            let mut command = fixture.command("workspace", &fixture.marker());
+            command
+                .current_dir(root.join("dep"))
+                .env("CARGO_ALIAS_GUARDED_BUILD", expansion)
+                .arg("cargo");
+            if source == "advanced-array" {
+                command
+                    .args(["-Zunstable-options", "-C"])
+                    .arg(root.join("dep"));
+            }
+            command.arg("guarded-build").output().unwrap()
+        };
+        let rejected = build();
+        assert_rejected(&rejected, &fixture.marker(), "guarded-dep v1.0.0");
+        let stderr = String::from_utf8_lossy(&rejected.stderr);
+        assert!(stderr.contains("no approval entry"), "{source}: {stderr}");
+        assert!(
+            stderr.contains(root.join("approved-builds.toml").to_str().unwrap()),
+            "{source}: {stderr}"
+        );
+        write(
+            &root,
+            "approved-builds.toml",
+            "[approved]\nguarded-dep = '1.0.0'\n",
+        );
+        assert_success(&build());
+        assert_eq!(fs::read(fixture.marker()).unwrap(), b"executed\n");
+    }
 }
 
 #[test]

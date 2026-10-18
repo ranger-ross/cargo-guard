@@ -1,10 +1,14 @@
 use std::{
+    borrow::Cow,
+    collections::{BTreeMap, HashSet},
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use cargo_metadata::{Metadata, MetadataCommand};
 use eyre::{Context, ensure};
+use serde::Deserialize;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 const MAX_ANCESTORS: usize = 128;
@@ -17,11 +21,7 @@ pub struct Invocation {
 }
 
 pub fn discover() -> eyre::Result<Invocation> {
-    discover_inner().wrap_err(
-        "could not discover the invoking Cargo workspace; run an ordinary supported Cargo command \
-         (build/check/test/run/bench/doc/rustc/rustdoc) with cargo-guard configured as the build-script runner; \
-         process ancestry must be accessible",
-    )
+    discover_inner().wrap_err("could not discover the invoking Cargo workspace")
 }
 
 fn discover_inner() -> eyre::Result<Invocation> {
@@ -102,6 +102,7 @@ struct ProcessSnapshot {
     exe: PathBuf,
     cmd: Vec<OsString>,
     cwd: Option<PathBuf>,
+    environ: Vec<OsString>,
 }
 
 impl ProcessSnapshot {
@@ -136,7 +137,8 @@ fn snapshot(system: &mut System, pid: Pid) -> eyre::Result<ProcessSnapshot> {
             .without_tasks()
             .with_exe(UpdateKind::Always)
             .with_cmd(UpdateKind::Always)
-            .with_cwd(UpdateKind::Always),
+            .with_cwd(UpdateKind::Always)
+            .with_environ(UpdateKind::Always),
     );
     ensure!(refreshed != 0, "could not inspect ancestor process {pid}");
     let process = system
@@ -161,6 +163,7 @@ fn snapshot(system: &mut System, pid: Pid) -> eyre::Result<ProcessSnapshot> {
             .cwd()
             .filter(|path| !path.as_os_str().is_empty())
             .map(Path::to_path_buf),
+        environ: process.environ().to_vec(),
     })
 }
 
@@ -278,8 +281,11 @@ fn metadata(process: &ProcessSnapshot, cargo: &Path) -> eyre::Result<Metadata> {
         "Cargo process {} uses a different executable from CARGO; cross-toolchain guarded ancestry is unsupported",
         process.pid
     );
-    let arguments = parse_cargo_args(&process.cmd)
-        .with_context(|| format!("could not interpret Cargo process {}", process.pid))?;
+    ensure!(
+        !process.environ.is_empty(),
+        "Cargo process {} has an inaccessible environment",
+        process.pid
+    );
     let cwd = process
         .cwd
         .as_deref()
@@ -290,6 +296,9 @@ fn metadata(process: &ProcessSnapshot, cargo: &Path) -> eyre::Result<Metadata> {
                 process.pid
             )
         })?;
+    let expanded = expand_aliases(process, cwd)?;
+    let arguments = parse_cargo_args(&expanded)
+        .with_context(|| format!("could not interpret Cargo process {}", process.pid))?;
     let mut builder = MetadataCommand::new();
     builder.cargo_path(&process.exe).current_dir(cwd).no_deps();
     if let Some(manifest) = &arguments.manifest {
@@ -297,6 +306,8 @@ fn metadata(process: &ProcessSnapshot, cargo: &Path) -> eyre::Result<Metadata> {
     }
     let output = builder
         .cargo_command()
+        .env_clear()
+        .envs(process.environment())
         .arg("--offline")
         .args(&arguments.forwarded)
         .output()
@@ -317,161 +328,260 @@ fn metadata(process: &ProcessSnapshot, cargo: &Path) -> eyre::Result<Metadata> {
     MetadataCommand::parse(json).wrap_err("could not parse invoking Cargo workspace metadata")
 }
 
-fn parse_cargo_args(args: &[OsString]) -> eyre::Result<CargoArguments> {
+fn is_workspace_command(command: &OsStr) -> bool {
+    command.to_str().is_some_and(|name| {
+        matches!(
+            name,
+            "build" | "check" | "test" | "run" | "bench" | "doc" | "rustc" | "rustdoc" | "fix"
+        )
+    })
+}
+
+#[derive(Default, Deserialize)]
+struct Aliases {
+    #[serde(default)]
+    alias: BTreeMap<String, toml::Value>,
+    #[serde(default)]
+    unstable: BTreeMap<String, toml::Value>,
+}
+
+impl ProcessSnapshot {
+    fn environment(&self) -> impl Iterator<Item = (&OsStr, &OsStr)> {
+        self.environ.iter().filter_map(|entry| {
+            let bytes = entry.as_encoded_bytes();
+            let separator = bytes.iter().position(|byte| *byte == b'=')?;
+            if separator == 0 {
+                return None;
+            }
+            // ASCII '=' separates two valid encoded-byte strings.
+            Some(unsafe {
+                (
+                    OsStr::from_encoded_bytes_unchecked(&bytes[..separator]),
+                    OsStr::from_encoded_bytes_unchecked(&bytes[separator + 1..]),
+                )
+            })
+        })
+    }
+}
+
+impl Aliases {
+    fn load(process: &ProcessSnapshot, cwd: &Path) -> eyre::Result<Self> {
+        // Cargo resolves aliases before applying command-line --config or -Z flags.
+        // Let its own loader handle config hierarchy, includes, and array merging.
+        let output = Command::new(&process.exe)
+            .current_dir(cwd)
+            .env_clear()
+            .envs(process.environment())
+            .args(["-Zunstable-options", "config", "get", "--format=toml"])
+            .output()
+            .wrap_err("could not read invoking Cargo alias configuration")?;
+        ensure!(
+            output.status.success(),
+            "Cargo could not read alias configuration: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let config =
+            std::str::from_utf8(&output.stdout).wrap_err("Cargo configuration is not UTF-8")?;
+        // Keep configuration values out of diagnostics.
+        toml::from_str(config).map_err(|_| eyre::eyre!("could not parse Cargo alias configuration"))
+    }
+
+    fn resolve(
+        &self,
+        name: &str,
+        process: &ProcessSnapshot,
+        advanced_env: bool,
+    ) -> eyre::Result<Vec<OsString>> {
+        let env_key = format!(
+            "CARGO_ALIAS_{}",
+            name.replace(['-', '.'], "_").to_uppercase()
+        );
+        let environment = process
+            .environment()
+            .find(|(key, _)| *key == OsStr::new(&env_key))
+            .map(|(_, value)| {
+                value
+                    .to_str()
+                    .ok_or_else(|| eyre::eyre!("Cargo alias environment value is not UTF-8"))
+            })
+            .transpose()?;
+        let mut args: Vec<OsString> = match self.alias.get(name) {
+            Some(toml::Value::Array(values)) => values
+                .iter()
+                .map(|value| {
+                    value.as_str().map(OsString::from).ok_or_else(|| {
+                        eyre::eyre!("Cargo alias {name} contains a non-string value")
+                    })
+                })
+                .collect::<eyre::Result<_>>()?,
+            Some(toml::Value::String(value)) => {
+                return Ok(environment
+                    .unwrap_or(value)
+                    .split_whitespace()
+                    .map(OsString::from)
+                    .collect());
+            }
+            Some(_) => eyre::bail!("Cargo alias {name} is not a string or array"),
+            None => Vec::new(),
+        };
+        if let Some(value) = environment {
+            if advanced_env
+                && self.alias.get(name).is_some_and(toml::Value::is_array)
+                && value.starts_with('[')
+                && value.ends_with(']')
+            {
+                let values = toml::de::ValueDeserializer::parse(value)
+                    .and_then(Vec::<String>::deserialize)
+                    .map_err(|_| eyre::eyre!("could not parse Cargo alias environment array"))?;
+                args.extend(values.into_iter().map(OsString::from));
+            } else {
+                args.extend(value.split_whitespace().map(OsString::from));
+            }
+        } else if !self.alias.contains_key(name) {
+            let builtin = match name {
+                "b" => "build",
+                "c" => "check",
+                "d" => "doc",
+                "r" => "run",
+                "t" => "test",
+                _ => {
+                    eyre::bail!("Cargo command {name} does not select a supported build workspace")
+                }
+            };
+            args.push(builtin.into());
+        }
+        Ok(args)
+    }
+}
+
+fn expand_aliases<'a>(
+    process: &'a ProcessSnapshot,
+    cwd: &Path,
+) -> eyre::Result<Cow<'a, [OsString]>> {
+    let (first, changed_directory) = command_index(&process.cmd, 1)?;
+    if is_workspace_command(&process.cmd[first]) {
+        return Ok(Cow::Borrowed(&process.cmd));
+    }
+    let aliases = Aliases::load(process, cwd)?;
+    // -C reloads unstable config before aliases. Normal invocation loads it afterward.
+    let advanced_env = changed_directory
+        && process
+            .environment()
+            .find(|(key, _)| *key == "CARGO_UNSTABLE_ADVANCED_ENV")
+            .map(|(_, value)| value == "true")
+            .unwrap_or_else(|| {
+                aliases
+                    .unstable
+                    .get("advanced-env")
+                    .and_then(toml::Value::as_bool)
+                    == Some(true)
+            });
+    let mut args = Cow::Borrowed(&process.cmd[first..]);
+    let mut seen = HashSet::new();
+    loop {
+        let name = args[0]
+            .to_str()
+            .ok_or_else(|| eyre::eyre!("Cargo command is not UTF-8"))?;
+        ensure!(seen.insert(name.to_owned()), "Cargo alias cycle at {name}");
+        let mut expanded = aliases.resolve(name, process, advanced_env)?;
+        ensure!(!expanded.is_empty(), "Cargo alias {name} is empty");
+        expanded.extend_from_slice(&args[1..]);
+        let (command, _) = command_index(&expanded, 0)?;
+        if is_workspace_command(&expanded[command]) {
+            let mut result = process.cmd[..first].to_vec();
+            result.extend(expanded);
+            return Ok(Cow::Owned(result));
+        }
+        // Cargo retains the original global arguments, not intermediate alias prefixes.
+        args = Cow::Owned(expanded.into_iter().skip(command).collect());
+    }
+}
+
+fn command_index(args: &[OsString], mut index: usize) -> eyre::Result<(usize, bool)> {
     ensure!(!args.is_empty(), "Cargo arguments are inaccessible");
+    let mut changed_directory = false;
+    while let Some(arg) = args.get(index) {
+        let current = index;
+        index += 1;
+        ensure!(arg != "--", "Cargo command is missing before --");
+        if arg == "--config" || arg == "--color" {
+            take_value(args, &mut index, arg)?;
+        } else if let Some((option, value)) = short_value_option(arg) {
+            changed_directory |= option == "-C";
+            if value.is_empty() {
+                take_value(args, &mut index, OsStr::new(option))?;
+            }
+        } else if !arg.as_encoded_bytes().starts_with(b"-") {
+            return Ok((current, changed_directory));
+        }
+    }
+    eyre::bail!("Cargo command is missing")
+}
+
+fn short_value_option(arg: &OsStr) -> Option<(&'static str, &OsStr)> {
+    let bytes = arg.as_encoded_bytes();
+    if bytes.first() != Some(&b'-') || bytes.get(1) == Some(&b'-') {
+        return None;
+    }
+    for (index, byte) in bytes.iter().enumerate().skip(1) {
+        let option = match byte {
+            b'v' | b'q' | b'r' | b'h' | b'V' => continue,
+            b'Z' => "-Z",
+            b'C' => "-C",
+            b'p' => "-p",
+            b'j' => "-j",
+            b'F' => "-F",
+            _ => return None,
+        };
+        // Short option characters are ASCII encoded-byte boundaries.
+        return Some((option, unsafe {
+            OsStr::from_encoded_bytes_unchecked(&bytes[index + 1..])
+        }));
+    }
+    None
+}
+
+fn parse_cargo_args(args: &[OsString]) -> eyre::Result<CargoArguments> {
+    let (command, _) = command_index(args, 1)?;
+    ensure!(
+        is_workspace_command(&args[command]),
+        "Cargo command does not select a supported build workspace: {}",
+        args[command].to_string_lossy()
+    );
     let mut result = CargoArguments::default();
-    let mut command = None;
-    let mut positional = false;
     let mut index = 1;
     while let Some(arg) = args.get(index) {
         index += 1;
         if arg == "--" {
-            ensure!(command.is_some(), "Cargo command is missing before --");
             break;
         }
         if let Some(value) = strip_prefix(arg, "--manifest-path=") {
             set_manifest(&mut result, value)?;
-            continue;
-        }
-        if arg == "--manifest-path" {
+        } else if arg == "--manifest-path" {
             set_manifest(&mut result, take_value(args, &mut index, arg)?)?;
-            continue;
-        }
-        if let Some(value) = strip_prefix(arg, "--config=") {
+        } else if let Some(value) = strip_prefix(arg, "--config=") {
             ensure!(!value.is_empty(), "empty Cargo --config value");
             result
                 .forwarded
                 .extend([OsString::from("--config"), value.to_owned()]);
-            continue;
-        }
-        if arg == "--config" || arg == "-Z" {
+        } else if arg == "--config" {
             result
                 .forwarded
                 .extend([arg.clone(), take_value(args, &mut index, arg)?.to_owned()]);
-            continue;
-        }
-        if let Some(value) = strip_prefix(arg, "-Z").filter(|value| !value.is_empty()) {
-            result
-                .forwarded
-                .extend([OsString::from("-Z"), value.to_owned()]);
-            continue;
-        }
-        // Cargo has already changed its cwd before invoking the runner.
-        if arg == "-C" {
-            take_value(args, &mut index, arg)?;
-            continue;
-        }
-        if strip_prefix(arg, "-C").is_some_and(|value| !value.is_empty()) {
-            continue;
-        }
-        let text = arg.to_str();
-        if text.is_some_and(|text| {
-            matches!(
-                text,
-                "--verbose"
-                    | "--quiet"
-                    | "--locked"
-                    | "--frozen"
-                    | "--offline"
-                    | "--release"
-                    | "-r"
-                    | "--workspace"
-                    | "--all"
-                    | "--lib"
-                    | "--bins"
-                    | "--examples"
-                    | "--tests"
-                    | "--benches"
-                    | "--all-targets"
-                    | "--all-features"
-                    | "--no-default-features"
-                    | "--keep-going"
-                    | "--future-incompat-report"
-                    | "--no-run"
-                    | "--no-fail-fast"
-                    | "--doc"
-                    | "--open"
-                    | "--no-deps"
-                    | "--document-private-items"
-                    | "--unit-graph"
-                    | "--build-plan"
-                    | "--ignore-rust-version"
-                    | "--timings"
-            )
-        }) {
-            continue;
-        }
-        if text.is_some_and(|text| {
-            text.starts_with('-')
-                && text.len() > 1
-                && text[1..].bytes().all(|byte| byte == b'v' || byte == b'q')
-        }) {
-            continue;
-        }
-        if strip_prefix(arg, "--timings=").is_some() {
-            continue;
-        }
-        let value_options = [
-            "--color",
-            "--package",
-            "--exclude",
-            "--bin",
-            "--example",
-            "--test",
-            "--bench",
-            "--target",
-            "--target-dir",
-            "--artifact-dir",
-            "--out-dir",
-            "--jobs",
-            "--features",
-            "--profile",
-            "--message-format",
-            "--lockfile-path",
-            "-p",
-            "-j",
-            "-F",
-        ];
-        if value_options.iter().any(|option| arg == OsStr::new(option)) {
-            take_value(args, &mut index, arg)?;
-            continue;
-        }
-        if value_options.iter().any(|option| {
-            strip_prefix(arg, option).is_some_and(|rest| {
-                if option.starts_with("--") {
-                    strip_prefix(rest, "=").is_some_and(|value| !value.is_empty())
-                } else {
-                    !rest.is_empty()
-                }
-            })
-        }) {
-            continue;
-        }
-        ensure!(
-            !arg.as_encoded_bytes().starts_with(b"-"),
-            "unsupported or ambiguous Cargo option: {}",
-            arg.to_string_lossy()
-        );
-        if command.is_none() {
-            let name = text.ok_or_else(|| eyre::eyre!("Cargo command is not UTF-8"))?;
-            ensure!(
-                matches!(
-                    name,
-                    "build" | "check" | "test" | "run" | "bench" | "doc" | "rustc" | "rustdoc"
-                ),
-                "unsupported Cargo command or unresolved alias: {name}; use an explicit supported command"
-            );
-            command = Some(name);
-        } else {
-            ensure!(
-                matches!(command, Some("test" | "bench")) && !positional,
-                "ambiguous Cargo positional argument: {}; use -- for arguments passed to programs, tests, or rustc",
-                arg.to_string_lossy()
-            );
-            positional = true;
+        } else if let Some((option, value)) = short_value_option(arg) {
+            let value = if value.is_empty() {
+                take_value(args, &mut index, OsStr::new(option))?
+            } else {
+                value
+            };
+            if option == "-Z" {
+                result
+                    .forwarded
+                    .extend([OsString::from("-Z"), value.to_owned()]);
+            }
+            // Cargo has already applied -C. Other build options do not select a workspace.
         }
     }
-    ensure!(command.is_some(), "Cargo command is missing");
     Ok(result)
 }
 
@@ -607,7 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn aliases_unknown_options_and_missing_values_fail_closed() {
+    fn invalid_workspace_selection_fails_closed() {
         for command in [
             "b",
             "c",
@@ -623,7 +733,6 @@ mod tests {
             assert!(parse(&["cargo", command]).is_err());
         }
         for args in [
-            vec!["cargo", "build", "--unknown", "value"],
             vec!["cargo", "build", "--manifest-path"],
             vec![
                 "cargo",
@@ -634,10 +743,27 @@ mod tests {
             ],
             vec!["cargo", "build", "--config="],
             vec!["cargo", "--", "build"],
-            vec!["cargo", "run", "unexpected-positional"],
         ] {
             assert!(parse(&args).is_err());
         }
+    }
+
+    #[test]
+    fn unrelated_build_flags_and_positionals_do_not_restrict_cargo() {
+        let args = parse(&[
+            "cargo",
+            "-vvZunstable-options",
+            "test",
+            "--new-cargo-option",
+            "value",
+            "filter",
+            "--manifest-path=app/Cargo.toml",
+            "--",
+            "--config=ignored",
+        ])
+        .unwrap();
+        assert_eq!(args.manifest, Some(PathBuf::from("app/Cargo.toml")));
+        assert_eq!(args.forwarded, ["-Z", "unstable-options"]);
     }
 
     #[test]
