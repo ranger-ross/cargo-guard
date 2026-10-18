@@ -10,6 +10,7 @@ pub enum Action {
     NextPackage,
     PreviousPackage,
     Skip,
+    CopySelection,
 }
 
 pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
@@ -21,6 +22,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
     }
     if key.code == KeyCode::Char('?') && key.kind == KeyEventKind::Press {
         app.show_help = !app.show_help;
+        app.selection.clear();
         return Action::Continue;
     }
     if app.show_help {
@@ -49,6 +51,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
         KeyCode::Char('f') if key.kind == KeyEventKind::Press && key.modifiers.is_empty() => {
             return Action::Decide(Decision::ApproveFingerprint);
         }
+        KeyCode::Char('y') if key.kind == KeyEventKind::Press && key.modifiers.is_empty() => {
+            return Action::CopySelection;
+        }
+        KeyCode::Esc if app.selection.clear() => {}
         KeyCode::Char('q') | KeyCode::Esc => return Action::Quit,
         KeyCode::Down => app.scroll(1, 0),
         KeyCode::Up => app.scroll(-1, 0),

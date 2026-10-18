@@ -215,6 +215,7 @@ fn render_area(frame: &mut Frame, app: &mut App, area: Rect) {
     let [gutter, code] =
         Layout::horizontal([Constraint::Length(gutter_width), Constraint::Min(0)]).areas(source);
     app.set_viewport(code.height, code.width);
+    app.selection.area = code;
     for (offset, row) in app
         .file()
         .rows
@@ -255,6 +256,24 @@ fn render_area(frame: &mut Frame, app: &mut App, area: Rect) {
             .scroll((0, app.left)),
             code_row,
         );
+        if row.kind != super::diff::LineKind::Note
+            && let Some(columns) = app.selection.columns(app.top + offset)
+        {
+            let left = usize::from(app.left);
+            let start = columns
+                .start
+                .saturating_sub(left)
+                .min(usize::from(code.width));
+            let end = columns
+                .end
+                .min(row.text.width() + 1)
+                .saturating_sub(left)
+                .min(usize::from(code.width));
+            for column in start..end {
+                frame.buffer_mut()[(code.x + column as u16, code_row.y)]
+                    .set_style(Style::default().fg(Color::Black).bg(Color::LightBlue));
+            }
+        }
     }
     render_footer(frame, app, footer);
     if app.show_help {
@@ -282,6 +301,10 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     }
     if app.queue_mode {
         keys.push(("s", "skip"));
+    }
+    if app.selection.is_active() {
+        keys.push(("y", "copy"));
+        keys.push(("Esc", "clear"));
     }
     keys.push(("↑/↓/←/→", "scroll"));
     if app.files.len() > 1 {
@@ -311,7 +334,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
 fn render_help(frame: &mut Frame, app: &App) {
     let area = frame.area();
     let width = area.width.min(90);
-    let height = area.height.min(if app.queue_mode { 30 } else { 27 });
+    let height = area.height.min(if app.queue_mode { 34 } else { 31 });
     let popup = Rect::new(
         area.x + (area.width - width) / 2,
         area.y + (area.height - height) / 2,
@@ -325,6 +348,7 @@ fn render_help(frame: &mut Frame, app: &App) {
         Line::from("Home / End       First / last page (also g / G)"),
         Line::from("[ / ]            Previous / next change"),
         Line::from("Tab / Shift+Tab  Next / previous file"),
+        Line::from("y / Esc          Copy selection / clear selection"),
     ];
     if app.queue_mode {
         lines.push(Line::from(

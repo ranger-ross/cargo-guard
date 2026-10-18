@@ -15,6 +15,7 @@ mod fingerprint;
 mod highlight;
 mod input;
 mod queue;
+mod selection;
 mod sources;
 mod tui;
 mod ui;

@@ -4,6 +4,7 @@ use super::{
     ReviewSession,
     diff::{self, FileStatus, ReviewFile},
     highlight::Highlighter,
+    selection::Selection,
     sources::{Baseline, ScriptSource},
 };
 use crate::config::ApprovedVersion;
@@ -28,6 +29,7 @@ pub struct App {
     pub decision_blocked: Option<String>,
     pub verification_message: Option<String>,
     pub verification_pending: bool,
+    pub selection: Selection,
 }
 
 impl App {
@@ -55,6 +57,7 @@ impl App {
             decision_blocked: None,
             verification_message: None,
             verification_pending: false,
+            selection: Selection::default(),
         })
     }
 
@@ -64,6 +67,7 @@ impl App {
 
     /// Refresh the edit snapshot without discarding unchanged verified sources.
     pub fn refresh(&mut self, session: ReviewSession) -> eyre::Result<()> {
+        self.selection.clear();
         let current: Arc<[ScriptSource]> = read_sources(&session)?.into();
         let invalidated = current != self.current
             || session.config.config().approved.get(&session.package.name)
@@ -343,6 +347,7 @@ impl App {
     }
 
     pub fn switch_file(&mut self, backwards: bool) {
+        self.selection.clear();
         self.change_target = None;
         self.selected = if backwards {
             (self.selected + self.files.len() - 1) % self.files.len()
@@ -354,6 +359,7 @@ impl App {
     }
 
     fn replace_files(&mut self, baseline: Baseline, files: Vec<ReviewFile>) {
+        self.selection.clear();
         self.selected = files
             .iter()
             .position(|file| file.path == self.file().path)

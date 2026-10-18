@@ -10,12 +10,13 @@ use std::{
 };
 
 use crossterm::{
-    event::{self, Event},
+    clipboard::CopyToClipboard,
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event},
     terminal::{EnterAlternateScreen, enable_raw_mode},
 };
 use eyre::Context;
 
-use super::{discovery::ReviewQueue, input::Action, queue::QueueState, ui};
+use super::{app::Notice, discovery::ReviewQueue, input::Action, queue::QueueState, ui};
 
 pub fn run(queue: ReviewQueue) -> eyre::Result<()> {
     run_review(queue, false)
@@ -42,7 +43,7 @@ fn run_review(queue: ReviewQueue, queue_mode: bool) -> eyre::Result<()> {
         // This guard also covers partially successful initialization.
         let _restore = RestoreTerminal;
         enable_raw_mode().context("could not enable review terminal raw mode")?;
-        crossterm::execute!(io::stdout(), EnterAlternateScreen)
+        crossterm::execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)
             .context("could not enter review alternate screen")?;
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(io::stdout()))
@@ -56,6 +57,11 @@ fn run_review(queue: ReviewQueue, queue_mode: bool) -> eyre::Result<()> {
             while let Some(event) = events.poll()? {
                 match event {
                     Event::Resize(..) => dirty = true,
+                    Event::Mouse(mouse) => {
+                        if let Some(app) = &mut state.app {
+                            dirty |= app.handle_mouse(mouse);
+                        }
+                    }
                     Event::Key(key) => {
                         dirty = true;
                         match state.handle_key(key) {
@@ -76,6 +82,23 @@ fn run_review(queue: ReviewQueue, queue_mode: bool) -> eyre::Result<()> {
                                     }
                                 }
                             },
+                            Action::CopySelection => {
+                                if let Some(app) = &mut state.app
+                                    && let Some(text) = app.selection.text(&app.file().rows)
+                                    && !text.is_empty()
+                                {
+                                    let result = crossterm::execute!(
+                                        io::stdout(),
+                                        CopyToClipboard::to_clipboard_from(text)
+                                    );
+                                    if let Err(error) = result {
+                                        app.notice = Some(Notice {
+                                            message: format!("Could not copy selection: {error}"),
+                                            is_error: true,
+                                        });
+                                    }
+                                }
+                            }
                             Action::Continue => {}
                         }
                         set_mode(&mut state, queue_mode)?;
@@ -194,6 +217,7 @@ struct RestoreTerminal;
 
 impl Drop for RestoreTerminal {
     fn drop(&mut self) {
+        let _ = crossterm::execute!(io::stdout(), DisableMouseCapture);
         ratatui::restore();
     }
 }
