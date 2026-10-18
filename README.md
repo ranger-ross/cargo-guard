@@ -102,7 +102,7 @@ of a crate with an existing build script and adds malicious code to it.
 
 The fingerprint is meant to serve as a middleground between version pinning and blanket approvals by
 taking a fingerprint of a build script and only requiring a re-approval if it has changed.
-The fingerprint attempts to track the most common attack vectors for build.rs attacks but does not garentee to
+The fingerprint attempts to track the most common attack vectors for build.rs attacks but does not guarantee to
 capture everything.
 
 
