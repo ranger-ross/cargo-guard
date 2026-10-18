@@ -1,8 +1,11 @@
 use std::{
+    fmt::Write as _,
     fs,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
 };
+
+use sha2::{Digest, Sha256};
 
 const TOOLCHAIN: &str = "nightly";
 
@@ -60,6 +63,73 @@ fn approved_dependency_build_script_executes() {
         )
     });
     assert_eq!(contents, b"executed\n", "{diagnostics}");
+}
+
+#[test]
+fn fingerprint_approval_checks_both_hashes_but_ignores_version_hints() {
+    let fixture = Fixture::new("[approved]\nguarded-dep = 'legacy-hash'\n");
+    let root = fixture.temp.path().join("workspace");
+    let script_path = root.join("dep/build.rs");
+    let script = format!(
+        "{}\nconst _: &str = include_str!(\"helper.txt\");\n",
+        fs::read_to_string(&script_path).unwrap()
+    );
+    fs::write(&script_path, &script).unwrap();
+    write(&root, "dep/helper.txt", "original");
+
+    let rejected = fixture.build();
+    let original = rejected_fingerprint(&rejected);
+    assert!(!fixture.marker().exists());
+    let (hashes, hint) = original.split_once('#').unwrap();
+    let (script_hash, inputs_hash) = hashes.split_once('+').unwrap();
+    assert_eq!(hint, "1.0.0");
+    let mut audited_hash = String::with_capacity(64);
+    for byte in Sha256::digest(script.as_bytes()) {
+        write!(&mut audited_hash, "{byte:02x}").unwrap();
+    }
+    assert_eq!(script_hash, audited_hash);
+
+    write(
+        &root,
+        "approved-builds.toml",
+        &format!("[approved]\nguarded-dep = '{hashes}#9.0.0+untrusted'\n"),
+    );
+    let approved = fixture.build();
+    assert!(
+        approved.status.success(),
+        "{}",
+        String::from_utf8_lossy(&approved.stderr)
+    );
+    assert_eq!(fs::read(fixture.marker()).unwrap(), b"executed\n");
+    fs::remove_file(fixture.marker()).unwrap();
+
+    write(&root, "dep/helper.txt", "changed");
+    let helper_changed = rejected_fingerprint(&fixture.build());
+    let (helper_hashes, _) = helper_changed.split_once('#').unwrap();
+    let (same_script_hash, changed_inputs_hash) = helper_hashes.split_once('+').unwrap();
+    assert_eq!(same_script_hash, script_hash);
+    assert_ne!(changed_inputs_hash, inputs_hash);
+    assert!(!fixture.marker().exists());
+
+    fs::write(&script_path, format!("// changed entry point\n{script}")).unwrap();
+    let script_changed = rejected_fingerprint(&fixture.build());
+    let (script_hashes, _) = script_changed.split_once('#').unwrap();
+    let (changed_script_hash, same_inputs_hash) = script_hashes.split_once('+').unwrap();
+    assert_ne!(changed_script_hash, script_hash);
+    assert_eq!(same_inputs_hash, changed_inputs_hash);
+    assert!(!fixture.marker().exists());
+}
+
+fn rejected_fingerprint(output: &Output) -> String {
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    stderr
+        .lines()
+        .find_map(|line| {
+            line.split_once("Current fingerprint: ")
+                .map(|(_, fingerprint)| fingerprint.trim().to_owned())
+        })
+        .unwrap_or_else(|| panic!("missing fingerprint in build rejection:\n{stderr}"))
 }
 
 struct Fixture {

@@ -90,7 +90,11 @@ impl ConfigFile {
                         array
                     }
                 };
-                if array.iter().any(|v| v.as_str() == Some(&new)) {
+                if array.iter().any(|value| {
+                    value.as_str().is_some_and(|old| {
+                        old == new || crate::fingerprint::fingerprints_match(old, &new)
+                    })
+                }) {
                     eyre::ensure!(
                         read_optional(&self.path)? == self.original,
                         "config {} changed since it was loaded; reload it before saving approvals",
@@ -217,6 +221,10 @@ mod tests {
         ApprovedVersion::SemVer(value.parse().unwrap())
     }
 
+    fn fingerprint(value: u64) -> String {
+        format!("{value:064x}+{:016x}#1.0.0", 0)
+    }
+
     #[test]
     fn scalar_fingerprints_replace_but_explicit_arrays_append() {
         for (original, hashes, expected) in [
@@ -256,7 +264,8 @@ mod tests {
     fn appends_without_duplicates_and_removes_only_selected_version() {
         let root = tempfile::tempdir().unwrap();
         let path = config_path(root.path());
-        fs::write(&path, "[approved]\nexample = [\n  'fingerprint', # script one\n  '1.0.0', # old version\n] # package\n").unwrap();
+        let hash = fingerprint(1);
+        fs::write(&path, format!("[approved]\nexample = [\n  '{hash}', # script one\n  '1.0.0', # old version\n] # package\n")).unwrap();
         let mut file = ConfigFile::open(&path).unwrap();
         file.set_approval("example", version("2.0.0")).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
@@ -268,7 +277,7 @@ mod tests {
         file.remove_version("example", &"2.0.0".parse().unwrap())
             .unwrap();
         assert!(file.config.approved["example"].allows_version(&"1.0.0".parse().unwrap()));
-        assert!(file.config.approved["example"].allows_fingerprint("fingerprint"));
+        assert!(file.config.approved["example"].allows_fingerprint(&hash));
         assert!(!file.config.approved["example"].allows_version(&"2.0.0".parse().unwrap()));
     }
 
@@ -279,14 +288,14 @@ mod tests {
         fs::write(&path, "[approved]\nexample='1.0.0' # retained\n").unwrap();
         let mut file = ConfigFile::open(&path).unwrap();
         let batch = [
-            ApprovedVersion::Fingerprint("first".into()),
-            ApprovedVersion::Fingerprint("second".into()),
+            ApprovedVersion::Fingerprint(fingerprint(1)),
+            ApprovedVersion::Fingerprint(fingerprint(2)),
         ];
         file.add_approvals("example", &batch).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
         assert!(saved.contains("# retained"));
-        assert!(file.config.approved["example"].allows_fingerprint("first"));
-        assert!(file.config.approved["example"].allows_fingerprint("second"));
+        assert!(file.config.approved["example"].allows_fingerprint(&fingerprint(1)));
+        assert!(file.config.approved["example"].allows_fingerprint(&fingerprint(2)));
         assert!(file.config.approved["example"].allows_version(&"1.0.0".parse().unwrap()));
         let before = file.config.approved.clone();
         fs::write(&path, "[approved]\nexternal='2.0.0'\n").unwrap();
@@ -294,8 +303,8 @@ mod tests {
             file.add_approvals(
                 "example",
                 &[
-                    ApprovedVersion::Fingerprint("third".into()),
-                    ApprovedVersion::Fingerprint("fourth".into())
+                    ApprovedVersion::Fingerprint(fingerprint(3)),
+                    ApprovedVersion::Fingerprint(fingerprint(4))
                 ]
             )
             .is_err()
@@ -304,6 +313,24 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             "[approved]\nexternal='2.0.0'\n"
+        );
+    }
+
+    #[test]
+    fn fingerprint_lists_do_not_duplicate_hashes_with_new_version_hints() {
+        let root = tempfile::tempdir().unwrap();
+        let path = config_path(root.path());
+        let hash = fingerprint(1);
+        fs::write(&path, format!("[approved]\nexample=['{hash}']\n")).unwrap();
+        let mut file = ConfigFile::open(&path).unwrap();
+        file.set_approval(
+            "example",
+            ApprovedVersion::Fingerprint(hash.replace("#1.0.0", "#2.0.0")),
+        )
+        .unwrap();
+        assert_eq!(
+            file.config.approved["example"],
+            ApprovedVersion::Multiple(vec![ApprovedVersion::Fingerprint(hash)])
         );
     }
 

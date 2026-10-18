@@ -358,8 +358,10 @@ fn render_help(frame: &mut Frame, app: &App) {
         lines.push(Line::from(
             "This version is already approved; viewing only.",
         ));
-    } else {
-        lines.push(Line::from("Current fingerprints have been approved."));
+    } else if app.is_current_fingerprint_approved() {
+        lines.push(Line::from(
+            "Current fingerprints are already approved; viewing only.",
+        ));
     }
     lines.extend([
         Line::default(),
@@ -408,15 +410,18 @@ fn heading(app: &App) -> Line<'static> {
         ("Blocked", Color::Yellow)
     } else if app.decision == Some(Decision::Reject) {
         ("Rejected", Color::Red)
-    } else if app.is_current_version_approved()
-        || app.decision == Some(Decision::ApproveFingerprint)
-    {
+    } else if app.is_current_version_approved() || app.is_current_fingerprint_approved() {
         ("Approved", Color::Green)
     } else {
         ("Reviewing", Color::Green)
     };
-    let version = match &package.approval {
-        Some(ApprovedVersion::SemVer(old)) if old != &package.version => {
+    let baseline_version = match (&package.approval, &app.baseline) {
+        (Some(ApprovedVersion::SemVer(version)), _) => Some(version),
+        (Some(ApprovedVersion::Fingerprint(_)), Baseline::Ready(sources)) => Some(&sources.version),
+        _ => None,
+    };
+    let version = match baseline_version {
+        Some(old) if old != &package.version => {
             format!("{} v{old} -> v{}", package.name, package.version)
         }
         _ => format!("{} v{}", package.name, package.version),
@@ -435,7 +440,15 @@ fn baseline_note(app: &App) -> Option<Line<'static>> {
     if let Some(reason) = &app.decision_blocked {
         return Some(status_line("warning", reason.clone(), Color::Yellow));
     }
+    if app.is_current_fingerprint_approved() {
+        return None;
+    }
     match &app.baseline {
+        Baseline::Loading(_) if app.prefers_fingerprint() => Some(status_line(
+            "Checking",
+            "current fingerprints against saved approvals".into(),
+            Color::Green,
+        )),
         Baseline::Loading(version) => Some(status_line(
             "Fetching",
             format!("approved v{version}"),
@@ -454,7 +467,8 @@ fn baseline_note(app: &App) -> Option<Line<'static>> {
         {
             Some(status_line(
                 "Unchanged",
-                "build scripts; the new version still needs approval".into(),
+                "build script entry points; current inputs still need approval or verification"
+                    .into(),
                 Color::Green,
             ))
         }
@@ -567,6 +581,49 @@ mod tests {
         assert!(text.contains("Approved example v0.1.0"));
         assert!(!text.contains("a approve"));
         assert!(!text.contains("r reject"));
+    }
+
+    #[test]
+    fn verified_current_fingerprints_show_approved_read_only_controls() {
+        use crate::review::sources::{PackageSources, ScriptSource};
+
+        let (_root, mut app) = fixture(&["fn main() {}"]);
+        app.session.package.approval = Some(ApprovedVersion::Fingerprint("hash".into()));
+        app.set_baseline(Baseline::Ready(PackageSources {
+            version: app.session.package.version.clone(),
+            scripts: vec![ScriptSource {
+                path: "script0.rs".into(),
+                contents: "fn main() {}".into(),
+            }],
+        }))
+        .unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(text.contains("Reviewing"));
+        assert!(text.contains("a fingerprints"));
+        assert!(app.can_decide());
+
+        app.set_baseline(Baseline::CurrentFingerprint(vec![ScriptSource {
+            path: "script0.rs".into(),
+            contents: "fn main() {}".into(),
+        }]))
+        .unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(text.contains("Approved"));
+        assert!(!text.contains("a fingerprints"));
+        assert!(!text.contains("r reject"));
+        assert!(!app.can_decide());
+        assert_eq!(app.decision, None);
+        assert!(baseline_note(&app).is_none());
+
+        app.show_help = true;
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(text.contains("approved"));
+        assert!(!text.contains("Approve current fingerprints"));
+        assert!(!text.contains("Reject and"));
     }
 
     #[test]

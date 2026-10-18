@@ -38,6 +38,7 @@ impl QueueState {
                 skipped: false,
                 error: None,
                 baseline_unavailable: false,
+                fingerprint_approved: false,
             })
             .collect();
         let selected = entries.iter().position(Entry::actionable).unwrap_or(0);
@@ -75,6 +76,10 @@ impl QueueState {
                     Some(format!("could not display baseline: {error:#}"));
                 self.app = None;
             }
+            self.entries[self.selected].fingerprint_approved = self
+                .app
+                .as_ref()
+                .is_some_and(App::is_current_fingerprint_approved);
             self.retire_loader();
             return true;
         }
@@ -113,6 +118,7 @@ impl QueueState {
                 .and_then(|a| a.for_review(&entry.package.version));
         }
         self.entries[self.selected].decision = app.decision;
+        self.entries[self.selected].fingerprint_approved = app.is_current_fingerprint_approved();
         self.entries[self.selected].skipped = false;
         self.retire_loader();
         Ok(self.advance())
@@ -165,6 +171,10 @@ impl QueueState {
         self.selected = selected;
         self.entries[selected].error = None;
         self.entries[selected].baseline_unavailable = false;
+        self.entries[selected].fingerprint_approved = false;
+        if self.entries[selected].decision == Some(Decision::ApproveFingerprint) {
+            self.entries[selected].decision = None;
+        }
         match self.load_current() {
             Ok((app, loader)) => {
                 self.app = Some(app);
@@ -203,7 +213,7 @@ impl QueueState {
         };
         app.queue_mode = true;
         app.decision = entry.decision;
-        let loader = if !matches!(app.baseline, Baseline::Loading(_)) {
+        let loader = if matches!(app.baseline, Baseline::Ready(_) | Baseline::CurrentVersion) {
             None
         } else {
             BaselineLoader::start(&app.session)?
@@ -241,6 +251,7 @@ pub struct Entry {
     pub skipped: bool,
     pub error: Option<String>,
     pub baseline_unavailable: bool,
+    pub fingerprint_approved: bool,
 }
 
 impl Entry {
@@ -254,10 +265,10 @@ impl Entry {
             "approved"
         } else if self.decision == Some(Decision::Reject) {
             "rejected"
-        } else if self.fingerprint_only() {
-            "fingerprint"
         } else if self.already_approved() {
             "already approved"
+        } else if self.fingerprint_only() {
+            "fingerprint"
         } else if self.skipped {
             "skipped"
         } else if self.baseline_unavailable {
@@ -268,7 +279,8 @@ impl Entry {
     }
 
     fn already_approved(&self) -> bool {
-        matches!(&self.package.approval, Some(ApprovedVersion::SemVer(version)) if version == &self.package.version)
+        self.fingerprint_approved
+            || matches!(&self.package.approval, Some(ApprovedVersion::SemVer(version)) if version == &self.package.version)
     }
 
     fn fingerprint_only(&self) -> bool {
@@ -307,6 +319,32 @@ mod tests {
         let (root, metadata) = super::super::tests::fixture();
         let queue = ReviewQueue::from_metadata(&metadata).unwrap();
         (root, QueueState::new(queue))
+    }
+
+    fn fingerprint_fixture() -> (tempfile::TempDir, QueueState, PathBuf) {
+        let (root, state) = fixture();
+        let script = &state.app.as_ref().unwrap().session.package.scripts[0];
+        let helper = script.path.with_file_name("helper.rs");
+        fs::write(&helper, "const INPUT: u8 = 1;\n").unwrap();
+        let artifact = root.path().join(format!(
+            "target/debug/build/custom-script/out/{}.d",
+            script.name.replace('-', "_")
+        ));
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        fs::write(
+            &artifact,
+            format!("binary: {} {}\n", script.path.display(), helper.display()),
+        )
+        .unwrap();
+        (root, state, artifact)
+    }
+
+    fn finish_baseline(state: &mut QueueState) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !state.poll() {
+            assert!(std::time::Instant::now() < deadline, "baseline timed out");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     #[test]
@@ -394,6 +432,83 @@ mod tests {
         ));
         assert_eq!(state.app.as_ref().unwrap().file().rows.as_ptr(), rows);
         assert!(state.loader.is_none());
+    }
+
+    #[test]
+    fn cached_fingerprint_approvals_are_rechecked_after_helper_changes() {
+        let (_root, mut state, artifact) = fingerprint_fixture();
+        let selected = state.selected;
+        let script = state.entries[selected].package.scripts[0].path.clone();
+        let displayed = fs::read_to_string(&script).unwrap();
+        state.decide(Decision::ApproveFingerprint).unwrap();
+        let approval = state.entries[selected].package.approval.clone();
+        assert!(state.entries[selected].fingerprint_approved);
+        assert_eq!(state.summary().approved, 1);
+
+        state.navigate(true);
+        assert_eq!(state.selected, selected);
+        assert_eq!(state.entries[selected].decision, None);
+        assert!(!state.entries[selected].fingerprint_approved);
+        assert!(state.app.as_ref().unwrap().can_decide());
+        finish_baseline(&mut state);
+        assert!(state.entries[selected].already_approved());
+        assert!(!state.entries[selected].actionable());
+        assert!(!state.app.as_ref().unwrap().can_decide());
+        assert_eq!(state.app.as_ref().unwrap().decision, None);
+        assert_eq!(state.summary().already_approved, 1);
+        assert_eq!(state.summary().approved, 0);
+
+        state.navigate(false);
+        fs::write(script.with_file_name("helper.rs"), "const INPUT: u8 = 2;\n").unwrap();
+        // Keep dep-info fresh so the changed input hash, not freshness alone,
+        // determines whether the saved approval still covers this package.
+        let dep_info = fs::read_to_string(&artifact).unwrap();
+        fs::write(&artifact, dep_info).unwrap();
+        state.navigate(true);
+        assert_eq!(fs::read_to_string(&script).unwrap(), displayed);
+        assert_eq!(state.entries[selected].package.approval, approval);
+        assert_eq!(state.entries[selected].decision, None);
+        assert!(!state.entries[selected].fingerprint_approved);
+        assert!(state.app.as_ref().unwrap().can_decide());
+        finish_baseline(&mut state);
+        assert!(!state.entries[selected].already_approved());
+        assert!(state.entries[selected].actionable());
+        assert!(state.app.as_ref().unwrap().can_decide());
+        assert_eq!(state.summary().already_approved, 0);
+        assert_eq!(state.summary().approved, 0);
+    }
+
+    #[test]
+    fn reopened_fingerprint_queue_updates_approved_status_and_summary() {
+        let (_root, mut state, _artifact) = fingerprint_fixture();
+        state.decide(Decision::ApproveFingerprint).unwrap();
+        let queue = ReviewQueue {
+            packages: state
+                .entries
+                .iter()
+                .map(|entry| entry.package.clone())
+                .collect(),
+            config: ConfigFile::open(&state.config_path).unwrap(),
+        };
+        let mut reopened = QueueState::new(queue);
+        assert_eq!(reopened.selected, 0);
+        assert!(reopened.entries[0].actionable());
+        finish_baseline(&mut reopened);
+        assert!(reopened.entries[0].fingerprint_only());
+        assert!(reopened.entries[0].already_approved());
+        assert_eq!(reopened.entries[0].status(), "already approved");
+        assert!(!reopened.entries[0].actionable());
+        assert_eq!(reopened.entries[0].decision, None);
+        assert!(!reopened.app.as_ref().unwrap().can_decide());
+        assert_eq!(reopened.app.as_ref().unwrap().decision, None);
+        assert_eq!(
+            reopened.summary(),
+            Summary {
+                already_approved: 1,
+                skipped: 3,
+                ..Default::default()
+            }
+        );
     }
 
     #[test]

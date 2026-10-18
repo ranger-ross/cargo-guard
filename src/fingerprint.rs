@@ -8,6 +8,51 @@ use std::{
 use eyre::{Context, ContextCompat};
 use sha2::{Digest, Sha256};
 
+const INPUT_HASH_BYTES: usize = 8;
+
+/// The version is only a lookup hint; parsing does not authenticate either hash
+/// or establish that sources from this version are a verified review baseline.
+#[derive(Debug)]
+pub(crate) struct ParsedFingerprint<'a> {
+    pub script_hash: &'a str,
+    pub inputs_hash: &'a str,
+    pub version: semver::Version,
+}
+
+impl<'a> ParsedFingerprint<'a> {
+    pub(crate) fn parse(fingerprint: &'a str) -> Option<Self> {
+        let (hashes, version) = fingerprint.split_once('#')?;
+        let (script_hash, inputs_hash) = hashes.split_once('+')?;
+        let is_hash = |hash: &str, length: usize| {
+            hash.len() == length
+                && hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        };
+        if !is_hash(script_hash, 64) || !is_hash(inputs_hash, INPUT_HASH_BYTES * 2) {
+            return None;
+        }
+        Some(Self {
+            script_hash,
+            inputs_hash,
+            version: semver::Version::parse(version).ok()?,
+        })
+    }
+}
+
+/// Compare both hashes, never the unauthenticated version hint.
+pub(crate) fn fingerprints_match(left: &str, right: &str) -> bool {
+    match (
+        ParsedFingerprint::parse(left),
+        ParsedFingerprint::parse(right),
+    ) {
+        (Some(left), Some(right)) => {
+            left.script_hash == right.script_hash && left.inputs_hash == right.inputs_hash
+        }
+        _ => false,
+    }
+}
+
 #[derive(Debug)]
 pub struct BuildScriptFingerprint {
     pub name: String,
@@ -46,7 +91,12 @@ impl BuildScriptFingerprint {
         let dep_info_root = env::var_os("CARGO_GUARD_WORKSPACE_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| manifest_dir.to_path_buf());
-        let fingerprint = from_dep_info(&self.manifest_path, &dep_info, &dep_info_root)?;
+        let fingerprint = from_dep_info(
+            &self.manifest_path,
+            &dep_info,
+            &dep_info_root,
+            &self.version,
+        )?;
         *self.fingerprint.borrow_mut() = Some(fingerprint.clone());
         Ok(fingerprint)
     }
@@ -56,7 +106,9 @@ pub(crate) fn from_dep_info(
     manifest_path: &Path,
     dep_info: &str,
     dep_info_root: &Path,
+    version: &str,
 ) -> eyre::Result<String> {
+    semver::Version::parse(version).context("invalid package version")?;
     let manifest = read_manifest(manifest_path)?;
     let manifest_dir = manifest_path.parent().context("manifest has no parent")?;
     let mut dependencies = manifest.clone();
@@ -85,6 +137,7 @@ pub(crate) fn from_dep_info(
         manifest_dir,
         dep_info,
         dep_info_root,
+        version,
     )
 }
 
@@ -203,72 +256,108 @@ fn fingerprint_inputs(
     manifest_dir: &Path,
     dep_info: &str,
     dep_info_root: &Path,
+    version: &str,
 ) -> eyre::Result<String> {
-    let mut files = BTreeSet::new();
-    match manifest.get("package").and_then(|p| p.get("build")) {
-        None | Some(toml::Value::Boolean(true)) => {
-            files.insert(PathBuf::from("build.rs"));
-        }
-        Some(toml::Value::String(path)) => {
-            files.insert(PathBuf::from(path));
-        }
+    let scripts = match manifest.get("package").and_then(|p| p.get("build")) {
+        None | Some(toml::Value::Boolean(true)) => vec![Path::new("build.rs")],
+        Some(toml::Value::String(path)) => vec![Path::new(path)],
         Some(toml::Value::Array(paths)) => {
-            // Cargo's dep-info belongs to this binary and includes its entry
-            // point. Other scripts in the package are independent approvals.
             eyre::ensure!(!paths.is_empty(), "manifest has no build scripts");
-            eyre::ensure!(
-                !parse_dep_info(dep_info)?.is_empty(),
-                "build script dep-info has no inputs"
-            );
+            paths
+                .iter()
+                .map(|path| {
+                    path.as_str()
+                        .map(Path::new)
+                        .context("build script path is not a string")
+                })
+                .collect::<eyre::Result<Vec<_>>>()?
         }
         _ => eyre::bail!("manifest does not enable a build script"),
-    }
-    files.extend(
-        parse_dep_info(dep_info)?
-            .into_iter()
-            .map(|path| dep_info_root.join(path)),
-    );
+    };
 
-    // Normalize and deduplicate absolute dep-info paths and manifest-relative
-    // script paths. Package-local labels do not include the versioned cache path.
+    // Normalize and deduplicate absolute dep-info paths. Package-local labels
+    // do not include the versioned cache path.
     let root = manifest_dir
         .canonicalize()
         .context("could not resolve manifest directory")?;
     let mut inputs = BTreeSet::new();
-    for file in files {
-        let path = root
+    for file in parse_dep_info(dep_info)? {
+        let path = dep_info_root
             .join(&file)
             .canonicalize()
             .with_context(|| format!("could not resolve tracked file {}", file.display()))?;
-        let label = path.strip_prefix(&root).unwrap_or(&path).to_path_buf();
-        inputs.insert((label, path));
+        inputs.insert(path);
     }
+    // Each dep-info describes one binary. Never include another declared
+    // script unless rustc actually tracked it as an input of this binary.
+    let mut entries = BTreeSet::new();
+    for script in scripts {
+        let path = root.join(script);
+        match path.canonicalize() {
+            Ok(path) if inputs.contains(&path) => {
+                entries.insert(path);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("could not resolve build script {}", path.display()));
+            }
+        }
+    }
+    eyre::ensure!(
+        entries.len() == 1,
+        "dep-info must contain exactly one declared build script entry point"
+    );
+    let entry = entries.pop_first().unwrap();
+    let entry_content = fs::read(&entry)
+        .with_context(|| format!("could not read build script {}", entry.display()))?;
+    let script_hash = Sha256::digest(&entry_content);
 
     let mut hash = Sha256::new();
-    hash_field(&mut hash, b"cargo-guard-build-fingerprint-v1");
+    hash_field(&mut hash, b"cargo-guard-build-fingerprint-v2");
+    hash_field(&mut hash, b"entry");
+    hash_field(&mut hash, input_label(&root, &entry)?.as_bytes());
     for (scope, deps) in dependency_tables(dependencies) {
         hash_field(&mut hash, b"dependencies");
         hash_field(&mut hash, scope.as_bytes());
         hash_field(&mut hash, deps.to_string().as_bytes());
     }
+    // Sort by the canonical label, not by the absolute installation path.
+    let inputs = inputs
+        .iter()
+        .filter(|path| **path != entry)
+        .map(|path| Ok((input_label(&root, path)?, path)))
+        .collect::<eyre::Result<BTreeSet<_>>>()?;
     for (label, path) in inputs {
-        let content = fs::read(&path)
+        let content = fs::read(path)
             .with_context(|| format!("could not read tracked file {}", path.display()))?;
         hash_field(&mut hash, b"file");
-        hash_field(
-            &mut hash,
-            label
-                .to_str()
-                .context("tracked path is not UTF-8")?
-                .as_bytes(),
-        );
+        hash_field(&mut hash, label.as_bytes());
         hash_field(&mut hash, &content);
     }
-    Ok(hash
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
+    let mut fingerprint = String::with_capacity(66 + INPUT_HASH_BYTES * 2 + version.len());
+    append_hex(&mut fingerprint, &script_hash);
+    fingerprint.push('+');
+    append_hex(&mut fingerprint, &hash.finalize()[..INPUT_HASH_BYTES]);
+    fingerprint.push('#');
+    fingerprint.push_str(version);
+    Ok(fingerprint)
+}
+
+fn input_label<'a>(root: &Path, path: &'a Path) -> eyre::Result<&'a str> {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_str()
+        .context("tracked path is not UTF-8")
+}
+
+pub(crate) fn append_hex(output: &mut String, bytes: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for &byte in bytes {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
 }
 
 fn hash_field(hash: &mut Sha256, bytes: &[u8]) {
@@ -286,7 +375,21 @@ mod tests {
         manifest_dir: &Path,
         dep_info: &str,
     ) -> eyre::Result<String> {
-        fingerprint_inputs(manifest, dependencies, manifest_dir, dep_info, manifest_dir)
+        fingerprint_inputs(
+            manifest,
+            dependencies,
+            manifest_dir,
+            dep_info,
+            manifest_dir,
+            "1.0.0",
+        )
+    }
+
+    fn assert_only_inputs_changed(before: &str, after: &str) {
+        let before = ParsedFingerprint::parse(before).unwrap();
+        let after = ParsedFingerprint::parse(after).unwrap();
+        assert_eq!(before.script_hash, after.script_hash);
+        assert_ne!(before.inputs_hash, after.inputs_hash);
     }
 
     #[test]
@@ -306,6 +409,7 @@ mod tests {
                 &package,
                 "binary: dep/first.rs dep/helper.rs\n",
                 root.path(),
+                "1.0.0",
             )
             .unwrap()
         };
@@ -316,6 +420,7 @@ mod tests {
                 &package,
                 "binary: dep/second.rs\n",
                 root.path(),
+                "1.0.0",
             )
             .unwrap()
         };
@@ -323,7 +428,21 @@ mod tests {
         let second_hash = second();
         assert_ne!(first_hash, second_hash);
         fs::write(package.join("helper.rs"), "const VALUE: u8 = 2;").unwrap();
-        assert_ne!(first_hash, first());
+        assert_only_inputs_changed(&first_hash, &first());
+        assert_eq!(second_hash, second());
+        let before_entry_change = first();
+        fs::write(
+            package.join("first.rs"),
+            "mod helper; fn main() { helper(); }",
+        )
+        .unwrap();
+        let after_entry_change = first();
+        let before = ParsedFingerprint::parse(&before_entry_change).unwrap();
+        let after = ParsedFingerprint::parse(&after_entry_change).unwrap();
+        assert_ne!(before.script_hash, after.script_hash);
+        assert_eq!(before.inputs_hash, after.inputs_hash);
+        assert_eq!(second_hash, second());
+        fs::remove_file(package.join("first.rs")).unwrap();
         assert_eq!(second_hash, second());
     }
 
@@ -387,18 +506,10 @@ mod tests {
     }
 
     #[test]
-    fn fingerprints_inputs_without_pinning_package_version() {
-        let root = env::temp_dir().join(format!(
-            "cargo-guard-fingerprint-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("custom.rs"), "fn main() {}\n").unwrap();
-        fs::write(root.join("helper.rs"), "original").unwrap();
+    fn separates_entry_bytes_from_helpers_and_build_dependencies() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("custom.rs"), b"abc").unwrap();
+        fs::write(root.path().join("helper.rs"), "original").unwrap();
         let mut manifest: toml::Value = toml::from_str(
             r#"
             [package]
@@ -413,44 +524,279 @@ mod tests {
         )
         .unwrap();
         let dep_info = "out: custom.rs helper.rs\n";
-        let initial = fingerprint(&manifest, &manifest, &root, dep_info).unwrap();
-        assert_eq!(initial.len(), 64);
+        let initial = fingerprint(&manifest, &manifest, root.path(), dep_info).unwrap();
+        assert_eq!(
+            ParsedFingerprint::parse(&initial).unwrap().script_hash,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
         assert_eq!(
             initial,
             fingerprint(
                 &manifest,
                 &manifest,
-                &root,
+                root.path(),
                 "out: helper.rs custom.rs helper.rs\n"
             )
             .unwrap()
         );
         manifest["package"]["version"] = "1.1.0".into();
-        assert_eq!(
-            initial,
-            fingerprint(&manifest, &manifest, &root, dep_info).unwrap()
+        let new_version = fingerprint_inputs(
+            &manifest,
+            &manifest,
+            root.path(),
+            dep_info,
+            root.path(),
+            "1.1.0",
+        )
+        .unwrap();
+        assert_ne!(initial, new_version);
+        assert!(fingerprints_match(&initial, &new_version));
+
+        fs::write(root.path().join("custom.rs"), b"abc\n").unwrap();
+        let entry_changed = fingerprint(&manifest, &manifest, root.path(), dep_info).unwrap();
+        let before = ParsedFingerprint::parse(&initial).unwrap();
+        let after = ParsedFingerprint::parse(&entry_changed).unwrap();
+        assert_ne!(before.script_hash, after.script_hash);
+        assert_eq!(before.inputs_hash, after.inputs_hash);
+        fs::write(root.path().join("custom.rs"), b"abc").unwrap();
+
+        fs::write(root.path().join("helper.rs"), "changed").unwrap();
+        assert_only_inputs_changed(
+            &initial,
+            &fingerprint(&manifest, &manifest, root.path(), dep_info).unwrap(),
         );
-        fs::write(root.join("helper.rs"), "changed").unwrap();
-        assert_ne!(
-            initial,
-            fingerprint(&manifest, &manifest, &root, dep_info).unwrap()
-        );
-        fs::write(root.join("helper.rs"), "original").unwrap();
+        fs::write(root.path().join("helper.rs"), "original").unwrap();
         manifest["target"]["cfg(unix)"]["build-dependencies"]["platform-helper"]["version"] =
             "3.0".into();
-        assert_ne!(
-            initial,
-            fingerprint(&manifest, &manifest, &root, dep_info).unwrap()
+        assert_only_inputs_changed(
+            &initial,
+            &fingerprint(&manifest, &manifest, root.path(), dep_info).unwrap(),
         );
         manifest["target"]["cfg(unix)"]["build-dependencies"]["platform-helper"]["version"] =
             "2.0".into();
         manifest["build-dependencies"]["helper"] = "1.1".into();
-        assert_ne!(
-            initial,
-            fingerprint(&manifest, &manifest, &root, dep_info).unwrap()
+        assert_only_inputs_changed(
+            &initial,
+            &fingerprint(&manifest, &manifest, root.path(), dep_info).unwrap(),
         );
-        fs::remove_file(root.join("helper.rs")).unwrap();
-        assert!(fingerprint(&manifest, &manifest, &root, dep_info).is_err());
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_file(root.path().join("helper.rs")).unwrap();
+        assert!(fingerprint(&manifest, &manifest, root.path(), dep_info).is_err());
+    }
+
+    #[test]
+    fn parses_strict_fingerprints_and_ignores_only_the_version() {
+        let script = "a".repeat(64);
+        let inputs = "b".repeat(16);
+        let initial = format!("{script}+{inputs}#1.2.3-alpha.1+build.42");
+        let parsed = ParsedFingerprint::parse(&initial).unwrap();
+        assert_eq!(parsed.script_hash, script);
+        assert_eq!(parsed.inputs_hash, inputs);
+        assert_eq!(parsed.version.to_string(), "1.2.3-alpha.1+build.42");
+        assert!(fingerprints_match(
+            &initial,
+            &format!("{script}+{inputs}#9.0.0")
+        ));
+        assert!(!fingerprints_match(
+            &initial,
+            &format!("{}+{inputs}#1.2.3-alpha.1+build.42", "c".repeat(64))
+        ));
+        assert!(!fingerprints_match(
+            &initial,
+            &format!("{script}+{}#1.2.3-alpha.1+build.42", "c".repeat(16))
+        ));
+        for malformed in [
+            String::new(),
+            script.clone(),
+            format!("{script}#1.0.0"),
+            format!("{script}+{inputs}"),
+            format!("{script}-{inputs}#1.0.0"),
+            format!("{script}-{}#v1.0.0", "b".repeat(64)),
+            format!("{script}+{inputs}#"),
+            format!("{script}+{inputs}#1.0"),
+            format!("{script}+{inputs}#01.0.0"),
+            format!("{script}+{inputs}#v1.0.0"),
+            format!("{script}+{inputs}#1.0.0#2.0.0"),
+            format!("{script}+{inputs}#1.0.0\n"),
+            format!("{}+{inputs}#1.0.0", "a".repeat(63)),
+            format!("{script}+{}#1.0.0", "b".repeat(15)),
+            format!("{script}+{}#1.0.0", "b".repeat(17)),
+            format!("{script}+{}#1.0.0", "b".repeat(64)),
+            format!("{}+{inputs}#1.0.0", "A".repeat(64)),
+            format!("{script}+{}#1.0.0", "B".repeat(16)),
+            format!("{}+{inputs}#1.0.0", "g".repeat(64)),
+            format!("{script}+{}#1.0.0", "é".repeat(8)),
+            format!("{script}+{inputs}+extra#1.0.0"),
+        ] {
+            assert!(
+                ParsedFingerprint::parse(&malformed).is_none(),
+                "{malformed}"
+            );
+            assert!(!fingerprints_match(&malformed, &malformed));
+            assert!(!fingerprints_match(&initial, &malformed));
+            assert!(!fingerprints_match(&malformed, &initial));
+        }
+    }
+
+    #[test]
+    fn uses_explicit_version_for_inherited_package_versions() {
+        let root = tempfile::tempdir().unwrap();
+        let manifest = root.path().join("Cargo.toml");
+        fs::write(&manifest, "[package]\nversion.workspace = true\n").unwrap();
+        fs::write(root.path().join("build.rs"), "fn main() {}\n").unwrap();
+        let fingerprint =
+            from_dep_info(&manifest, "out: build.rs\n", root.path(), "1.2.3+release").unwrap();
+        assert_eq!(
+            ParsedFingerprint::parse(&fingerprint).unwrap().version,
+            semver::Version::parse("1.2.3+release").unwrap()
+        );
+        for invalid in ["", "1", "1.2", "v1.2.3", "01.2.3", "1.2.3\n"] {
+            assert!(from_dep_info(&manifest, "out: build.rs\n", root.path(), invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn requires_a_unique_declared_entry_point() {
+        let root = tempfile::tempdir().unwrap();
+        for script in ["first.rs", "second.rs", "helper.rs"] {
+            fs::write(root.path().join(script), "fn main() {}").unwrap();
+        }
+        let manifest: toml::Value =
+            toml::from_str("[package]\nbuild = ['first.rs', 'second.rs']").unwrap();
+        for dep_info in ["out: helper.rs\n", "out: first.rs second.rs\n"] {
+            assert!(fingerprint(&manifest, &manifest, root.path(), dep_info).is_err());
+        }
+        for declaration in [
+            "false",
+            "[]",
+            "['first.rs', 1]",
+            "'missing.rs'",
+            "'first.rs'",
+        ] {
+            let manifest: toml::Value =
+                toml::from_str(&format!("[package]\nbuild = {declaration}")).unwrap();
+            assert!(
+                fingerprint(&manifest, &manifest, root.path(), "out: helper.rs\n").is_err(),
+                "{declaration}"
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_relocatability_and_canonical_path_deduplication() {
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        let manifest: toml::Value = toml::from_str("[package]\nbuild = true").unwrap();
+        for root in [left.path(), right.path()] {
+            fs::create_dir(root.join("sub")).unwrap();
+            fs::write(root.join("build.rs"), "fn main() {}").unwrap();
+            fs::write(root.join("helper.rs"), "helper").unwrap();
+        }
+        let initial = fingerprint(
+            &manifest,
+            &manifest,
+            left.path(),
+            "out: build.rs helper.rs\n",
+        )
+        .unwrap();
+        assert_eq!(
+            initial,
+            fingerprint(
+                &manifest,
+                &manifest,
+                right.path(),
+                "out: sub/../build.rs helper.rs ./helper.rs\n"
+            )
+            .unwrap()
+        );
+        let absolute = format!(
+            "out: {} {} build.rs\n",
+            left.path().join("build.rs").display(),
+            left.path().join("helper.rs").display()
+        );
+        assert_eq!(
+            initial,
+            fingerprint(&manifest, &manifest, left.path(), &absolute).unwrap()
+        );
+    }
+
+    #[test]
+    fn entry_and_helper_paths_are_part_of_the_opaque_hash() {
+        let root = tempfile::tempdir().unwrap();
+        for script in ["first.rs", "second.rs"] {
+            fs::write(root.path().join(script), "fn main() {}").unwrap();
+        }
+        for helper in ["helper.rs", "renamed.rs"] {
+            fs::write(root.path().join(helper), "helper").unwrap();
+        }
+        let mut manifest: toml::Value = toml::from_str("[package]\nbuild = 'first.rs'").unwrap();
+        let first = fingerprint(
+            &manifest,
+            &manifest,
+            root.path(),
+            "out: first.rs helper.rs\n",
+        )
+        .unwrap();
+        let renamed_helper = fingerprint(
+            &manifest,
+            &manifest,
+            root.path(),
+            "out: first.rs renamed.rs\n",
+        )
+        .unwrap();
+        assert_only_inputs_changed(&first, &renamed_helper);
+        manifest["package"]["build"] = "second.rs".into();
+        let second = fingerprint(
+            &manifest,
+            &manifest,
+            root.path(),
+            "out: second.rs helper.rs\n",
+        )
+        .unwrap();
+        assert_only_inputs_changed(&first, &second);
+    }
+
+    #[test]
+    fn inherited_dependencies_retain_workspace_declarations_and_local_overrides() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("build.rs"), "fn main() {}").unwrap();
+        let manifest: toml::Value = toml::from_str(
+            "[build-dependencies]\nhelper = { workspace = true, features = ['local'] }\n\
+             [target.'cfg(unix)'.build-dependencies]\nplatform = { workspace = true }\n",
+        )
+        .unwrap();
+        let mut workspace: toml::Value = toml::from_str(
+            "[workspace.dependencies]\nhelper = { version = '1', features = ['shared'] }\n\
+             platform = '2'\n",
+        )
+        .unwrap();
+        let mut resolved = manifest.clone();
+        inherit_dependencies(&mut resolved, &workspace).unwrap();
+        let initial = fingerprint(&manifest, &resolved, root.path(), "out: build.rs\n").unwrap();
+        workspace["workspace"]["dependencies"]["helper"]["version"] = "3".into();
+        let mut changed = manifest.clone();
+        inherit_dependencies(&mut changed, &workspace).unwrap();
+        assert_only_inputs_changed(
+            &initial,
+            &fingerprint(&manifest, &changed, root.path(), "out: build.rs\n").unwrap(),
+        );
+        workspace["workspace"]["dependencies"]["helper"]["version"] = "1".into();
+        workspace["workspace"]["dependencies"]["platform"] = "3".into();
+        let mut changed = manifest.clone();
+        inherit_dependencies(&mut changed, &workspace).unwrap();
+        assert_only_inputs_changed(
+            &initial,
+            &fingerprint(&manifest, &changed, root.path(), "out: build.rs\n").unwrap(),
+        );
+        workspace["workspace"]["dependencies"]["platform"] = "2".into();
+        let mut changed = manifest.clone();
+        changed["build-dependencies"]["helper"]["features"] =
+            toml::Value::Array(vec!["different".into()]);
+        inherit_dependencies(&mut changed, &workspace).unwrap();
+        assert_only_inputs_changed(
+            &initial,
+            &fingerprint(&manifest, &changed, root.path(), "out: build.rs\n").unwrap(),
+        );
+        let missing: toml::Value = toml::from_str("[workspace.dependencies]").unwrap();
+        assert!(inherit_dependencies(&mut manifest.clone(), &missing).is_err());
     }
 }

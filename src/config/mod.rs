@@ -7,6 +7,8 @@ use std::{
 use eyre::Context;
 use serde::{Deserialize, Serialize};
 
+use crate::fingerprint::{ParsedFingerprint, fingerprints_match};
+
 pub mod edit;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -37,9 +39,13 @@ impl ApprovedVersion {
     }
 
     pub fn allows_fingerprint(&self, fingerprint: &str) -> bool {
-        self.entries()
-            .iter()
-            .any(|entry| matches!(entry, Self::Fingerprint(f) if f == fingerprint))
+        match self {
+            Self::Fingerprint(approved) => fingerprints_match(approved, fingerprint),
+            Self::Multiple(entries) => entries
+                .iter()
+                .any(|entry| entry.allows_fingerprint(fingerprint)),
+            Self::SemVer(_) => false,
+        }
     }
 
     /// The current approval, or the nearest historical version for source review.
@@ -60,6 +66,23 @@ impl ApprovedVersion {
             .find(|v| ***v <= *current)
             .or_else(|| versions.first())
             .map(|v| Self::SemVer((*v).clone()))
+            .or_else(|| {
+                entries
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        Self::Fingerprint(value) => {
+                            ParsedFingerprint::parse(value).map(|parsed| (value, parsed.version))
+                        }
+                        _ => None,
+                    })
+                    .min_by(|(_, a), (_, b)| match (a <= current, b <= current) {
+                        (true, true) => b.cmp(a),
+                        (false, false) => a.cmp(b),
+                        (true, false) => std::cmp::Ordering::Less,
+                        (false, true) => std::cmp::Ordering::Greater,
+                    })
+                    .map(|(value, _)| Self::Fingerprint(value.clone()))
+            })
             .or_else(|| {
                 entries.iter().find_map(|entry| match entry {
                     Self::Fingerprint(f) => Some(Self::Fingerprint(f.clone())),
@@ -138,15 +161,18 @@ mod tests {
 
     #[test]
     fn mixed_lists_match_independently_and_select_nearest_baseline() {
-        let config: Config =
-            toml::from_str("[approved]\npkg=['2.0.0','hash-a','1.0.0','hash-b']\nempty=[]\n")
-                .unwrap();
+        let first = format!("{:064x}+{:016x}#1.0.0", 1, 2);
+        let second = format!("{:064x}+{:016x}#2.0.0", 3, 4);
+        let config: Config = toml::from_str(&format!(
+            "[approved]\npkg=['2.0.0','{first}','1.0.0','{second}']\nempty=[]\n"
+        ))
+        .unwrap();
         let approvals = &config.approved["pkg"];
         assert!(approvals.allows_version(&"1.0.0".parse().unwrap()));
         assert!(approvals.allows_version(&"2.0.0".parse().unwrap()));
         assert!(!approvals.allows_version(&"3.0.0".parse().unwrap()));
-        assert!(approvals.allows_fingerprint("hash-a"));
-        assert!(approvals.allows_fingerprint("hash-b"));
+        assert!(approvals.allows_fingerprint(&first));
+        assert!(approvals.allows_fingerprint(&second));
         for (current, expected) in [
             ("0.5.0", "1.0.0"),
             ("1.5.0", "1.0.0"),
@@ -171,8 +197,36 @@ mod tests {
     }
 
     #[test]
+    fn fingerprint_hints_select_baselines_without_authorizing_versions() {
+        let old = format!("{:064x}+{:016x}#1.0.0", 1, 2);
+        let new = format!("{:064x}+{:016x}#2.0.0", 1, 3);
+        let approvals = ApprovedVersion::Multiple(vec![
+            ApprovedVersion::Fingerprint("legacy-hash".into()),
+            ApprovedVersion::Fingerprint(new.clone()),
+            ApprovedVersion::Fingerprint(old.clone()),
+        ]);
+        for (current, expected) in [
+            ("0.5.0", &old),
+            ("1.5.0", &old),
+            ("2.0.0", &new),
+            ("3.0.0", &new),
+        ] {
+            let version = current.parse().unwrap();
+            assert_eq!(
+                approvals.for_review(&version),
+                Some(ApprovedVersion::Fingerprint(expected.clone()))
+            );
+            assert!(!approvals.allows_version(&version));
+        }
+        assert!(approvals.allows_fingerprint(&format!("{:064x}+{:016x}#9.0.0", 1, 2)));
+        assert!(!approvals.allows_fingerprint(&format!("{:064x}+{:016x}#1.0.0", 2, 2)));
+        assert!(!approvals.allows_fingerprint(&format!("{:064x}+{:016x}#1.0.0", 1, 4)));
+        assert!(!approvals.allows_fingerprint("legacy-hash"));
+    }
+
+    #[test]
     fn detects_versions_and_fingerprints_and_round_trips() {
-        let hash = "7c22171135c52f3285ec525c724cf784149707b935293dd6d158eff15b7bd3e8";
+        let hash = format!("{:064x}+{:016x}#1.0.0-rc.1+build.2", 1, 2);
         let source = format!(
             "[approved]\nfoo = \"1.0.0\"\nbar = \"{hash}\"\npreview = \"2.0.0-rc.1+build.2\"\n"
         );
@@ -187,7 +241,7 @@ mod tests {
             ));
             assert!(matches!(
                 &config.approved["bar"],
-                ApprovedVersion::Fingerprint(value) if value == hash
+                ApprovedVersion::Fingerprint(value) if value == &hash
             ));
             assert!(matches!(
                 &config.approved["preview"],

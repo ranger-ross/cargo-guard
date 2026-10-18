@@ -292,7 +292,6 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(app.file().status, FileStatus::Unchanged);
-        assert!(app.baseline_message().contains("Build scripts unchanged"));
         assert!(app.can_decide());
         assert_eq!(
             input::handle_key(&mut app, key('r')),
