@@ -18,8 +18,15 @@ use super::{
 };
 use crate::config::ApprovedVersion;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Scope {
+    Selected,
+    Global,
+}
+
 pub(super) struct Request {
     pub index: usize,
+    pub scope: Scope,
     pub generation: u64,
     pub package: ReviewPackage,
     pub approvals: ApprovedVersion,
@@ -27,6 +34,7 @@ pub(super) struct Request {
 
 pub(super) struct Result {
     pub index: usize,
+    pub scope: Scope,
     pub generation: u64,
     pub package_id: PackageId,
     pub verification: Verification,
@@ -83,6 +91,7 @@ impl Verifier {
                     if results
                         .send(Result {
                             index: request.index,
+                            scope: request.scope,
                             generation: request.generation,
                             package_id: request.package.id,
                             verification,
@@ -121,7 +130,10 @@ impl Verifier {
 fn enqueue(command: Command, pending: &mut VecDeque<Box<Request>>) -> bool {
     match command {
         Command::Verify(request) => {
-            if let Some(index) = pending.iter().position(|old| old.index == request.index) {
+            if let Some(index) = pending
+                .iter()
+                .position(|old| old.index == request.index && old.scope == request.scope)
+            {
                 pending[index] = request;
             } else {
                 pending.push_back(request);

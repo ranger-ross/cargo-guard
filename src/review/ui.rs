@@ -9,11 +9,12 @@ use unicode_width::UnicodeWidthStr;
 
 use super::{
     app::{App, Decision},
+    diagnostic::Diagnostic,
     diff::FileStatus,
     queue::QueueState,
     sources::Baseline,
 };
-use crate::config::ApprovedVersion;
+use crate::config::{ApprovalScope, ApprovalTarget, ApprovedVersion};
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     render_area(frame, app, frame.area());
@@ -61,7 +62,7 @@ pub fn render_queue(frame: &mut Frame, state: &mut QueueState) {
         .take(visible)
         .map(|(index, entry)| {
             let (marker, color) = match entry.status() {
-                "approved" | "already approved" => ("✓", Color::Green),
+                "approved" | "already approved" | "approved globally" => ("✓", Color::Green),
                 "rejected" => ("×", Color::Red),
                 "load error" | "baseline unavailable" | "verification unavailable" => {
                     ("!", Color::Yellow)
@@ -137,9 +138,25 @@ fn render_failure_area(frame: &mut Frame, state: &mut QueueState, area: Rect) {
     );
     state.error_diagnostic.render(frame, error);
     frame.render_widget(
-        Paragraph::new("y copy selection  Esc clear selection  q quit").style(muted()),
+        Paragraph::new("? help  y copy  Esc clear  q quit").style(muted()),
         footer,
     );
+    if state.show_failure_help {
+        let mut text = approval_destination(&state.approval_target);
+        for note in &state.policy_notes {
+            text.push_str("\n\n");
+            text.push_str(note);
+        }
+        text.push_str(
+            "\n\nSources could not be loaded; approval actions are unavailable.\n\
+             j / k  Next / previous package\n\
+             s      Skip to the next pending package\n\
+             y / Esc  Copy diagnostic selection / clear selection\n\
+             q / Ctrl+C  Quit; saved decisions are kept",
+        );
+        state.failure_help.set_report(text, false);
+        render_help_popup(frame, &mut state.failure_help);
+    }
 }
 
 fn update_diagnostic(app: &mut App) {
@@ -382,16 +399,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn render_help(frame: &mut Frame, app: &App) {
-    let area = frame.area();
-    let width = area.width.min(90);
-    let height = area.height.min(if app.queue_mode { 34 } else { 31 });
-    let popup = Rect::new(
-        area.x + (area.width - width) / 2,
-        area.y + (area.height - height) / 2,
-        width,
-        height,
-    );
+fn render_help(frame: &mut Frame, app: &mut App) {
     let mut lines = vec![
         Line::from("Up / Down        Scroll source"),
         Line::from("←/→ or h/l       Pan long lines"),
@@ -437,6 +445,14 @@ fn render_help(frame: &mut Frame, app: &App) {
             "Current fingerprints are already approved; viewing only.",
         ));
     }
+    if app.globally_approved {
+        lines.push(Line::from(
+            "Global approval is informational here; workspace review still saves only workspace approvals.",
+        ));
+        lines.push(Line::from(
+            "Build precedence is unchanged: an existing workspace approval file remains authoritative for builds configured with that workspace root.",
+        ));
+    }
     lines.extend([
         Line::default(),
         Line::from("Diff columns: approved / current. Approval covers all scripts in the package."),
@@ -460,22 +476,49 @@ fn render_help(frame: &mut Frame, app: &App) {
             ),
             muted(),
         ),
-        Line::styled(
-            format!("Approvals: {}", app.session.config.path().display()),
-            muted(),
-        ),
     ]);
-    frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::bordered()
-                    .border_style(muted())
-                    .title(Span::styled(" Review help ", bold(Color::Green))),
-            )
-            .wrap(Wrap { trim: false }),
-        popup,
+    let mut text = approval_destination(app.session.config.target());
+    for note in &app.session.policy_notes {
+        text.push_str("\n\n");
+        text.push_str(note);
+    }
+    text.push('\n');
+    for line in lines {
+        text.push('\n');
+        for span in line.spans {
+            text.push_str(&span.content);
+        }
+    }
+    app.help.set_report(text, false);
+    render_help_popup(frame, &mut app.help);
+}
+
+fn render_help_popup(frame: &mut Frame, help: &mut Diagnostic) {
+    let area = frame.area();
+    let width = area.width.min(90);
+    let height = area.height.min(34);
+    let popup = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
     );
+    let block = Block::bordered()
+        .border_style(muted())
+        .title(Span::styled(" Review help ", bold(Color::Green)));
+    let [body, footer] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(block.inner(popup));
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+    help.render_body(frame, body);
+    frame.render_widget(
+        Paragraph::new("↑↓ PgUp/Dn Home/End scroll · ?/Esc close").style(muted()),
+        footer,
+    );
+}
+
+fn approval_destination(target: &ApprovalTarget) -> String {
+    format!("Approvals ({}): {}", target.scope, target.path.display())
 }
 
 fn heading(app: &App) -> Line<'static> {
@@ -484,15 +527,29 @@ fn heading(app: &App) -> Line<'static> {
         ("Blocked", Color::Yellow)
     } else if app.decision == Some(Decision::Reject) {
         ("Rejected", Color::Red)
-    } else if app.is_current_version_approved() || app.is_current_fingerprint_approved() {
-        ("Approved", Color::Green)
+    } else if let Some(scope) = app.displayed_approval_scope() {
+        let label = if scope == ApprovalScope::Global {
+            "Approved (global)"
+        } else {
+            "Approved"
+        };
+        (label, Color::Green)
     } else {
         ("Reviewing", Color::Green)
     };
-    let baseline_version = match (&package.approval, &app.baseline) {
-        (Some(ApprovedVersion::SemVer(version)), _) => Some(version),
-        (Some(ApprovedVersion::Fingerprint(_)), Baseline::Ready(sources)) => Some(&sources.version),
-        _ => None,
+    let supplemental_only = app.globally_approved
+        && !app.is_current_version_approved()
+        && !app.is_current_fingerprint_approved();
+    let baseline_version = if supplemental_only {
+        None
+    } else {
+        match (&package.approval, &app.baseline) {
+            (Some(ApprovedVersion::SemVer(version)), _) => Some(version),
+            (Some(ApprovedVersion::Fingerprint(_)), Baseline::Ready(sources)) => {
+                Some(&sources.version)
+            }
+            _ => None,
+        }
     };
     let version = match baseline_version {
         Some(old) if old != &package.version => {
@@ -501,10 +558,14 @@ fn heading(app: &App) -> Line<'static> {
         _ => format!("{} v{}", package.name, package.version),
     };
     let mut line = status_line(label, version, color);
-    let suffix = match &package.approval {
-        None => " (new)",
-        Some(ApprovedVersion::Fingerprint(_)) => " (fingerprint)",
-        _ => "",
+    let suffix = if supplemental_only {
+        ""
+    } else {
+        match &package.approval {
+            None => " (new)",
+            Some(ApprovedVersion::Fingerprint(_)) => " (fingerprint)",
+            _ => "",
+        }
     };
     line.spans.push(Span::styled(suffix, muted()));
     line
@@ -602,6 +663,7 @@ mod tests {
         let queue = crate::review::discovery::ReviewQueue::from_metadata(
             &metadata,
             &crate::args::ReviewOptions::default(),
+            None,
         )
         .unwrap();
         let mut state = QueueState::new(queue);
@@ -620,6 +682,78 @@ mod tests {
                 .draw(|frame| render_queue(frame, &mut state))
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn narrow_help_scrolls_without_changing_source_or_package_selection() {
+        use crate::review::input::{self, Action};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (_root, mut app) = fixture(&["fn main() {}\n"]);
+        app.queue_mode = true;
+        app.session.policy_notes = vec!["policy-note ".repeat(40) + "note-end-marker"];
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        input::handle_key(&mut app, key(KeyCode::Char('?')));
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let first = screen(&terminal);
+        let mut saw_note_end = false;
+        for _ in 0..80 {
+            assert_eq!(
+                input::handle_key(&mut app, key(KeyCode::Char('j'))),
+                Action::Continue,
+            );
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            saw_note_end |= screen(&terminal).contains("note-end-marker");
+        }
+        assert!(saw_note_end);
+        assert_ne!(screen(&terminal), first);
+        assert_eq!(app.top, 0);
+        assert_eq!(app.selected, 0);
+        input::handle_key(&mut app, key(KeyCode::Home));
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        assert_eq!(screen(&terminal), first);
+        input::handle_key(&mut app, key(KeyCode::Esc));
+        assert!(!app.show_help);
+    }
+
+    #[test]
+    fn failure_help_scrolls_and_blocks_package_actions() {
+        use crate::review::input::Action;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let (_root, metadata) = crate::review::tests::fixture();
+        let queue = crate::review::discovery::ReviewQueue::from_metadata(
+            &metadata,
+            &crate::args::ReviewOptions::default(),
+            None,
+        )
+        .unwrap();
+        let mut state = QueueState::new(queue);
+        state.app = None;
+        state.policy_notes = vec!["policy-note ".repeat(40) + "note-end-marker"];
+        let selected = state.selected;
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        state.handle_key(key(KeyCode::Char('?')));
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        terminal
+            .draw(|frame| render_failure(frame, &mut state))
+            .unwrap();
+        let first = screen(&terminal);
+        assert_eq!(state.handle_key(key(KeyCode::Char('s'))), Action::Continue);
+        state.handle_key(key(KeyCode::End));
+        terminal
+            .draw(|frame| render_failure(frame, &mut state))
+            .unwrap();
+        assert_ne!(screen(&terminal), first);
+        assert_eq!(state.selected, selected);
+        state.handle_key(key(KeyCode::Home));
+        terminal
+            .draw(|frame| render_failure(frame, &mut state))
+            .unwrap();
+        assert_eq!(screen(&terminal), first);
+        assert_eq!(state.handle_key(key(KeyCode::Esc)), Action::Continue);
+        assert!(!state.show_failure_help);
     }
 
     #[test]
@@ -668,7 +802,6 @@ mod tests {
         assert!(text.contains("fn main()"));
         for removed in [
             "Source:",
-            "Approvals:",
             "Baseline:",
             "Files (",
             "Build script review",

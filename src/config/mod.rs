@@ -11,6 +11,168 @@ use crate::fingerprint::{ParsedFingerprint, fingerprints_match};
 
 pub mod edit;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApprovalScope {
+    Workspace,
+    Global,
+}
+
+impl std::fmt::Display for ApprovalScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Workspace => "workspace",
+            Self::Global => "global",
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ApprovalTarget {
+    pub path: PathBuf,
+    pub scope: ApprovalScope,
+}
+
+pub struct RunnerPaths {
+    pub workspace_root: Option<PathBuf>,
+    pub global: Option<PathBuf>,
+}
+
+pub struct LoadedApprovals {
+    pub target: ApprovalTarget,
+    pub config: Config,
+}
+
+const GLOBAL_PATH: &str = "CARGO_GUARD_GLOBAL_APPROVED_BUILDS_PATH";
+const WORKSPACE_ROOT: &str = "CARGO_GUARD_WORKSPACE_ROOT";
+
+impl RunnerPaths {
+    pub fn from_env() -> eyre::Result<Self> {
+        let workspace_root = validate_path(WORKSPACE_ROOT, env::var_os(WORKSPACE_ROOT))?;
+        let global = validate_path(GLOBAL_PATH, env::var_os(GLOBAL_PATH))?;
+        eyre::ensure!(
+            workspace_root.is_some() || global.is_some(),
+            "set CARGO_GUARD_WORKSPACE_ROOT or CARGO_GUARD_GLOBAL_APPROVED_BUILDS_PATH in Cargo [env] configuration"
+        );
+        Ok(Self {
+            workspace_root,
+            global,
+        })
+    }
+}
+
+fn validate_path(name: &str, value: Option<std::ffi::OsString>) -> eyre::Result<Option<PathBuf>> {
+    value.map(|value| {
+        let path = PathBuf::from(value);
+        eyre::ensure!(
+            !path.as_os_str().is_empty() && path.is_absolute(),
+            "{name} must be a nonempty absolute path; use an absolute path or Cargo relative = true"
+        );
+        Ok(path)
+    }).transpose()
+}
+
+pub fn review_global_path(cwd: &Path) -> eyre::Result<Option<PathBuf>> {
+    let config = cargo_config2::Config::load_with_cwd(cwd)
+        .context("could not load Cargo configuration for review")?;
+    let exported = env::var_os(GLOBAL_PATH);
+    let value = match config.env.get(GLOBAL_PATH) {
+        Some(entry) if entry.force || exported.is_none() => Some(entry.value.clone()),
+        _ => exported,
+    };
+    validate_path(GLOBAL_PATH, value)
+}
+
+pub fn review_target(
+    workspace_root: &Path,
+    global: bool,
+    configured_global: Option<&Path>,
+) -> eyre::Result<ApprovalTarget> {
+    if !global {
+        return Ok(ApprovalTarget {
+            path: config_path(workspace_root),
+            scope: ApprovalScope::Workspace,
+        });
+    }
+    let path = if let Some(path) = configured_global {
+        path.to_owned()
+    } else {
+        let home = match env::var_os("CARGO_HOME").filter(|value| !value.is_empty()) {
+            Some(home) => std::path::absolute(home).context("could not resolve CARGO_HOME")?,
+            None => env::home_dir()
+                .ok_or_else(|| {
+                    eyre::eyre!(
+                        "could not find home directory; set {GLOBAL_PATH} to an absolute path"
+                    )
+                })?
+                .join(".cargo"),
+        };
+        config_path(&home)
+    };
+    Ok(ApprovalTarget {
+        path,
+        scope: ApprovalScope::Global,
+    })
+}
+
+pub fn load_runner_approvals(paths: &RunnerPaths) -> eyre::Result<LoadedApprovals> {
+    let workspace = paths.workspace_root.as_deref().map(|root| ApprovalTarget {
+        path: config_path(root),
+        scope: ApprovalScope::Workspace,
+    });
+    if let Some(target) = workspace.as_ref()
+        && let Some(config) = read_runner_config(&target.path)?
+    {
+        return Ok(LoadedApprovals {
+            target: target.clone(),
+            config,
+        });
+    }
+    let target = match &paths.global {
+        Some(path) => ApprovalTarget {
+            path: path.clone(),
+            scope: ApprovalScope::Global,
+        },
+        None => workspace.ok_or_else(|| eyre::eyre!("no approval destination configured"))?,
+    };
+    let config = if target.scope == ApprovalScope::Global {
+        read_runner_config(&target.path)?
+    } else {
+        None
+    }
+    .unwrap_or_else(|| Config {
+        approved: BTreeMap::new(),
+    });
+    Ok(LoadedApprovals { target, config })
+}
+
+fn read_runner_config(path: &Path) -> eyre::Result<Option<Config>> {
+    read_optional(path)?
+        .map(|contents| {
+            toml::from_str(&contents)
+                .with_context(|| format!("could not parse config {}", path.display()))
+        })
+        .transpose()
+}
+
+pub(super) fn read_optional(path: &Path) -> eyre::Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match fs::symlink_metadata(path) {
+                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Ok(_) => {
+                    Err(error).with_context(|| format!("could not read config {}", path.display()))
+                }
+                Err(error) => Err(error)
+                    .with_context(|| format!("could not inspect config {}", path.display())),
+            }
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("could not read config {}", path.display()))
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
     pub approved: BTreeMap<String, ApprovedVersion>,
@@ -92,51 +254,16 @@ impl ApprovedVersion {
     }
 }
 
-pub fn load_config() -> eyre::Result<Config> {
-    let workspace_root = determine_workspace_root()?;
-    load_config_from(&config_path(&workspace_root))
-}
-
 pub fn config_path(workspace_root: &Path) -> PathBuf {
     workspace_root.join("approved-builds.toml")
 }
 
+#[cfg(test)]
 pub fn load_config_from(path: &Path) -> eyre::Result<Config> {
     let contents = fs::read_to_string(path)
         .with_context(|| format!("could not read config {}", path.display()))?;
 
     toml::from_str(&contents).with_context(|| format!("could not parse config {}", path.display()))
-}
-
-pub fn determine_workspace_root() -> eyre::Result<PathBuf> {
-    // A build-script runner's working directory belongs to the dependency,
-    // not the workspace that is building it. Cargo config must supply the root.
-    if let Some(root) = env::var_os("CARGO_GUARD_WORKSPACE_ROOT") {
-        let root = PathBuf::from(root);
-        eyre::ensure!(
-            root.is_absolute(),
-            "CARGO_GUARD_WORKSPACE_ROOT must be an absolute path; use relative = true in Cargo config"
-        );
-        return Ok(root);
-    }
-
-    // If we are running as a build script runner, we cannot trust `cargo metadata` since it will
-    // return the workspace root of the registry package, not the actual workspace being built.
-    eyre::ensure!(
-        env::var_os("OUT_DIR").is_none(),
-        "set CARGO_GUARD_WORKSPACE_ROOT in .cargo/config.toml:\n\
-         ```\n\
-         [env]\n\
-         CARGO_GUARD_WORKSPACE_ROOT = {{ value = \".\", relative = true }}\n\
-         ```"
-    );
-
-    let metadata = cargo_metadata::MetadataCommand::new()
-        .no_deps()
-        .exec()
-        .context("could not determine cargo workspace root")?;
-
-    Ok(metadata.workspace_root.into_std_path_buf())
 }
 
 fn deserialize_approvals<'de, D: serde::Deserializer<'de>>(
@@ -158,6 +285,59 @@ fn deserialize_approvals<'de, D: serde::Deserializer<'de>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_runner_files_are_empty_without_creating_them() {
+        let root = tempfile::tempdir().unwrap();
+        let global = root.path().join("global/approved-builds.toml");
+        for paths in [
+            RunnerPaths {
+                workspace_root: Some(root.path().to_owned()),
+                global: None,
+            },
+            RunnerPaths {
+                workspace_root: None,
+                global: Some(global.clone()),
+            },
+            RunnerPaths {
+                workspace_root: Some(root.path().to_owned()),
+                global: Some(global.clone()),
+            },
+        ] {
+            let loaded = load_runner_approvals(&paths).unwrap();
+            assert!(loaded.config.approved.is_empty());
+            assert_eq!(
+                loaded.target.scope,
+                if paths.global.is_some() {
+                    ApprovalScope::Global
+                } else {
+                    ApprovalScope::Workspace
+                }
+            );
+            assert!(!loaded.target.path.exists());
+        }
+        assert!(!global.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn explicit_review_destination_does_not_change_workspace_policy() {
+        let root = tempfile::tempdir().unwrap();
+        let global = root.path().join("personal.toml");
+        let workspace = review_target(root.path(), false, Some(&global)).unwrap();
+        assert_eq!(workspace.path, config_path(root.path()));
+        assert_eq!(workspace.scope, ApprovalScope::Workspace);
+        let personal = review_target(root.path(), true, Some(&global)).unwrap();
+        assert_eq!(personal.path, global);
+        assert_eq!(personal.scope, ApprovalScope::Global);
+        for invalid in ["", ".", "relative", "~/personal.toml"] {
+            assert!(validate_path(GLOBAL_PATH, Some(invalid.into())).is_err());
+        }
+        assert_eq!(
+            validate_path(GLOBAL_PATH, Some(global.into_os_string())).unwrap(),
+            Some(personal.path)
+        );
+        assert_eq!(validate_path(GLOBAL_PATH, None).unwrap(), None);
+    }
 
     #[test]
     fn mixed_lists_match_independently_and_select_nearest_baseline() {

@@ -30,6 +30,7 @@ fn fixture() -> tempfile::TempDir {
 fn runner(root: &Path, manifest: &Path, name: &str) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-guard"));
     command
+        .env_remove("CARGO_GUARD_GLOBAL_APPROVED_BUILDS_PATH")
         .env("CARGO_GUARD_WORKSPACE_ROOT", root)
         .env("CARGO_MANIFEST_PATH", manifest)
         .env("CARGO_PKG_NAME", name)
@@ -171,4 +172,85 @@ fn explicit_workspace_review_needs_no_terminal_or_approval_file() {
         .unwrap();
     assert!(output.status.success(), "{:?}", output);
     assert!(String::from_utf8_lossy(&output.stdout).contains("do not require approval"));
+}
+
+#[test]
+fn runner_selects_one_store_and_requires_explicit_activation() {
+    let root = fixture();
+    let global = root.path().join("personal.toml");
+    fs::write(
+        &global,
+        "[approved]\nexcluded=['unreadable-fingerprint','1.0.0']\nmember='1.0.0'\n",
+    )
+    .unwrap();
+    let run = |workspace: bool, global_enabled: bool, package: &str| {
+        let mut command = runner(
+            root.path(),
+            &root.path().join(format!("{package}/Cargo.toml")),
+            package,
+        );
+        if !workspace {
+            command.env_remove("CARGO_GUARD_WORKSPACE_ROOT");
+        }
+        if global_enabled {
+            command.env("CARGO_GUARD_GLOBAL_APPROVED_BUILDS_PATH", &global);
+        }
+        command
+            .args(["/bin/sh", "-c", "echo executed"])
+            .output()
+            .unwrap()
+    };
+    assert!(!run(false, false, "excluded").status.success());
+    assert!(run(false, true, "excluded").status.success());
+    assert!(run(false, true, "member").status.success());
+    fs::write(&global, "[approved]\nexcluded='1.0.0'\n").unwrap();
+    let rejected = run(false, true, "member");
+    assert!(!rejected.status.success());
+    assert!(!String::from_utf8_lossy(&rejected.stdout).contains("executed"));
+    assert!(run(true, true, "excluded").status.success());
+    let workspace = root.path().join("approved-builds.toml");
+    for contents in [
+        "[approved]\n",
+        "[approved]\nexcluded='2.0.0'\n",
+        "invalid toml",
+        "unrelated=true",
+    ] {
+        fs::write(&workspace, contents).unwrap();
+        let rejected = run(true, true, "excluded");
+        assert!(!rejected.status.success(), "{rejected:?}");
+        assert!(!String::from_utf8_lossy(&rejected.stdout).contains("executed"));
+    }
+    fs::remove_file(&workspace).unwrap();
+    std::os::unix::fs::symlink(root.path().join("missing"), &workspace).unwrap();
+    assert!(!run(true, true, "excluded").status.success());
+    fs::remove_file(&workspace).unwrap();
+    fs::create_dir(&workspace).unwrap();
+    assert!(!run(true, true, "excluded").status.success());
+    fs::remove_dir(&workspace).unwrap();
+    fs::write(&workspace, "[approved]\nexcluded='1.0.0'\n").unwrap();
+    fs::write(&global, "malformed").unwrap();
+    assert!(run(true, true, "excluded").status.success());
+    fs::remove_file(&global).unwrap();
+    assert!(!run(false, true, "excluded").status.success());
+}
+
+#[test]
+fn runner_validates_even_unselected_paths() {
+    let root = fixture();
+    for variable in [
+        "CARGO_GUARD_WORKSPACE_ROOT",
+        "CARGO_GUARD_GLOBAL_APPROVED_BUILDS_PATH",
+    ] {
+        for invalid in ["", "relative", "~/approvals.toml"] {
+            let output = runner(root.path(), &root.path().join("Cargo.toml"), "root")
+                .env(variable, invalid)
+                .args(["/bin/sh", "-c", "echo executed"])
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            let text = String::from_utf8_lossy(&output.stdout);
+            assert!(text.contains(variable), "{text}");
+            assert!(!text.contains("executed"));
+        }
+    }
 }

@@ -1,41 +1,50 @@
-use std::{
-    fs,
-    io::{ErrorKind, Write},
-    path::{Path, PathBuf},
-};
+use std::{fs, io::Write, path::Path};
 
 use eyre::{Context, ContextCompat};
 use tempfile::NamedTempFile;
 use toml_edit::{DocumentMut, Item, Table, Value};
 
-use super::{ApprovedVersion, Config, config_path};
+#[cfg(test)]
+use super::config_path;
+use super::{ApprovalScope, ApprovalTarget, ApprovedVersion, Config, read_optional};
 
 /// A review session's config snapshot. Successful edits are saved immediately;
 /// failed saves leave both the snapshot and the in-memory approvals unchanged.
 pub struct ConfigFile {
-    path: PathBuf,
+    target: ApprovalTarget,
     original: Option<String>,
     document: DocumentMut,
     config: Config,
 }
 
 impl ConfigFile {
+    #[cfg(test)]
     pub fn for_workspace(root: &Path) -> eyre::Result<Self> {
-        Self::open(&config_path(root))
+        Self::open(ApprovalTarget {
+            path: config_path(root),
+            scope: ApprovalScope::Workspace,
+        })
     }
 
     /// A missing file is an empty allow list until the first approval is saved.
-    pub fn open(path: &Path) -> eyre::Result<Self> {
-        let path = std::path::absolute(path).context("could not resolve config path")?;
-        let original = read_optional(&path)?;
+    pub fn open(mut target: ApprovalTarget) -> eyre::Result<Self> {
+        target.path = std::path::absolute(&target.path).context("could not resolve config path")?;
+        let original = read_optional(&target.path)?;
+        if target.scope == ApprovalScope::Global && original.is_some() {
+            target.path = target
+                .path
+                .canonicalize()
+                .with_context(|| format!("could not resolve config {}", target.path.display()))?;
+        }
+        let path = &target.path;
         let document = original
             .as_deref()
             .unwrap_or("")
             .parse::<DocumentMut>()
             .with_context(|| format!("could not parse config {}", path.display()))?;
-        let config = parse_config(&document, &path)?;
+        let config = parse_config(&document, path)?;
         Ok(Self {
-            path,
+            target,
             original,
             document,
             config,
@@ -43,7 +52,11 @@ impl ConfigFile {
     }
 
     pub fn path(&self) -> &Path {
-        &self.path
+        &self.target.path
+    }
+
+    pub fn target(&self) -> &ApprovalTarget {
+        &self.target
     }
 
     pub fn config(&self) -> &Config {
@@ -54,8 +67,7 @@ impl ConfigFile {
         self.add_approvals(package, &[approval])
     }
 
-    /// Persist approvals together. A scalar fingerprint is replaced by a new
-    /// fingerprint batch; explicit arrays retain their additive semantics.
+    /// Workspace scalar fingerprints are replaced. Global additions retain history.
     pub fn add_approvals(
         &mut self,
         package: &str,
@@ -67,12 +79,14 @@ impl ConfigFile {
             .or_insert(Item::Table(Table::new()))
             .as_table_like_mut()
             .context("approved must be a TOML table")?;
-        let replace_fingerprint = matches!(
-            self.config.approved.get(package),
-            Some(ApprovedVersion::Fingerprint(_))
-        ) && approvals
-            .iter()
-            .all(|approval| matches!(approval, ApprovedVersion::Fingerprint(_)));
+        let replace_fingerprint = self.target.scope == ApprovalScope::Workspace
+            && matches!(
+                self.config.approved.get(package),
+                Some(ApprovedVersion::Fingerprint(_))
+            )
+            && approvals
+                .iter()
+                .all(|approval| matches!(approval, ApprovedVersion::Fingerprint(_)));
         for (index, approval) in approvals.iter().enumerate() {
             let new = match approval {
                 ApprovedVersion::SemVer(version) => version.to_string(),
@@ -95,11 +109,6 @@ impl ConfigFile {
                         old == new || crate::fingerprint::fingerprints_match(old, &new)
                     })
                 }) {
-                    eyre::ensure!(
-                        read_optional(&self.path)? == self.original,
-                        "config {} changed since it was loaded; reload it before saving approvals",
-                        self.path.display()
-                    );
                     continue;
                 }
                 array.push(new);
@@ -155,50 +164,88 @@ impl ConfigFile {
     }
 
     fn save(&mut self, document: DocumentMut) -> eyre::Result<()> {
-        let config = parse_config(&document, &self.path)?;
+        let config = parse_config(&document, self.path())?;
         let contents = document.to_string();
-        let parent = self.path.parent().context("config path has no parent")?;
+        let mut path = self.target.path.clone();
+        let mut lock = None;
+        if self.target.scope == ApprovalScope::Global {
+            let parent = path.parent().context("config path has no parent")?;
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "could not create global approval directory {}",
+                    parent.display()
+                )
+            })?;
+            path = parent
+                .canonicalize()
+                .with_context(|| {
+                    format!(
+                        "could not resolve global approval directory {}",
+                        parent.display()
+                    )
+                })?
+                .join(path.file_name().context("config path has no filename")?);
+            let mut name = path.file_name().unwrap().to_os_string();
+            name.push(".lock");
+            let lock_path = path.with_file_name(name);
+            let handle = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock_path)
+                .with_context(|| {
+                    format!(
+                        "could not open global approval lock {}",
+                        lock_path.display()
+                    )
+                })?;
+            match handle.try_lock() {
+                Ok(()) => {}
+                Err(fs::TryLockError::WouldBlock) => eyre::bail!(
+                    "global approvals {} are being updated; retry after the other save finishes",
+                    path.display()
+                ),
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("could not lock global approvals {}", path.display())
+                    });
+                }
+            }
+            lock = Some(handle);
+        }
+        let parent = path.parent().context("config path has no parent")?;
         // Same-directory staging keeps the rename on the same filesystem.
         let mut temporary = NamedTempFile::new_in(parent)
             .with_context(|| format!("could not stage config in {}", parent.display()))?;
         if self.original.is_some() {
-            let permissions = fs::metadata(&self.path)
-                .with_context(|| format!("could not read config metadata {}", self.path.display()))?
+            let permissions = fs::metadata(&path)
+                .with_context(|| format!("could not read config metadata {}", path.display()))?
                 .permissions();
             temporary.as_file().set_permissions(permissions)?;
         }
         temporary.write_all(contents.as_bytes())?;
         temporary.as_file().sync_all()?;
 
-        // Optimistic conflict detection: compare immediately before publishing.
-        // An external writer can still race the check/rename; this is not a lock.
+        // Non-cooperating editors can still race this comparison and rename.
         eyre::ensure!(
-            read_optional(&self.path)? == self.original,
+            read_optional(&path)? == self.original,
             "config {} changed since it was loaded; reload it before saving approvals",
-            self.path.display()
+            path.display()
         );
         if self.original.is_none() {
-            // Do not overwrite a file created after the comparison above.
-            temporary.persist_noclobber(&self.path)
+            temporary.persist_noclobber(&path)
         } else {
-            temporary.persist(&self.path)
+            temporary.persist(&path)
         }
-        .with_context(|| format!("could not save config {}", self.path.display()))?;
+        .with_context(|| format!("could not save config {}", path.display()))?;
 
+        self.target.path = path;
         self.original = Some(contents);
         self.document = document;
         self.config = config;
+        drop(lock);
         Ok(())
-    }
-}
-
-fn read_optional(path: &Path) -> eyre::Result<Option<String>> {
-    match fs::read_to_string(path) {
-        Ok(contents) => Ok(Some(contents)),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-        Err(error) => {
-            Err(error).with_context(|| format!("could not read config {}", path.display()))
-        }
     }
 }
 
@@ -247,7 +294,11 @@ mod tests {
                 format!("[approved]\n# explanation\nexample = {original} # retained\n"),
             )
             .unwrap();
-            let mut file = ConfigFile::open(&path).unwrap();
+            let mut file = ConfigFile::open(ApprovalTarget {
+                path: path.clone(),
+                scope: ApprovalScope::Workspace,
+            })
+            .unwrap();
             let approvals: Vec<_> = hashes
                 .into_iter()
                 .map(|hash| ApprovedVersion::Fingerprint(hash.into()))
@@ -266,7 +317,11 @@ mod tests {
         let path = config_path(root.path());
         let hash = fingerprint(1);
         fs::write(&path, format!("[approved]\nexample = [\n  '{hash}', # script one\n  '1.0.0', # old version\n] # package\n")).unwrap();
-        let mut file = ConfigFile::open(&path).unwrap();
+        let mut file = ConfigFile::open(ApprovalTarget {
+            path: path.clone(),
+            scope: ApprovalScope::Workspace,
+        })
+        .unwrap();
         file.set_approval("example", version("2.0.0")).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
         assert!(saved.contains("# script one"));
@@ -286,7 +341,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = config_path(root.path());
         fs::write(&path, "[approved]\nexample='1.0.0' # retained\n").unwrap();
-        let mut file = ConfigFile::open(&path).unwrap();
+        let mut file = ConfigFile::open(ApprovalTarget {
+            path: path.clone(),
+            scope: ApprovalScope::Workspace,
+        })
+        .unwrap();
         let batch = [
             ApprovedVersion::Fingerprint(fingerprint(1)),
             ApprovedVersion::Fingerprint(fingerprint(2)),
@@ -322,7 +381,11 @@ mod tests {
         let path = config_path(root.path());
         let hash = fingerprint(1);
         fs::write(&path, format!("[approved]\nexample=['{hash}']\n")).unwrap();
-        let mut file = ConfigFile::open(&path).unwrap();
+        let mut file = ConfigFile::open(ApprovalTarget {
+            path: path.clone(),
+            scope: ApprovalScope::Workspace,
+        })
+        .unwrap();
         file.set_approval(
             "example",
             ApprovedVersion::Fingerprint(hash.replace("#1.0.0", "#2.0.0")),
@@ -374,7 +437,11 @@ mod tests {
             "enabled = true # unrelated\n"
         );
         fs::write(&path, original).unwrap();
-        let mut file = ConfigFile::open(&path).unwrap();
+        let mut file = ConfigFile::open(ApprovalTarget {
+            path: path.clone(),
+            scope: ApprovalScope::Workspace,
+        })
+        .unwrap();
         file.set_approval("example", version("1.1.0")).unwrap();
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
@@ -393,8 +460,16 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = config_path(root.path());
         fs::write(&path, "[approved]\nexample = '1.0.0'\n").unwrap();
-        let mut first = ConfigFile::open(&path).unwrap();
-        let mut second = ConfigFile::open(&path).unwrap();
+        let mut first = ConfigFile::open(ApprovalTarget {
+            path: path.clone(),
+            scope: ApprovalScope::Workspace,
+        })
+        .unwrap();
+        let mut second = ConfigFile::open(ApprovalTarget {
+            path: path.clone(),
+            scope: ApprovalScope::Workspace,
+        })
+        .unwrap();
         first.set_approval("example", version("2.0.0")).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
         assert!(
@@ -428,11 +503,21 @@ mod tests {
         let path = config_path(root.path());
         for invalid in ["[broken", "approved = 42", "[approved]\nexample = false"] {
             fs::write(&path, invalid).unwrap();
-            assert!(ConfigFile::open(&path).is_err());
+            assert!(
+                ConfigFile::open(ApprovalTarget {
+                    path: path.clone(),
+                    scope: ApprovalScope::Workspace
+                })
+                .is_err()
+            );
             assert_eq!(fs::read_to_string(&path).unwrap(), invalid);
         }
         fs::write(&path, "approved = { example = '1.0.0' } # inline\n").unwrap();
-        let mut file = ConfigFile::open(&path).unwrap();
+        let mut file = ConfigFile::open(ApprovalTarget {
+            path: path.clone(),
+            scope: ApprovalScope::Workspace,
+        })
+        .unwrap();
         file.set_approval("example", version("2.0.0")).unwrap();
         file.remove_approval("example").unwrap();
         assert!(fs::read_to_string(&path).unwrap().contains("# inline"));
@@ -449,7 +534,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = config_path(root.path());
         fs::write(&path, "# settings\n[settings]\nvalue = 7\n").unwrap();
-        let mut file = ConfigFile::open(&path).unwrap();
+        let mut file = ConfigFile::open(ApprovalTarget {
+            path: path.clone(),
+            scope: ApprovalScope::Workspace,
+        })
+        .unwrap();
         file.set_approval("example", version("1.0.0")).unwrap();
         assert!(
             fs::read_to_string(&path)
@@ -457,5 +546,103 @@ mod tests {
                 .starts_with("# settings\n[settings]\nvalue = 7\n")
         );
         assert!(file.config().approved.contains_key("example"));
+    }
+
+    #[test]
+    fn global_saves_append_and_preserve_snapshot_under_contention() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("nested/approvals.toml");
+        let target = ApprovalTarget {
+            path: path.clone(),
+            scope: ApprovalScope::Global,
+        };
+        let mut first = ConfigFile::open(target.clone()).unwrap();
+        assert!(!path.parent().unwrap().exists());
+        first
+            .set_approval("example", ApprovedVersion::Fingerprint(fingerprint(1)))
+            .unwrap();
+        let mut stale = ConfigFile::open(target.clone()).unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.with_file_name("approvals.toml.lock"))
+            .unwrap();
+        lock.try_lock().unwrap();
+        let error = first
+            .set_approval("example", ApprovedVersion::Fingerprint(fingerprint(2)))
+            .unwrap_err();
+        assert!(error.to_string().contains("being updated"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(first.original.as_deref(), Some(before.as_str()));
+        assert!(!first.config.approved["example"].allows_fingerprint(&fingerprint(2)));
+        drop(lock);
+        first
+            .set_approval("example", ApprovedVersion::Fingerprint(fingerprint(2)))
+            .unwrap();
+        assert!(first.config.approved["example"].allows_fingerprint(&fingerprint(1)));
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(stale.set_approval("example", version("2.0.0")).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), saved);
+        let mut reopened = ConfigFile::open(first.target().clone()).unwrap();
+        assert_eq!(reopened.target().scope, ApprovalScope::Global);
+        reopened.set_approval("example", version("2.0.0")).unwrap();
+        reopened
+            .set_approval(
+                "example",
+                ApprovedVersion::Fingerprint(fingerprint(1).replace("#1.0.0", "#9.0.0")),
+            )
+            .unwrap();
+        let entries = &reopened.config.approved["example"];
+        assert_eq!(entries.entries().len(), 3);
+        assert!(entries.allows_fingerprint(&fingerprint(1)));
+        assert!(entries.allows_fingerprint(&fingerprint(2)));
+        assert!(entries.allows_version(&"2.0.0".parse().unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn global_edits_follow_symlinks_and_reject_dangling_links() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let path = real.join("approvals.toml");
+        fs::write(&path, format!("# keep\n[approved]\nexample='{}' # reviewed\nother='3.0.0'\n[settings]\nenabled=true\n", fingerprint(1))).unwrap();
+        let link = root.path().join("linked.toml");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        let mut file = ConfigFile::open(ApprovalTarget {
+            path: link.clone(),
+            scope: ApprovalScope::Global,
+        })
+        .unwrap();
+        file.set_approval("example", ApprovedVersion::Fingerprint(fingerprint(2)))
+            .unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(file.path(), path);
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("# keep") && saved.contains("# reviewed"));
+        assert!(saved.contains("other='3.0.0'") && saved.contains("enabled=true"));
+        let mut missing = ConfigFile::open(ApprovalTarget {
+            path: alias.join("new.toml"),
+            scope: ApprovalScope::Global,
+        })
+        .unwrap();
+        missing.set_approval("example", version("1.0.0")).unwrap();
+        assert_eq!(missing.path(), real.join("new.toml"));
+        fs::remove_file(&path).unwrap();
+        assert!(
+            ConfigFile::open(ApprovalTarget {
+                path: link,
+                scope: ApprovalScope::Global
+            })
+            .is_err()
+        );
     }
 }

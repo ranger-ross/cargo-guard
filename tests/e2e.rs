@@ -120,6 +120,134 @@ fn fingerprint_approval_checks_both_hashes_but_ignores_version_hints() {
     assert!(!fixture.marker().exists());
 }
 
+#[test]
+fn global_version_approval_authorizes_two_rootless_workspaces() {
+    let fixture = Fixture::global();
+    for workspace in ["workspace", "workspace-b"] {
+        let rejected = fixture.build_workspace(workspace, false);
+        assert_rejected(
+            &rejected,
+            &fixture.workspace_marker(workspace),
+            "guarded-dep v1.0.0",
+        );
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr)
+                .contains(fixture.global_path().to_str().unwrap()),
+            "rejection did not name the configured global destination"
+        );
+    }
+    assert!(!fixture.global_path().exists());
+
+    fixture.approve_global("[approved]\nguarded-dep = '1.0.0'\n");
+    for workspace in ["workspace", "workspace-b"] {
+        assert_success(&fixture.build_workspace(workspace, false));
+        assert_eq!(
+            fs::read(fixture.workspace_marker(workspace)).unwrap(),
+            b"executed\n"
+        );
+        assert!(
+            !fixture
+                .temp
+                .path()
+                .join(workspace)
+                .join("approved-builds.toml")
+                .exists()
+        );
+    }
+}
+
+#[test]
+fn rootless_global_build_requires_workspace_member_approval() {
+    let fixture = Fixture::global();
+    let root = fixture.temp.path().join("workspace");
+    write(
+        &root,
+        "build.rs",
+        r#"fn main() {
+    let marker = std::path::PathBuf::from(
+        std::env::var_os("CARGO_GUARD_E2E_MARKER").expect("missing marker path"),
+    ).with_extension("member");
+    std::fs::write(marker, b"executed\n").expect("could not write member marker");
+}
+"#,
+    );
+    fixture.approve_global("[approved]\nguarded-dep = '1.0.0'\n");
+    let member_marker = fixture
+        .workspace_marker("workspace")
+        .with_extension("member");
+    let rejected = fixture.build_workspace("workspace", false);
+    assert_rejected(&rejected, &member_marker, "consumer v0.1.0");
+
+    fixture.approve_global("[approved]\nguarded-dep = '1.0.0'\nconsumer = '0.1.0'\n");
+    assert_success(&fixture.build_workspace("workspace", false));
+    assert_eq!(fs::read(member_marker).unwrap(), b"executed\n");
+    assert!(!root.join("approved-builds.toml").exists());
+}
+
+#[test]
+fn global_fingerprint_is_shared_but_workspace_policy_remains_authoritative() {
+    let fixture = Fixture::global();
+    fixture.approve_global("[approved]\nguarded-dep = 'legacy-hash'\n");
+    let rejected = fixture.build_workspace("workspace", true);
+    assert_rejected(
+        &rejected,
+        &fixture.workspace_marker("workspace"),
+        "guarded-dep v1.0.0",
+    );
+    let fingerprint = rejected_fingerprint(&rejected);
+    fixture.approve_global(&format!("[approved]\nguarded-dep = '{fingerprint}'\n"));
+
+    for workspace in ["workspace", "workspace-b"] {
+        assert_success(&fixture.build_workspace(workspace, true));
+        assert_eq!(
+            fs::read(fixture.workspace_marker(workspace)).unwrap(),
+            b"executed\n"
+        );
+        assert!(
+            !fixture
+                .temp
+                .path()
+                .join(workspace)
+                .join("approved-builds.toml")
+                .exists()
+        );
+    }
+
+    let second_root = fixture.temp.path().join("workspace-b");
+    fs::remove_file(fixture.workspace_marker("workspace-b")).unwrap();
+    write(&second_root, "dep/helper.txt", "changed");
+    let changed = fixture.build_workspace("workspace-b", true);
+    assert_rejected(
+        &changed,
+        &fixture.workspace_marker("workspace-b"),
+        "guarded-dep v1.0.0",
+    );
+    assert_ne!(rejected_fingerprint(&changed), fingerprint);
+
+    // The first workspace still matches the global fingerprint. Force Cargo to
+    // invoke its runner again after installing an authoritative empty policy.
+    let first_root = fixture.temp.path().join("workspace");
+    write(&first_root, "approved-builds.toml", "[approved]\n");
+    fs::remove_file(fixture.workspace_marker("workspace")).unwrap();
+    fixture.clean_dependency("workspace");
+    let authoritative = fixture.build_workspace("workspace", true);
+    assert_rejected(
+        &authoritative,
+        &fixture.workspace_marker("workspace"),
+        "guarded-dep v1.0.0",
+    );
+    let stderr = String::from_utf8_lossy(&authoritative.stderr);
+    assert!(stderr.contains("no approval entry"), "{stderr}");
+    assert!(
+        stderr.contains(first_root.join("approved-builds.toml").to_str().unwrap()),
+        "{stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.global_path()).unwrap(),
+        format!("[approved]\nguarded-dep = '{fingerprint}'\n")
+    );
+}
+
 fn rejected_fingerprint(output: &Output) -> String {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -140,48 +268,7 @@ impl Fixture {
     fn new(approvals: &str) -> Self {
         let temp = tempfile::tempdir().expect("could not create e2e fixture directory");
         let root = temp.path().join("workspace");
-        write(
-            &root,
-            "Cargo.toml",
-            r#"[package]
-name = "consumer"
-version = "0.1.0"
-edition = "2024"
-
-[workspace]
-exclude = ["dep"]
-
-[dependencies]
-guarded-dep = { path = "dep" }
-"#,
-        );
-        write(
-            &root,
-            "dep/Cargo.toml",
-            r#"[package]
-name = "guarded-dep"
-version = "1.0.0"
-edition = "2024"
-build = "build.rs"
-
-[workspace]
-"#,
-        );
-        write(&root, "src/lib.rs", "");
-        write(&root, "dep/src/lib.rs", "");
-        write(&root, "approved-builds.toml", approvals);
-        write(
-            &root,
-            "dep/build.rs",
-            r#"fn main() {
-    std::fs::write(
-        std::env::var_os("CARGO_GUARD_E2E_MARKER").expect("missing marker path"),
-        b"executed\n",
-    )
-    .expect("could not write execution marker");
-}
-"#,
-        );
+        create_workspace(&root, Some(approvals));
         let binary = toml::Value::String(env!("CARGO_BIN_EXE_cargo-guard").into());
         write(
             &root,
@@ -204,27 +291,111 @@ CARGO_GUARD_WORKSPACE_ROOT = {{ value = ".", relative = true }}
         Self { temp }
     }
 
+    fn global() -> Self {
+        let temp = tempfile::tempdir().expect("could not create e2e fixture directory");
+        for workspace in ["workspace", "workspace-b"] {
+            let root = temp.path().join(workspace);
+            create_workspace(&root, None);
+            let script_path = root.join("dep/build.rs");
+            let script = fs::read_to_string(&script_path).unwrap();
+            fs::write(
+                script_path,
+                format!("{script}\nconst _: &str = include_str!(\"helper.txt\");\n"),
+            )
+            .unwrap();
+            write(&root, "dep/helper.txt", "original");
+        }
+        let fixture = Self { temp };
+        let binary = toml::Value::String(env!("CARGO_BIN_EXE_cargo-guard").into());
+        let global = toml::Value::String(fixture.global_path().to_str().unwrap().into());
+        write(
+            fixture.temp.path(),
+            "cargo-home/config.toml",
+            &format!(
+                r#"target-applies-to-host = false
+
+[unstable]
+host-config = true
+target-applies-to-host = true
+
+[host]
+runner = [{binary}]
+
+[env]
+CARGO_GUARD_GLOBAL_APPROVED_BUILDS_PATH = {global}
+"#,
+            ),
+        );
+        fixture
+    }
+
+    fn global_path(&self) -> PathBuf {
+        self.temp.path().join("global/approved-builds.toml")
+    }
+
+    fn approve_global(&self, approvals: &str) {
+        write(self.temp.path(), "global/approved-builds.toml", approvals);
+    }
+
+    fn workspace_marker(&self, workspace: &str) -> PathBuf {
+        self.temp.path().join(format!("{workspace}-script-ran"))
+    }
+
+    fn build_workspace(&self, workspace: &str, configured_root: bool) -> Output {
+        self.cargo(
+            workspace,
+            configured_root,
+            &self.workspace_marker(workspace),
+            &["build", "--offline", "--color", "never"],
+        )
+    }
+
+    fn clean_dependency(&self, workspace: &str) {
+        let output = self.cargo(
+            workspace,
+            true,
+            &self.workspace_marker(workspace),
+            &[
+                "clean",
+                "-p",
+                "guarded-dep",
+                "--offline",
+                "--color",
+                "never",
+            ],
+        );
+        assert_success(&output);
+    }
+
     fn marker(&self) -> PathBuf {
         self.temp.path().join("script-ran")
     }
 
     fn build(&self) -> Output {
+        self.cargo(
+            "workspace",
+            false,
+            &self.marker(),
+            &["build", "--offline", "--color", "never"],
+        )
+    }
+
+    fn cargo(
+        &self,
+        workspace: &str,
+        configured_root: bool,
+        marker: &Path,
+        args: &[&str],
+    ) -> Output {
         let root = self.temp.path();
         let cargo_home = root.join("cargo-home");
         fs::create_dir_all(&cargo_home)
             .unwrap_or_else(|error| panic!("could not create {}: {error}", cargo_home.display()));
         let mut command = Command::new("rustup");
         command
-            .args([
-                "run",
-                TOOLCHAIN,
-                "cargo",
-                "build",
-                "--offline",
-                "--color",
-                "never",
-            ])
-            .current_dir(root.join("workspace"))
+            .args(["run", TOOLCHAIN, "cargo"])
+            .args(args)
+            .current_dir(root.join(workspace))
             .stdin(Stdio::null());
         for (key, _) in std::env::vars_os() {
             if key == "CARGO" || key.to_string_lossy().starts_with("CARGO_") {
@@ -240,19 +411,92 @@ CARGO_GUARD_WORKSPACE_ROOT = {{ value = ".", relative = true }}
         ] {
             command.env_remove(key);
         }
+        if configured_root {
+            command.env("CARGO_GUARD_WORKSPACE_ROOT", root.join(workspace));
+        }
         command
             .env("CARGO_HOME", cargo_home)
-            .env("CARGO_TARGET_DIR", root.join("target"))
+            .env("CARGO_TARGET_DIR", root.join(format!("target-{workspace}")))
             .env("CARGO_NET_OFFLINE", "true")
-            .env("CARGO_GUARD_E2E_MARKER", self.marker())
+            .env("CARGO_GUARD_E2E_MARKER", marker)
             .output()
             .unwrap_or_else(|error| {
                 panic!(
-                    "could not run rustup run {TOOLCHAIN} cargo build --offline --color never in {}: {error}",
-                    root.join("workspace").display()
+                    "could not run rustup run {TOOLCHAIN} cargo {args:?} in {}: {error}",
+                    root.join(workspace).display()
                 )
             })
     }
+}
+
+fn create_workspace(root: &Path, approvals: Option<&str>) {
+    write(
+        root,
+        "Cargo.toml",
+        r#"[package]
+name = "consumer"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+exclude = ["dep"]
+
+[dependencies]
+guarded-dep = { path = "dep" }
+"#,
+    );
+    write(
+        root,
+        "dep/Cargo.toml",
+        r#"[package]
+name = "guarded-dep"
+version = "1.0.0"
+edition = "2024"
+build = "build.rs"
+
+[workspace]
+"#,
+    );
+    write(root, "src/lib.rs", "");
+    write(root, "dep/src/lib.rs", "");
+    if let Some(approvals) = approvals {
+        write(root, "approved-builds.toml", approvals);
+    }
+    write(
+        root,
+        "dep/build.rs",
+        r#"fn main() {
+    std::fs::write(
+        std::env::var_os("CARGO_GUARD_E2E_MARKER").expect("missing marker path"),
+        b"executed\n",
+    )
+    .expect("could not write execution marker");
+}
+"#,
+    );
+}
+
+fn assert_success(output: &Output) {
+    assert!(
+        output.status.success(),
+        "status: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+fn assert_rejected(output: &Output, marker: &Path, package: &str) {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "unexpected success:\n{stderr}");
+    assert!(
+        stderr.contains(&format!("build script for {package}")),
+        "missing Cargo Guard rejection:\n{stderr}"
+    );
+    assert!(
+        !marker.try_exists().unwrap(),
+        "rejected script executed:\n{stderr}"
+    );
 }
 
 fn write(root: &Path, path: &str, contents: &str) {

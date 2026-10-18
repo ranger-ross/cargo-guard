@@ -28,7 +28,16 @@ pub fn run_queue(queue: ReviewQueue) -> eyre::Result<()> {
 
 fn run_review(queue: ReviewQueue, queue_mode: bool) -> eyre::Result<()> {
     if queue.packages.is_empty() {
-        println!("No dependency build scripts to review in the selected dependency graph.");
+        let target = queue.config.target();
+        println!("Approvals ({}): {}", target.scope, target.path.display());
+        for note in &queue.policy_notes {
+            println!("{note}");
+        }
+        if target.scope == crate::config::ApprovalScope::Global {
+            println!("No build scripts to review in the selected dependency graph.");
+        } else {
+            println!("No dependency build scripts to review in the selected dependency graph.");
+        }
         return Ok(());
     }
     eyre::ensure!(

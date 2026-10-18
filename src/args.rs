@@ -26,6 +26,10 @@ pub enum Command {
 
 #[derive(Clone, Debug, Default, clap::Args)]
 pub struct ReviewOptions {
+    /// Review shared global approvals instead of workspace approvals
+    #[arg(long)]
+    pub global: bool,
+
     /// Filter metadata to this target triple (default: all platforms)
     #[arg(long)]
     pub target: Option<String>,

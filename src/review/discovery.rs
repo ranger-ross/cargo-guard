@@ -1,13 +1,16 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use cargo_metadata::{CargoOpt, Metadata, MetadataCommand, Node, NodeDep, Package};
 use eyre::ContextCompat;
 
 use super::ReviewPackage;
-use crate::{args::ReviewOptions, config::edit::ConfigFile};
+use crate::{
+    args::ReviewOptions,
+    config::{self, ApprovalTarget, edit::ConfigFile},
+};
 
 pub fn metadata_command(options: &ReviewOptions) -> MetadataCommand {
     let mut command = MetadataCommand::new();
@@ -173,14 +176,27 @@ pub struct ReviewQueue {
     pub packages: Vec<ReviewPackage>,
     pub config: ConfigFile,
     pub build_directory: PathBuf,
+    pub workspace_root: PathBuf,
+    pub policy_notes: Vec<String>,
+    pub global_target: Option<ApprovalTarget>,
 }
 
 impl ReviewQueue {
-    pub fn from_metadata(metadata: &Metadata, options: &ReviewOptions) -> eyre::Result<Self> {
-        let config = ConfigFile::for_workspace(metadata.workspace_root.as_std_path())?;
+    pub fn from_metadata(
+        metadata: &Metadata,
+        options: &ReviewOptions,
+        global_path: Option<&Path>,
+    ) -> eyre::Result<Self> {
+        let workspace_root = metadata.workspace_root.clone().into_std_path_buf();
+        let config = ConfigFile::open(config::review_target(
+            &workspace_root,
+            options.global,
+            global_path,
+        )?)?;
+        let policy_notes = super::policy_notes(&workspace_root, config.target(), global_path)?;
         let packages: Vec<_> = resolved_packages(metadata, options)?
             .into_iter()
-            .filter(|package| !crate::workspace::is_member(metadata, package))
+            .filter(|package| options.global || !crate::workspace::is_member(metadata, package))
             .filter(|package| {
                 package
                     .targets
@@ -192,6 +208,14 @@ impl ReviewQueue {
         Ok(Self {
             packages,
             config,
+            workspace_root,
+            policy_notes,
+            global_target: global_path
+                .filter(|_| !options.global)
+                .map(|path| {
+                    config::review_target(metadata.workspace_root.as_std_path(), true, Some(path))
+                })
+                .transpose()?,
             build_directory: metadata
                 .build_directory
                 .as_ref()
@@ -284,7 +308,89 @@ mod tests {
         let mut command = metadata_command(options);
         command.manifest_path(root.join("Cargo.toml"));
         let metadata = command.exec().unwrap();
-        ReviewQueue::from_metadata(&metadata, options).unwrap()
+        ReviewQueue::from_metadata(&metadata, options, None).unwrap()
+    }
+
+    #[test]
+    fn global_review_includes_members_and_uses_only_selected_store() {
+        let root = fixture();
+        let external = tempfile::tempdir().unwrap();
+        let global = external.path().join("approved-builds.toml");
+        fs::write(&global, "[approved]\nmember='1.0.0'\nshared='1.0.0'\n").unwrap();
+        write(
+            root.path(),
+            "approved-builds.toml",
+            "[approved]\nbuild-only='1.0.0'\n",
+        );
+        let metadata = metadata_command(&ReviewOptions::default())
+            .manifest_path(root.path().join("Cargo.toml"))
+            .exec()
+            .unwrap();
+        let options = ReviewOptions {
+            global: true,
+            ..Default::default()
+        };
+        let global_queue = ReviewQueue::from_metadata(&metadata, &options, Some(&global)).unwrap();
+        assert_eq!(
+            global_queue.workspace_root,
+            metadata.workspace_root.as_std_path()
+        );
+        assert_eq!(global_queue.config.path(), global);
+        assert!(
+            global_queue
+                .packages
+                .iter()
+                .any(|p| p.name == "member" && p.approval.is_some())
+        );
+        assert!(
+            global_queue
+                .packages
+                .iter()
+                .any(|p| p.name == "build-only" && p.approval.is_none())
+        );
+        let member = super::super::ReviewSession::from_metadata(
+            &metadata,
+            "member@1.0.0",
+            &options,
+            Some(&global),
+        )
+        .unwrap();
+        assert_eq!(member.package.name, "member");
+        assert_eq!(member.workspace_root, global_queue.workspace_root);
+        assert_eq!(member.policy_notes, global_queue.policy_notes);
+        let workspace_queue =
+            ReviewQueue::from_metadata(&metadata, &ReviewOptions::default(), Some(&global))
+                .unwrap();
+        assert!(!workspace_queue.packages.iter().any(|p| p.name == "member"));
+        assert!(
+            workspace_queue
+                .packages
+                .iter()
+                .any(|p| p.name == "shared" && p.approval.is_none())
+        );
+        assert!(
+            workspace_queue
+                .packages
+                .iter()
+                .any(|p| p.name == "build-only" && p.approval.is_some())
+        );
+        assert!(
+            super::super::ReviewSession::from_metadata(
+                &metadata,
+                "member",
+                &ReviewOptions::default(),
+                Some(&global)
+            )
+            .is_err()
+        );
+        let dependency = super::super::ReviewSession::from_metadata(
+            &metadata,
+            "shared",
+            &ReviewOptions::default(),
+            Some(&global),
+        )
+        .unwrap();
+        assert!(dependency.package.approval.is_none());
     }
 
     #[test]
@@ -367,12 +473,14 @@ mod tests {
             .exec()
             .unwrap();
         let inactive =
-            ReviewQueue::from_metadata(&metadata, &crate::args::ReviewOptions::default()).unwrap();
+            ReviewQueue::from_metadata(&metadata, &crate::args::ReviewOptions::default(), None)
+                .unwrap();
         assert!(
             super::super::ReviewSession::from_metadata(
                 &metadata,
                 "leaf",
-                &ReviewOptions::default()
+                &ReviewOptions::default(),
+                None,
             )
             .is_err()
         );
@@ -390,9 +498,10 @@ mod tests {
                 .manifest_path(root.path().join("Cargo.toml"))
                 .exec()
                 .unwrap();
-            let active = ReviewQueue::from_metadata(&metadata, &options).unwrap();
+            let active = ReviewQueue::from_metadata(&metadata, &options, None).unwrap();
             let selected =
-                super::super::ReviewSession::from_metadata(&metadata, "leaf", &options).unwrap();
+                super::super::ReviewSession::from_metadata(&metadata, "leaf", &options, None)
+                    .unwrap();
             assert_eq!(selected.package.name, "leaf");
             let names: Vec<_> = active
                 .packages
@@ -428,7 +537,8 @@ mod tests {
     fn retains_multiple_versions_for_independent_review() {
         let (root, metadata) = super::super::tests::fixture();
         let queue =
-            ReviewQueue::from_metadata(&metadata, &crate::args::ReviewOptions::default()).unwrap();
+            ReviewQueue::from_metadata(&metadata, &crate::args::ReviewOptions::default(), None)
+                .unwrap();
         assert_eq!(
             queue
                 .packages

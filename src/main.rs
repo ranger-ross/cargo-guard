@@ -4,7 +4,7 @@ use eyre::Context;
 
 use crate::{
     args::{Args, Command as GuardCommand},
-    config::{ApprovedVersion, load_config},
+    config::{ApprovalScope, ApprovedVersion, LoadedApprovals, RunnerPaths},
     fingerprint::BuildScriptFingerprint,
 };
 
@@ -38,11 +38,16 @@ fn run(args: &[OsString]) -> eyre::Result<()> {
     let (binary, args) = args.split_first().ok_or_else(|| {
         eyre::eyre!("expected the build script binary path as the first argument")
     })?;
-    let root = config::determine_workspace_root()?;
-    let manifest = std::env::var_os("CARGO_MANIFEST_PATH")
-        .ok_or_else(|| eyre::eyre!("could not read CARGO_MANIFEST_PATH"))?;
-    if !workspace::contains_manifest(&root, Path::new(&manifest))? {
-        check_approval(Path::new(binary))?;
+    let paths = RunnerPaths::from_env()?;
+    let is_member = if let Some(root) = &paths.workspace_root {
+        let manifest = std::env::var_os("CARGO_MANIFEST_PATH")
+            .ok_or_else(|| eyre::eyre!("could not read CARGO_MANIFEST_PATH"))?;
+        workspace::contains_manifest(root, Path::new(&manifest))?
+    } else {
+        false
+    };
+    if !is_member {
+        check_approval(Path::new(binary), &config::load_runner_approvals(&paths)?)?;
     }
 
     let status = Command::new(binary)
@@ -53,12 +58,26 @@ fn run(args: &[OsString]) -> eyre::Result<()> {
     std::process::exit(status.code().unwrap_or(1));
 }
 
-fn check_approval(binary: &Path) -> eyre::Result<()> {
+fn check_approval(binary: &Path, approvals: &LoadedApprovals) -> eyre::Result<()> {
     let build_script = BuildScriptFingerprint::current(binary)?;
-
-    let config = load_config()?;
-
-    let approval = config.approved.get(&build_script.name);
+    let target = &approvals.target;
+    let flag = if target.scope == ApprovalScope::Global {
+        " --global"
+    } else {
+        ""
+    };
+    let guidance = || {
+        format!(
+            "Approvals ({}): {}\nRun cargo guard review{} {}@{} to review this script. If missing, this creates {}.",
+            target.scope,
+            target.path.display(),
+            flag,
+            build_script.name,
+            build_script.version,
+            target.path.display()
+        )
+    };
+    let approval = approvals.config.approved.get(&build_script.name);
     let version: semver::Version = build_script.version.parse()?;
     if approval.is_some_and(|a| a.allows_version(&version)) {
         return Ok(());
@@ -72,26 +91,25 @@ fn check_approval(binary: &Path) -> eyre::Result<()> {
         if approval.is_some_and(|a| a.allows_fingerprint(&fingerprint)) {
             return Ok(());
         }
+        let guidance = guidance();
         eyre::bail!(
-            "build script for {} v{} is not approved: fingerprint mismatch\nCurrent fingerprint: {}\nExisting approvals: {}\nAppend the current fingerprint or version to this package's approval list in approved-builds.toml.",
+            "build script for {} v{} is not approved: fingerprint mismatch\nCurrent fingerprint: {}\nExisting approvals: {}\n{guidance}",
             build_script.name,
             build_script.version,
             fingerprint,
             toml::Value::try_from(approval.unwrap())?
         );
     }
+    let guidance = guidance();
     match approval {
         Some(approval) => eyre::bail!(
-            "build script for {} v{} is not approved: no matching version\nExisting approvals: {}\nAppend \"{}\" to this package's approval list in approved-builds.toml (convert a single string to an array).",
+            "build script for {} v{} is not approved: no matching version\nExisting approvals: {}\n{guidance}",
             build_script.name,
             build_script.version,
-            toml::Value::try_from(approval)?,
-            build_script.version
+            toml::Value::try_from(approval)?
         ),
         None => eyre::bail!(
-            "build script for {0} v{1} is not approved: no approval entry\n\n\
-             To approve this version, add this entry under [approved] in approved-builds.toml:\n\n  \
-             {0} = \"{1}\"",
+            "build script for {0} v{1} is not approved: no approval entry\n{guidance}",
             build_script.name,
             build_script.version,
         ),

@@ -1,6 +1,9 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use super::app::{App, Decision};
+use super::{
+    app::{App, Decision},
+    diagnostic::Diagnostic,
+};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
@@ -26,16 +29,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
     }
     if key.code == KeyCode::Char('?') && key.kind == KeyEventKind::Press {
         app.show_help = !app.show_help;
+        app.help.reset_view();
         app.selection.clear();
         return Action::Continue;
     }
     if app.show_help {
-        match key.code {
-            KeyCode::Esc => app.show_help = false,
-            KeyCode::Char('q') => return Action::Quit,
-            _ => {}
-        }
-        return Action::Continue;
+        return handle_help_key(&mut app.show_help, &mut app.help, key);
     }
     if matches!(key.code, KeyCode::Char('a' | 'r')) && !app.can_decide() {
         return Action::Continue;
@@ -70,6 +69,25 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
         KeyCode::BackTab => app.switch_file(true),
         KeyCode::Char(']') => app.jump_change(false),
         KeyCode::Char('[') => app.jump_change(true),
+        _ => {}
+    }
+    Action::Continue
+}
+
+pub(super) fn handle_help_key(
+    show_help: &mut bool,
+    help: &mut Diagnostic,
+    key: KeyEvent,
+) -> Action {
+    match key.code {
+        KeyCode::Esc => *show_help = false,
+        KeyCode::Char('q') => return Action::Quit,
+        KeyCode::Down | KeyCode::Char('j') => help.scroll(1),
+        KeyCode::Up | KeyCode::Char('k') => help.scroll(-1),
+        KeyCode::PageDown => help.scroll(help.selection.area.height.max(1) as isize),
+        KeyCode::PageUp => help.scroll(-(help.selection.area.height.max(1) as isize)),
+        KeyCode::Home | KeyCode::Char('g') => help.scroll(isize::MIN),
+        KeyCode::End | KeyCode::Char('G') => help.scroll(isize::MAX),
         _ => {}
     }
     Action::Continue

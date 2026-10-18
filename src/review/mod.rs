@@ -1,11 +1,11 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use cargo_metadata::{Metadata, Package, PackageId, Source};
 use eyre::Context;
 
 use crate::{
     args::ReviewOptions,
-    config::{ApprovedVersion, edit::ConfigFile},
+    config::{self, ApprovalScope, ApprovalTarget, ApprovedVersion, edit::ConfigFile},
 };
 
 mod app;
@@ -26,6 +26,8 @@ mod verification;
 pub struct ReviewSession {
     pub package: ReviewPackage,
     pub config: ConfigFile,
+    pub workspace_root: PathBuf,
+    pub policy_notes: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -46,6 +48,8 @@ pub struct BuildScript {
 }
 
 pub fn run(package: Option<&str>, options: &ReviewOptions) -> eyre::Result<()> {
+    let cwd = std::env::current_dir().context("could not determine review working directory")?;
+    let global_path = config::review_global_path(&cwd)?;
     // Full metadata includes dependency packages, not just workspace members.
     // This resolves/downloads sources but does not compile or execute scripts.
     let metadata = discovery::metadata_command(options)
@@ -58,7 +62,8 @@ pub fn run(package: Option<&str>, options: &ReviewOptions) -> eyre::Result<()> {
             .into_iter()
             .filter(|p| p.name.as_str() == name && version.as_ref().is_none_or(|v| v == &p.version))
             .collect();
-        if !named.is_empty()
+        if !options.global
+            && !named.is_empty()
             && named
                 .iter()
                 .all(|p| crate::workspace::is_member(&metadata, p))
@@ -68,10 +73,23 @@ pub fn run(package: Option<&str>, options: &ReviewOptions) -> eyre::Result<()> {
             );
             return Ok(());
         }
-        let session = ReviewSession::from_metadata(&metadata, selector, options)?;
+        let session =
+            ReviewSession::from_metadata(&metadata, selector, options, global_path.as_deref())?;
+        let global_target = if options.global {
+            None
+        } else {
+            Some(config::review_target(
+                &session.workspace_root,
+                true,
+                global_path.as_deref(),
+            )?)
+        };
         tui::run(discovery::ReviewQueue {
             packages: vec![session.package],
             config: session.config,
+            workspace_root: session.workspace_root,
+            policy_notes: session.policy_notes,
+            global_target,
             build_directory: metadata
                 .build_directory
                 .as_ref()
@@ -80,7 +98,15 @@ pub fn run(package: Option<&str>, options: &ReviewOptions) -> eyre::Result<()> {
                 .into_std_path_buf(),
         })
     } else {
-        let queue = discovery::ReviewQueue::from_metadata(&metadata, options)?;
+        let mut queue =
+            discovery::ReviewQueue::from_metadata(&metadata, options, global_path.as_deref())?;
+        if !options.global && queue.global_target.is_none() {
+            queue.global_target = Some(config::review_target(
+                &queue.workspace_root,
+                true,
+                global_path.as_deref(),
+            )?);
+        }
         tui::run_queue(queue)
     }
 }
@@ -90,13 +116,14 @@ impl ReviewSession {
         metadata: &Metadata,
         name: &str,
         options: &ReviewOptions,
+        global_path: Option<&Path>,
     ) -> eyre::Result<Self> {
         let (name, version) = package_selector(name)?;
         let mut candidates: Vec<_> = discovery::resolved_packages(metadata, options)?
             .into_iter()
             .filter(|package| package.name.as_str() == name)
             .filter(|package| version.as_ref().is_none_or(|v| v == &package.version))
-            .filter(|package| !crate::workspace::is_member(metadata, package))
+            .filter(|package| options.global || !crate::workspace::is_member(metadata, package))
             .collect();
         candidates.sort_by(|a, b| {
             a.version
@@ -107,7 +134,7 @@ impl ReviewSession {
             && metadata.packages.iter().any(|package| {
                 package.name.as_str() == name
                     && version.as_ref().is_none_or(|v| v == &package.version)
-                    && !crate::workspace::is_member(metadata, package)
+                    && (options.global || !crate::workspace::is_member(metadata, package))
             })
         {
             eyre::bail!(
@@ -130,14 +157,25 @@ impl ReviewSession {
         let package = candidates[0];
         // Review discovers the consuming workspace itself, rather than relying
         // on build-runner environment variables or a dependency's manifest dir.
-        let config = ConfigFile::for_workspace(metadata.workspace_root.as_std_path())?;
+        let workspace_root = metadata.workspace_root.clone().into_std_path_buf();
+        let config = ConfigFile::open(config::review_target(
+            &workspace_root,
+            options.global,
+            global_path,
+        )?)?;
+        let policy_notes = policy_notes(&workspace_root, config.target(), global_path)?;
         let package = ReviewPackage::from_package(package, &config);
         eyre::ensure!(
             !package.scripts.is_empty(),
             "package `{name}` v{} has no build scripts",
             package.version
         );
-        Ok(Self { package, config })
+        Ok(Self {
+            package,
+            config,
+            workspace_root,
+            policy_notes,
+        })
     }
 }
 
@@ -170,6 +208,46 @@ impl ReviewPackage {
     }
 }
 
+fn policy_notes(
+    root: &Path,
+    target: &ApprovalTarget,
+    global_path: Option<&Path>,
+) -> eyre::Result<Vec<String>> {
+    let workspace_path = config::config_path(root);
+    let workspace_exists = match std::fs::symlink_metadata(&workspace_path) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "could not inspect workspace approvals {}",
+                    workspace_path.display()
+                )
+            });
+        }
+    };
+    let mut notes = Vec::new();
+    match target.scope {
+        ApprovalScope::Global => {
+            notes.push("Global approvals apply across projects; version pins apply by package name and version across sources.".into());
+            notes.push("Fingerprints with relative compiler inputs require CARGO_GUARD_WORKSPACE_ROOT during builds.".into());
+            if global_path.is_none() {
+                notes.push(format!("Global approvals are not enabled for builds. Set CARGO_GUARD_GLOBAL_APPROVED_BUILDS_PATH to {} in Cargo [env] configuration.", target.path.display()));
+            }
+            if workspace_exists {
+                notes.push(format!("Builds configured with CARGO_GUARD_WORKSPACE_ROOT={} use {} instead of this global file.", root.display(), workspace_path.display()));
+            }
+        }
+        ApprovalScope::Workspace => {
+            notes.push("Workspace approvals require CARGO_GUARD_WORKSPACE_ROOT during builds; use --global for a global-only setup.".into());
+            if global_path.is_some() && !workspace_exists {
+                notes.push(format!("The first workspace approval makes {} authoritative for builds configured with this workspace root; global approvals will no longer fill missing entries.", workspace_path.display()));
+            }
+        }
+    }
+    Ok(notes)
+}
+
 fn package_selector(selector: &str) -> eyre::Result<(&str, Option<semver::Version>)> {
     match selector.rsplit_once('@') {
         Some((name, version)) => Ok((
@@ -198,6 +276,7 @@ mod tests {
             &metadata,
             "duplicate@2.0.0",
             &crate::args::ReviewOptions::default(),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -205,12 +284,22 @@ mod tests {
             "2.0.0".parse::<semver::Version>().unwrap()
         );
         assert!(
-            ReviewSession::from_metadata(&metadata, "duplicate@3.0.0", &ReviewOptions::default())
-                .is_err()
+            ReviewSession::from_metadata(
+                &metadata,
+                "duplicate@3.0.0",
+                &ReviewOptions::default(),
+                None
+            )
+            .is_err()
         );
         assert!(
-            ReviewSession::from_metadata(&metadata, "duplicate@invalid", &ReviewOptions::default())
-                .is_err()
+            ReviewSession::from_metadata(
+                &metadata,
+                "duplicate@invalid",
+                &ReviewOptions::default(),
+                None
+            )
+            .is_err()
         );
     }
 
@@ -298,11 +387,15 @@ mod tests {
                 metadata,
                 "default-script",
                 &crate::args::ReviewOptions::default(),
+                None,
             )
             .unwrap();
             let mut state = QueueState::new(ReviewQueue {
                 packages: vec![session.package],
                 config: session.config,
+                workspace_root: session.workspace_root,
+                policy_notes: session.policy_notes,
+                global_target: None,
                 build_directory: metadata
                     .build_directory
                     .as_ref()
@@ -377,6 +470,7 @@ mod tests {
             &upgraded,
             "default-script",
             &crate::args::ReviewOptions::default(),
+            None,
         )
         .unwrap();
         assert!(
@@ -392,6 +486,7 @@ mod tests {
             &metadata,
             "default-script",
             &crate::args::ReviewOptions::default(),
+            None,
         )
         .unwrap();
         assert_eq!(session.package.scripts.len(), 1);
@@ -411,6 +506,7 @@ mod tests {
             &metadata,
             "custom-script",
             &crate::args::ReviewOptions::default(),
+            None,
         )
         .unwrap();
         assert_eq!(session.package.version, semver::Version::new(2, 0, 0));
@@ -440,6 +536,7 @@ mod tests {
                 &metadata,
                 name,
                 &crate::args::ReviewOptions::default(),
+                None,
             )
             .err()
             .unwrap()
@@ -475,6 +572,7 @@ mod tests {
             &metadata,
             "custom-script",
             &crate::args::ReviewOptions::default(),
+            None,
         )
         .unwrap();
         assert_eq!(session.package.scripts.len(), 2);

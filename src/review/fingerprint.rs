@@ -139,11 +139,7 @@ impl ArtifactIndex {
 
 /// Use already-compiled inputs; reviewing must never run a build script.
 pub fn approvals(session: &ReviewSession) -> eyre::Result<Vec<ApprovedVersion>> {
-    let root = session
-        .config
-        .path()
-        .parent()
-        .context("approval file has no parent")?;
+    let root = &session.workspace_root;
     let metadata = cargo_metadata::MetadataCommand::new()
         .current_dir(root)
         .manifest_path(root.join("Cargo.toml"))
@@ -257,7 +253,7 @@ fn calculate(
         };
         check_fresh()?;
         let fingerprint =
-            fingerprint::from_dep_info(&package.manifest_path, contents, root, &version)?;
+            fingerprint::from_dep_info(&package.manifest_path, contents, Some(root), &version)?;
         let source = fs::read_to_string(&script.path)?;
         let mut snapshot_hash = String::with_capacity(64);
         fingerprint::append_hex(&mut snapshot_hash, &Sha256::digest(source.as_bytes()));
@@ -379,11 +375,35 @@ mod tests {
         (root, app, artifact)
     }
 
+    #[test]
+    fn global_approvals_find_artifacts_in_the_consuming_workspace() {
+        use crate::config::{ApprovalScope, ApprovalTarget, edit::ConfigFile};
+
+        let (root, mut app, _artifact) = compiled_fixture();
+        let global = tempfile::tempdir().unwrap();
+        let path = global.path().join("approved-builds.toml");
+        app.session.config = ConfigFile::open(ApprovalTarget {
+            path: path.clone(),
+            scope: ApprovalScope::Global,
+        })
+        .unwrap();
+        app.decide(Decision::ApproveFingerprint).unwrap();
+        let saved = crate::config::load_config_from(&path).unwrap();
+        assert!(saved.approved.contains_key("example"));
+        let mut index = ArtifactIndex::new(root.path().join("target"));
+        assert!(matches!(
+            verify_saved(&app, &mut index),
+            Verification::Verified(_)
+        ));
+        assert!(!root.path().join("approved-builds.toml").exists());
+        assert!(!global.path().join("target").exists());
+    }
+
     fn verify_saved(app: &App, index: &mut ArtifactIndex) -> Verification {
         index.verify(
             &app.session.package,
             &app.session.config.config().approved["example"],
-            app.session.config.path().parent().unwrap(),
+            &app.session.workspace_root,
             &AtomicBool::new(false),
         )
     }
@@ -739,7 +759,7 @@ mod tests {
         let expected = fingerprint::from_dep_info(
             &app.session.package.manifest_path,
             &fs::read_to_string(&artifact).unwrap(),
-            root.path(),
+            Some(root.path()),
             &app.session.package.version.to_string(),
         )
         .unwrap();
@@ -773,8 +793,10 @@ mod tests {
         let (root, mut app, _artifact) = compiled_fixture();
         app.decide(Decision::ApproveFingerprint).unwrap();
         let session = ReviewSession {
+            workspace_root: app.session.workspace_root.clone(),
+            policy_notes: app.session.policy_notes.clone(),
             package: app.session.package.clone(),
-            config: ConfigFile::open(app.session.config.path()).unwrap(),
+            config: ConfigFile::open(app.session.config.target().clone()).unwrap(),
         };
         let mut reopened = App::new(session).unwrap();
         assert_eq!(reopened.decision, None);

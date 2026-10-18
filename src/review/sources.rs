@@ -114,12 +114,7 @@ impl BaselineLoader {
                 .source
                 .as_ref()
                 .map(|source| source.repr.clone()),
-            workspace_root: session
-                .config
-                .path()
-                .parent()
-                .context("approval file has no parent")?
-                .to_path_buf(),
+            workspace_root: session.workspace_root.clone(),
             fingerprints: match session
                 .package
                 .approval
@@ -396,7 +391,7 @@ fn verify_fingerprint_baseline(
                     let fingerprint = match fingerprint::from_dep_info(
                         manifest_path,
                         &mapped,
-                        &root,
+                        Some(&root),
                         &version_string,
                     ) {
                         Ok(fingerprint) => fingerprint,
@@ -623,6 +618,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn global_history_uses_the_consuming_workspaces_source_configuration() {
+        use crate::config::{ApprovalScope, ApprovalTarget, edit::ConfigFile};
+
+        let (root, mut app) = super::super::app::tests::fixture(&["fn main() {}"]);
+        let global = tempfile::tempdir().unwrap();
+        app.session.config = ConfigFile::open(ApprovalTarget {
+            path: global.path().join("approved-builds.toml"),
+            scope: ApprovalScope::Global,
+        })
+        .unwrap();
+        let historical = root.path().join("vendor/example");
+        fs::create_dir_all(historical.join("src")).unwrap();
+        fs::write(
+            historical.join("Cargo.toml"),
+            "[package]\nname='example'\nversion='0.0.1'\nedition='2024'\n",
+        )
+        .unwrap();
+        fs::write(historical.join("src/lib.rs"), "").unwrap();
+        let contents = "compile_error!(\"historical scripts must not execute\");\n";
+        fs::write(historical.join("build.rs"), contents).unwrap();
+        fs::write(
+            historical.join(".cargo-checksum.json"),
+            r#"{"files":{},"package":null}"#,
+        )
+        .unwrap();
+        fs::create_dir(root.path().join(".cargo")).unwrap();
+        fs::write(
+            root.path().join(".cargo/config.toml"),
+            format!(
+                "[net]\noffline=true\n[source.crates-io]\nreplace-with='fixture'\n\
+                 [source.fixture]\ndirectory={}\n",
+                toml::Value::String(root.path().join("vendor").display().to_string())
+            ),
+        )
+        .unwrap();
+        app.session.package.source = Some(cargo_metadata::Source {
+            repr: "registry+https://github.com/rust-lang/crates.io-index".into(),
+        });
+        app.session.package.approval = Some(ApprovedVersion::SemVer("0.0.1".parse().unwrap()));
+        let loader = BaselineLoader::start(&app.session).unwrap().unwrap();
+        let result = loader
+            .receiver
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap();
+        let Baseline::Ready(sources) = result else {
+            panic!("expected historical sources, got {result:?}");
+        };
+        assert_eq!(sources.version, "0.0.1".parse::<semver::Version>().unwrap());
+        assert_eq!(sources.scripts.len(), 1);
+        assert_eq!(sources.scripts[0].path, Path::new("build.rs"));
+        assert_eq!(sources.scripts[0].contents, contents);
+        assert!(!global.path().join("target").exists());
+        assert!(!app.session.config.path().exists());
+    }
+
+    #[test]
     fn skips_unneeded_loads_and_reports_unsupported_history() {
         let (_root, mut app) = super::super::app::tests::fixture(&["fn main() {}"]);
         assert!(BaselineLoader::start(&app.session).unwrap().is_none());
@@ -786,7 +837,8 @@ mod tests {
             for (name, entry) in &targets {
                 let dep_info = format!("binary: {} helper\\ file.rs\n", entry.display());
                 approvals.push(
-                    fingerprint::from_dep_info(&manifest, &dep_info, &baseline, "1.0.0").unwrap(),
+                    fingerprint::from_dep_info(&manifest, &dep_info, Some(&baseline), "1.0.0")
+                        .unwrap(),
                 );
                 let artifact = directory
                     .path()
@@ -1007,7 +1059,7 @@ mod tests {
             fingerprint::from_dep_info(
                 &fixture.manifest,
                 "binary: scripts/first.rs helper\\ file.rs feature.rs\n",
-                baseline,
+                Some(baseline),
                 "1.0.0",
             )
             .unwrap(),

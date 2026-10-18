@@ -81,20 +81,14 @@ impl BuildScriptFingerprint {
             return Ok(fingerprint.clone());
         }
 
-        let manifest_dir = self
-            .manifest_path
-            .parent()
-            .context("manifest has no parent")?;
         let dep_info = fs::read_to_string(&self.dep_info_path)
             .with_context(|| format!("could not read dep-info {}", self.dep_info_path.display()))?;
 
-        let dep_info_root = env::var_os("CARGO_GUARD_WORKSPACE_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| manifest_dir.to_path_buf());
+        let dep_info_root = env::var_os("CARGO_GUARD_WORKSPACE_ROOT").map(PathBuf::from);
         let fingerprint = from_dep_info(
             &self.manifest_path,
             &dep_info,
-            &dep_info_root,
+            dep_info_root.as_deref(),
             &self.version,
         )?;
         *self.fingerprint.borrow_mut() = Some(fingerprint.clone());
@@ -105,7 +99,7 @@ impl BuildScriptFingerprint {
 pub(crate) fn from_dep_info(
     manifest_path: &Path,
     dep_info: &str,
-    dep_info_root: &Path,
+    dep_info_root: Option<&Path>,
     version: &str,
 ) -> eyre::Result<String> {
     semver::Version::parse(version).context("invalid package version")?;
@@ -255,7 +249,7 @@ fn fingerprint_inputs(
     dependencies: &toml::Value,
     manifest_dir: &Path,
     dep_info: &str,
-    dep_info_root: &Path,
+    dep_info_root: Option<&Path>,
     version: &str,
 ) -> eyre::Result<String> {
     let scripts = match manifest.get("package").and_then(|p| p.get("build")) {
@@ -282,9 +276,17 @@ fn fingerprint_inputs(
         .context("could not resolve manifest directory")?;
     let mut inputs = BTreeSet::new();
     for file in parse_dep_info(dep_info)? {
-        let path = dep_info_root
-            .join(&file)
-            .canonicalize()
+        let path = match dep_info_root {
+            Some(root) => root.join(&file).canonicalize(),
+            None => {
+                eyre::ensure!(
+                    file.is_absolute(),
+                    "cannot resolve relative build-script input {} without CARGO_GUARD_WORKSPACE_ROOT; set it to the consuming workspace's absolute path (no workspace approval file is required)",
+                    file.display()
+                );
+                file.canonicalize()
+            }
+        }
             .with_context(|| format!("could not resolve tracked file {}", file.display()))?;
         inputs.insert(path);
     }
@@ -380,7 +382,7 @@ mod tests {
             dependencies,
             manifest_dir,
             dep_info,
-            manifest_dir,
+            Some(manifest_dir),
             "1.0.0",
         )
     }
@@ -408,7 +410,7 @@ mod tests {
                 &manifest,
                 &package,
                 "binary: dep/first.rs dep/helper.rs\n",
-                root.path(),
+                Some(root.path()),
                 "1.0.0",
             )
             .unwrap()
@@ -419,7 +421,7 @@ mod tests {
                 &manifest,
                 &package,
                 "binary: dep/second.rs\n",
-                root.path(),
+                Some(root.path()),
                 "1.0.0",
             )
             .unwrap()
@@ -496,7 +498,11 @@ mod tests {
 
         fs::create_dir_all(&root).unwrap();
         fs::write(&script.manifest_path, "[package]\nname = 'example'\n").unwrap();
-        fs::write(&script.dep_info_path, "out: build.rs\n").unwrap();
+        fs::write(
+            &script.dep_info_path,
+            format!("out: {}\n", root.join("build.rs").display()),
+        )
+        .unwrap();
         fs::write(root.join("build.rs"), "fn main() {}\n").unwrap();
         let hash = script.fingerprint().unwrap();
         assert_eq!(script.fingerprint.borrow().as_ref(), Some(&hash));
@@ -545,7 +551,7 @@ mod tests {
             &manifest,
             root.path(),
             dep_info,
-            root.path(),
+            Some(root.path()),
             "1.1.0",
         )
         .unwrap();
@@ -643,14 +649,54 @@ mod tests {
         let manifest = root.path().join("Cargo.toml");
         fs::write(&manifest, "[package]\nversion.workspace = true\n").unwrap();
         fs::write(root.path().join("build.rs"), "fn main() {}\n").unwrap();
-        let fingerprint =
-            from_dep_info(&manifest, "out: build.rs\n", root.path(), "1.2.3+release").unwrap();
+        let fingerprint = from_dep_info(
+            &manifest,
+            "out: build.rs\n",
+            Some(root.path()),
+            "1.2.3+release",
+        )
+        .unwrap();
         assert_eq!(
             ParsedFingerprint::parse(&fingerprint).unwrap().version,
             semver::Version::parse("1.2.3+release").unwrap()
         );
         for invalid in ["", "1", "1.2", "v1.2.3", "01.2.3", "1.2.3\n"] {
-            assert!(from_dep_info(&manifest, "out: build.rs\n", root.path(), invalid).is_err());
+            assert!(
+                from_dep_info(&manifest, "out: build.rs\n", Some(root.path()), invalid).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn rootless_fingerprints_require_absolute_inputs() {
+        let root = tempfile::tempdir().unwrap();
+        let manifest = root.path().join("Cargo.toml");
+        fs::write(&manifest, "[package]\nname='example'\nversion='1.0.0'\n").unwrap();
+        fs::write(root.path().join("build.rs"), "fn main() {}").unwrap();
+        fs::write(root.path().join("helper.rs"), "const X: u8 = 1;").unwrap();
+        let absolute = format!(
+            "out: {} {}\n",
+            root.path().join("build.rs").display(),
+            root.path().join("helper.rs").display()
+        );
+        let expected = from_dep_info(&manifest, &absolute, Some(root.path()), "1.0.0").unwrap();
+        assert_eq!(
+            from_dep_info(&manifest, &absolute, None, "1.0.0").unwrap(),
+            expected
+        );
+        for inputs in [
+            "out: build.rs helper.rs\n".to_owned(),
+            format!(
+                "out: {} helper.rs\n",
+                root.path().join("build.rs").display()
+            ),
+        ] {
+            let error = from_dep_info(&manifest, &inputs, None, "1.0.0").unwrap_err();
+            assert!(error.to_string().contains("CARGO_GUARD_WORKSPACE_ROOT"));
+            assert_eq!(
+                from_dep_info(&manifest, &inputs, Some(root.path()), "1.0.0").unwrap(),
+                expected
+            );
         }
     }
 

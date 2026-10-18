@@ -9,7 +9,7 @@ use super::{
     selection::Selection,
     sources::{Baseline, ScriptSource},
 };
-use crate::config::ApprovedVersion;
+use crate::config::{ApprovalScope, ApprovedVersion};
 use eyre::Context;
 
 pub struct App {
@@ -27,10 +27,12 @@ pub struct App {
     pub decision: Option<Decision>,
     pub notice: Option<Notice>,
     pub show_help: bool,
+    pub help: Diagnostic,
     pub queue_mode: bool,
     pub decision_blocked: Option<String>,
     pub verification_message: Option<String>,
     pub verification_pending: bool,
+    pub globally_approved: bool,
     pub selection: Selection,
     pub diagnostic: Diagnostic,
     pub pin_dialog: Option<PinDialog>,
@@ -57,10 +59,12 @@ impl App {
             decision: None,
             notice: None,
             show_help: false,
+            help: Diagnostic::default(),
             queue_mode: false,
             decision_blocked: None,
             verification_message: None,
             verification_pending: false,
+            globally_approved: false,
             selection: Selection::default(),
             diagnostic: Diagnostic::default(),
             pin_dialog: None,
@@ -73,6 +77,7 @@ impl App {
 
     /// Refresh the edit snapshot without discarding unchanged verified sources.
     pub fn refresh(&mut self, session: ReviewSession) -> eyre::Result<()> {
+        self.globally_approved = false;
         self.pin_dialog = None;
         self.selection.clear();
         self.diagnostic.reset_view();
@@ -110,6 +115,7 @@ impl App {
         if current.as_slice() == self.current.as_ref() {
             return Ok(false);
         }
+        self.globally_approved = false;
         self.pin_dialog = None;
         let baseline = Baseline::for_session(&self.session);
         let files = diff::build_files(&current, &baseline, &self.highlighter)?;
@@ -184,8 +190,10 @@ impl App {
                     .config
                     .remove_version(&package.name, &package.version)?;
                 format!(
-                    "Rejected {} v{}; its approval was removed",
-                    package.name, package.version
+                    "Rejected {} v{}; its approval was removed from {}",
+                    package.name,
+                    package.version,
+                    self.session.config.path().display()
                 )
             }
             Decision::Reject => match &package.approval {
@@ -282,6 +290,17 @@ impl App {
     pub fn is_current_fingerprint_approved(&self) -> bool {
         matches!(self.baseline, Baseline::CurrentFingerprint(_))
             || self.decision == Some(Decision::ApproveFingerprint)
+    }
+
+    /// Display supplemental approval without changing the selected write destination.
+    pub fn displayed_approval_scope(&self) -> Option<ApprovalScope> {
+        if self.is_current_version_approved() || self.is_current_fingerprint_approved() {
+            Some(self.session.config.target().scope)
+        } else if self.globally_approved {
+            Some(ApprovalScope::Global)
+        } else {
+            None
+        }
     }
 
     pub fn can_decide(&self) -> bool {
@@ -414,10 +433,11 @@ impl App {
         self.pin_dialog = None;
         self.notice = Some(Notice {
             message: format!(
-                "Approved {} fingerprint(s) for {} v{}",
+                "Approved {} fingerprint(s) for {} v{}; saved to {}",
                 approvals.len(),
                 self.session.package.name,
-                self.session.package.version
+                self.session.package.version,
+                self.session.config.path().display()
             ),
             is_error: false,
         });
@@ -489,6 +509,8 @@ pub(super) mod tests {
             });
         }
         let session = ReviewSession {
+            workspace_root: root.path().to_path_buf(),
+            policy_notes: Vec::new(),
             package: ReviewPackage {
                 id: cargo_metadata::PackageId {
                     repr: "path+file:///example#0.1.0".into(),
@@ -503,6 +525,76 @@ pub(super) mod tests {
             config: ConfigFile::for_workspace(root.path()).unwrap(),
         };
         (root, App::new(session).unwrap())
+    }
+
+    #[test]
+    fn global_indicator_keeps_workspace_approval_actionable_and_local() {
+        let (_root, mut app) = fixture(&["fn main() {}\n"]);
+        assert!(!app.globally_approved);
+        app.globally_approved = true;
+        assert_eq!(app.displayed_approval_scope(), Some(ApprovalScope::Global));
+        assert!(app.can_decide());
+        assert!(app.session.package.approval.is_none());
+        assert!(matches!(app.baseline, Baseline::NewPackage));
+        let destination = app.session.config.path().to_path_buf();
+
+        app.decide(Decision::PinVersion).unwrap();
+        assert_eq!(app.session.config.path(), destination);
+        assert_eq!(app.session.config.target().scope, ApprovalScope::Workspace);
+        assert_eq!(
+            app.displayed_approval_scope(),
+            Some(ApprovalScope::Workspace)
+        );
+        let saved = crate::config::load_config_from(&destination).unwrap();
+        assert!(
+            matches!(&saved.approved["example"], ApprovedVersion::SemVer(v) if v == &app.session.package.version)
+        );
+        assert!(!app.can_decide());
+
+        app.decide(Decision::Reject).unwrap();
+        assert!(app.globally_approved);
+        assert!(app.session.package.approval.is_none());
+        assert!(
+            crate::config::load_config_from(&destination)
+                .unwrap()
+                .approved
+                .is_empty()
+        );
+        assert_eq!(app.decision, Some(Decision::Reject));
+    }
+
+    #[test]
+    fn rejecting_supplemental_approval_does_not_create_workspace_policy() {
+        let (_root, mut app) = fixture(&["fn main() {}\n"]);
+        app.globally_approved = true;
+        app.decide(Decision::Reject).unwrap();
+        assert!(!app.session.config.path().exists());
+        assert!(app.globally_approved);
+        assert!(app.session.package.approval.is_none());
+        assert!(matches!(app.baseline, Baseline::NewPackage));
+    }
+
+    #[test]
+    fn source_changes_clear_supplemental_approval() {
+        let (_root, mut app) = fixture(&["fn main() {}\n"]);
+        app.globally_approved = true;
+        assert!(!app.refresh_sources().unwrap());
+        assert!(app.globally_approved);
+        fs::write(&app.session.package.scripts[0].path, "fn main() { }").unwrap();
+        assert!(app.refresh_sources().unwrap());
+        assert!(!app.globally_approved);
+        assert_eq!(app.displayed_approval_scope(), None);
+    }
+
+    #[test]
+    fn refreshed_sessions_require_supplemental_approval_to_be_reestablished() {
+        let (_root, mut app) = fixture(&["fn main() {}\n"]);
+        let (_next_root, next) = fixture(&["fn main() {}\n"]);
+        app.globally_approved = true;
+        app.refresh(next.session).unwrap();
+        assert!(!app.globally_approved);
+        assert!(app.can_decide());
+        assert_eq!(app.displayed_approval_scope(), None);
     }
 
     #[test]
@@ -631,6 +723,39 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn global_version_removal_and_failed_saves_leave_workspace_policy_untouched() {
+        use crate::config::{ApprovalScope, ApprovalTarget};
+
+        let (root, mut app) = fixture(&["fn main() {}\n"]);
+        let workspace = root.path().join("approved-builds.toml");
+        let workspace_policy = "[approved]\nexample = '0.1.0'\n";
+        fs::write(&workspace, workspace_policy).unwrap();
+        let global = tempfile::tempdir().unwrap();
+        let path = global.path().join("approved-builds.toml");
+        app.session.config = ConfigFile::open(ApprovalTarget {
+            path: path.clone(),
+            scope: ApprovalScope::Global,
+        })
+        .unwrap();
+        fs::write(&path, "[approved]\nother = '1.0.0'\n").unwrap();
+        let before = fs::read(&path).unwrap();
+        assert!(app.decide(Decision::PinVersion).is_err());
+        assert_eq!(app.decision, None);
+        assert!(app.session.package.approval.is_none());
+        assert_eq!(fs::read(&path).unwrap(), before);
+
+        app.session.config = ConfigFile::open(app.session.config.target().clone()).unwrap();
+        app.decide(Decision::PinVersion).unwrap();
+        app.decide(Decision::Reject).unwrap();
+        let saved = crate::config::load_config_from(&path).unwrap();
+        assert!(!saved.approved.contains_key("example"));
+        assert!(saved.approved.contains_key("other"));
+        assert_eq!(fs::read_to_string(&workspace).unwrap(), workspace_policy);
+        assert_eq!(app.session.workspace_root, root.path());
+        assert_eq!(app.session.config.target().scope, ApprovalScope::Global);
+    }
+
+    #[test]
     fn save_failures_leave_decisions_and_approvals_unchanged() {
         let (_root, mut app) = fixture(&["fn main() {}\n"]);
         fs::write(app.session.config.path(), "[approved]\nother = '1.0.0'\n").unwrap();
@@ -642,7 +767,7 @@ pub(super) mod tests {
         assert!(app.session.package.approval.is_none());
         assert_eq!(fs::read(app.session.config.path()).unwrap(), before);
 
-        app.session.config = ConfigFile::open(app.session.config.path()).unwrap();
+        app.session.config = ConfigFile::open(app.session.config.target().clone()).unwrap();
         assert!(app.decide(Decision::PinVersion).unwrap());
         let changed = format!(
             "{}\n# external edit\n",
