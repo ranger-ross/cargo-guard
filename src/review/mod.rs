@@ -18,6 +18,7 @@ mod queue;
 mod sources;
 mod tui;
 mod ui;
+mod verification;
 
 pub struct ReviewSession {
     pub package: ReviewPackage,
@@ -64,7 +65,17 @@ pub fn run(package: Option<&str>, options: &ReviewOptions) -> eyre::Result<()> {
             );
             return Ok(());
         }
-        tui::run(ReviewSession::from_metadata(&metadata, selector, options)?)
+        let session = ReviewSession::from_metadata(&metadata, selector, options)?;
+        tui::run(discovery::ReviewQueue {
+            packages: vec![session.package],
+            config: session.config,
+            build_directory: metadata
+                .build_directory
+                .as_ref()
+                .unwrap_or(&metadata.target_directory)
+                .clone()
+                .into_std_path_buf(),
+        })
     } else {
         let queue = discovery::ReviewQueue::from_metadata(&metadata, options)?;
         tui::run_queue(queue)
@@ -270,44 +281,56 @@ mod tests {
     #[test]
     fn single_package_review_workflow_persists_decisions_and_reopens() {
         use super::{
-            app::{App, Decision},
+            app::Decision,
             diff::FileStatus,
-            input::{self, Action},
+            discovery::ReviewQueue,
+            input::Action,
+            queue::QueueState,
             sources::{Baseline, PackageSources, ScriptSource},
         };
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+        fn open(metadata: &Metadata) -> QueueState {
+            let session = ReviewSession::from_metadata(
+                metadata,
+                "default-script",
+                &crate::args::ReviewOptions::default(),
+            )
+            .unwrap();
+            let mut state = QueueState::new(ReviewQueue {
+                packages: vec![session.package],
+                config: session.config,
+                build_directory: metadata
+                    .build_directory
+                    .as_ref()
+                    .unwrap_or(&metadata.target_directory)
+                    .clone()
+                    .into_std_path_buf(),
+            });
+            state.app.as_mut().unwrap().queue_mode = false;
+            state
+        }
+
         let (root, metadata) = fixture();
         let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
-        let mut app = App::new(
-            ReviewSession::from_metadata(
-                &metadata,
-                "default-script",
-                &crate::args::ReviewOptions::default(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        let mut state = open(&metadata);
+        let app = state.app.as_ref().unwrap();
+        let config_path = app.session.config.path().to_path_buf();
         assert_eq!(app.file().status, FileStatus::Added);
+        for navigation in ['j', 'k', 's'] {
+            assert_eq!(state.handle_key(key(navigation)), Action::Continue);
+        }
         assert_eq!(
-            input::handle_key(&mut app, key('a')),
+            state.handle_key(key('a')),
             Action::Decide(Decision::Approve)
         );
-        app.decide(Decision::Approve).unwrap();
-        let saved = fs::read(app.session.config.path()).unwrap();
-        let mut reopened = App::new(
-            ReviewSession::from_metadata(
-                &metadata,
-                "default-script",
-                &crate::args::ReviewOptions::default(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        assert!(reopened.is_current_version_approved());
-        assert_eq!(input::handle_key(&mut reopened, key('r')), Action::Continue);
-        assert_eq!(input::handle_key(&mut reopened, key('q')), Action::Quit);
-        assert_eq!(fs::read(reopened.session.config.path()).unwrap(), saved);
+        assert!(state.decide(Decision::Approve).unwrap());
+        let saved = fs::read(&config_path).unwrap();
+        let mut reopened = open(&metadata);
+        assert!(reopened.app.as_ref().unwrap().is_current_version_approved());
+        assert_eq!(reopened.handle_key(key('r')), Action::Continue);
+        assert_eq!(reopened.handle_key(key('q')), Action::Quit);
+        assert_eq!(fs::read(&config_path).unwrap(), saved);
 
         let manifest_path = root.path().join("deps/default/Cargo.toml");
         let manifest = fs::read_to_string(&manifest_path)
@@ -319,17 +342,10 @@ mod tests {
             .other_options(vec!["--offline".into()])
             .exec()
             .unwrap();
-        let mut app = App::new(
-            ReviewSession::from_metadata(
-                &upgraded,
-                "default-script",
-                &crate::args::ReviewOptions::default(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        let mut state = open(&upgraded);
         // Supply the fixture's previous source snapshot; real registry retrieval
         // is exercised separately by the source-loading tests.
+        let app = state.app.as_mut().unwrap();
         app.set_baseline(Baseline::Ready(PackageSources {
             version: "1.0.0".parse().unwrap(),
             scripts: vec![ScriptSource {
@@ -340,23 +356,12 @@ mod tests {
         .unwrap();
         assert_eq!(app.file().status, FileStatus::Unchanged);
         assert!(app.can_decide());
-        assert_eq!(
-            input::handle_key(&mut app, key('r')),
-            Action::Decide(Decision::Reject)
-        );
-        app.decide(Decision::Reject).unwrap();
-        assert_eq!(fs::read(app.session.config.path()).unwrap(), saved);
+        assert_eq!(state.handle_key(key('r')), Action::Decide(Decision::Reject));
+        assert!(state.decide(Decision::Reject).unwrap());
+        assert_eq!(fs::read(&config_path).unwrap(), saved);
 
-        let mut app = App::new(
-            ReviewSession::from_metadata(
-                &upgraded,
-                "default-script",
-                &crate::args::ReviewOptions::default(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        app.decide(Decision::Approve).unwrap();
+        let mut state = open(&upgraded);
+        assert!(state.decide(Decision::Approve).unwrap());
         let reopened = ReviewSession::from_metadata(
             &upgraded,
             "default-script",

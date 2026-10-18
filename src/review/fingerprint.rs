@@ -2,7 +2,11 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::SystemTime,
 };
 
 use eyre::{Context, ContextCompat};
@@ -10,6 +14,127 @@ use sha2::{Digest, Sha256};
 
 use super::{ReviewPackage, ReviewSession, sources::ScriptSource};
 use crate::{config::ApprovedVersion, fingerprint};
+
+/// Cache only artifact locations, never fingerprints or authorization decisions.
+pub(super) struct ArtifactIndex {
+    directory: PathBuf,
+    artifacts: Vec<PathBuf>,
+    directories: Vec<(PathBuf, Option<DirectoryStamp>)>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Verification {
+    Verified(Arc<[ScriptSource]>),
+    Mismatch,
+    Unavailable(String),
+}
+
+#[derive(PartialEq, Eq)]
+struct DirectoryStamp {
+    modified: SystemTime,
+    #[cfg(unix)]
+    identity: (u64, u64, i64, i64),
+    #[cfg(not(unix))]
+    created: Option<SystemTime>,
+}
+
+impl DirectoryStamp {
+    fn read(path: &Path) -> eyre::Result<Option<Self>> {
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        eyre::ensure!(metadata.is_dir(), "{} is not a directory", path.display());
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Ok(Some(Self {
+            modified: metadata.modified()?,
+            #[cfg(unix)]
+            identity: (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            ),
+            #[cfg(not(unix))]
+            created: metadata.created().ok(),
+        }))
+    }
+}
+
+impl ArtifactIndex {
+    pub(super) fn new(directory: PathBuf) -> Self {
+        Self {
+            directory,
+            artifacts: Vec::new(),
+            directories: Vec::new(),
+        }
+    }
+
+    /// Authenticate every current target. Version suffixes are retrieval hints.
+    pub(super) fn verify(
+        &mut self,
+        package: &ReviewPackage,
+        approvals: &ApprovedVersion,
+        root: &Path,
+        cancelled: &AtomicBool,
+    ) -> Verification {
+        let fingerprints = (|| {
+            self.refresh(cancelled)?;
+            let fingerprints = calculate(package, root, &self.artifacts, cancelled)?;
+            eyre::ensure!(
+                Self::unchanged(&self.directories, cancelled)?,
+                "compiled artifact directories changed during review"
+            );
+            Ok::<_, eyre::Report>(fingerprints)
+        })();
+        match fingerprints {
+            Ok(fingerprints) => {
+                if fingerprints
+                    .iter()
+                    .any(|(fingerprint, _)| !approvals.allows_fingerprint(fingerprint))
+                {
+                    return Verification::Mismatch;
+                }
+                Verification::Verified(fingerprints.into_iter().map(|(_, source)| source).collect())
+            }
+            Err(error) => Verification::Unavailable(format!("{error:#}")),
+        }
+    }
+
+    fn unchanged(
+        directories: &[(PathBuf, Option<DirectoryStamp>)],
+        cancelled: &AtomicBool,
+    ) -> eyre::Result<bool> {
+        for (path, stamp) in directories {
+            eyre::ensure!(
+                !cancelled.load(Ordering::Relaxed),
+                "fingerprint verification cancelled"
+            );
+            if DirectoryStamp::read(path)? != *stamp {
+                return Ok(false);
+            }
+        }
+        Ok(!directories.is_empty())
+    }
+
+    fn refresh(&mut self, cancelled: &AtomicBool) -> eyre::Result<()> {
+        if Self::unchanged(&self.directories, cancelled)? {
+            return Ok(());
+        }
+        let mut artifacts = Vec::new();
+        let mut directories = Vec::new();
+        collect_cancellable(&self.directory, &mut artifacts, &mut directories, cancelled)?;
+        eyre::ensure!(
+            Self::unchanged(&directories, cancelled)?,
+            "compiled artifact directories changed while indexing"
+        );
+        self.artifacts = artifacts;
+        self.directories = directories;
+        Ok(())
+    }
+}
 
 /// Use already-compiled inputs; reviewing must never run a build script.
 pub fn approvals(session: &ReviewSession) -> eyre::Result<Vec<ApprovedVersion>> {
@@ -38,7 +163,14 @@ fn from_directory(
     root: &Path,
     directory: &Path,
 ) -> eyre::Result<Vec<ApprovedVersion>> {
-    let fingerprints = calculate(package, root, directory, &AtomicBool::new(false))?;
+    let cancelled = AtomicBool::new(false);
+    let mut index = ArtifactIndex::new(directory.to_path_buf());
+    index.refresh(&cancelled)?;
+    let fingerprints = calculate(package, root, &index.artifacts, &cancelled)?;
+    eyre::ensure!(
+        ArtifactIndex::unchanged(&index.directories, &cancelled)?,
+        "compiled artifact directories changed during review"
+    );
     Ok(fingerprints
         .into_iter()
         .map(|(fingerprint, _)| fingerprint)
@@ -48,36 +180,12 @@ fn from_directory(
         .collect())
 }
 
-/// Authenticate every current target against the complete saved approval list.
-/// Version suffixes are retrieval hints, not part of hash authorization.
-pub(super) fn verify_current(
-    package: &ReviewPackage,
-    approvals: &ApprovedVersion,
-    root: &Path,
-    directory: &Path,
-    cancelled: &AtomicBool,
-) -> eyre::Result<Vec<ScriptSource>> {
-    calculate(package, root, directory, cancelled)?
-        .into_iter()
-        .map(|(fingerprint, source)| {
-            eyre::ensure!(
-                approvals.allows_fingerprint(&fingerprint),
-                "current compiled inputs are not approved for {}",
-                source.path.display()
-            );
-            Ok(source)
-        })
-        .collect()
-}
-
 fn calculate(
     package: &ReviewPackage,
     root: &Path,
-    directory: &Path,
+    artifacts: &[PathBuf],
     cancelled: &AtomicBool,
 ) -> eyre::Result<Vec<(String, ScriptSource)>> {
-    let mut artifacts = Vec::new();
-    collect_cancellable(directory, &mut artifacts, cancelled)?;
     let mut result = Vec::with_capacity(package.scripts.len());
     let version = package.version.to_string();
     for script in &package.scripts {
@@ -87,7 +195,7 @@ fn calculate(
         );
         let script_path = script.path.canonicalize()?;
         let mut candidates = Vec::new();
-        for artifact in &artifacts {
+        for artifact in artifacts {
             eyre::ensure!(
                 !cancelled.load(Ordering::Relaxed),
                 "fingerprint verification cancelled"
@@ -156,6 +264,10 @@ fn calculate(
             "compiled inputs changed during review; reopen review"
         );
         eyre::ensure!(
+            fs::metadata(artifact)?.modified()? == *compiled,
+            "compiled artifact changed during review; reopen review"
+        );
+        eyre::ensure!(
             !cancelled.load(Ordering::Relaxed),
             "fingerprint verification cancelled"
         );
@@ -192,19 +304,26 @@ pub(super) fn matches_target(artifact: &Path, target: &str) -> bool {
 }
 
 pub(super) fn collect(directory: &Path, result: &mut Vec<PathBuf>) -> eyre::Result<()> {
-    collect_cancellable(directory, result, &AtomicBool::new(false))
+    let mut index = ArtifactIndex::new(directory.to_path_buf());
+    index.refresh(&AtomicBool::new(false))?;
+    result.extend(index.artifacts);
+    Ok(())
 }
 
 fn collect_cancellable(
     directory: &Path,
     result: &mut Vec<PathBuf>,
+    directories: &mut Vec<(PathBuf, Option<DirectoryStamp>)>,
     cancelled: &AtomicBool,
 ) -> eyre::Result<()> {
     eyre::ensure!(
         !cancelled.load(Ordering::Relaxed),
         "fingerprint verification cancelled"
     );
-    if !directory.exists() {
+    let stamp = DirectoryStamp::read(directory)?;
+    let absent = stamp.is_none();
+    directories.push((directory.to_path_buf(), stamp));
+    if absent {
         return Ok(());
     }
     for entry in fs::read_dir(directory)? {
@@ -222,7 +341,7 @@ fn collect_cancellable(
             ) {
                 continue;
             }
-            collect_cancellable(&entry.path(), result, cancelled)?;
+            collect_cancellable(&entry.path(), result, directories, cancelled)?;
         } else if kind.is_file() && entry.path().extension().is_some_and(|e| e == "d") {
             result.push(entry.path());
         }
@@ -252,26 +371,19 @@ mod tests {
         (root, app, artifact)
     }
 
-    fn loaded_baseline(app: &App) -> super::super::sources::Baseline {
-        use super::super::sources::BaselineLoader;
-        use std::time::{Duration, Instant};
-
-        let loader = BaselineLoader::start(&app.session).unwrap().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(baseline) = loader.poll() {
-                return baseline;
-            }
-            assert!(Instant::now() < deadline, "approval verification timed out");
-            std::thread::sleep(Duration::from_millis(10));
-        }
+    fn verify_saved(app: &App, index: &mut ArtifactIndex) -> Verification {
+        index.verify(
+            &app.session.package,
+            &app.session.config.config().approved["example"],
+            app.session.config.path().parent().unwrap(),
+            &AtomicBool::new(false),
+        )
     }
 
     #[test]
     fn current_authorization_ignores_hints_and_mixed_version_representatives() {
-        use super::super::sources::Baseline;
-
-        let (_root, mut app, _artifact) = compiled_fixture();
+        let (root, mut app, _artifact) = compiled_fixture();
+        let mut index = ArtifactIndex::new(root.path().join("target"));
         app.decide(Decision::ApproveFingerprint).unwrap();
         let ApprovedVersion::Fingerprint(saved) = &app.session.config.config().approved["example"]
         else {
@@ -297,7 +409,7 @@ mod tests {
         for source in [None, Some("git+https://example.com/example#01234567")] {
             app.session.package.source =
                 source.map(|repr| cargo_metadata::Source { repr: repr.into() });
-            let Baseline::CurrentFingerprint(sources) = loaded_baseline(&app) else {
+            let Verification::Verified(sources) = verify_saved(&app, &mut index) else {
                 panic!("saved hashes must authorize regardless of version hint");
             };
             assert_eq!(sources.len(), 1);
@@ -308,25 +420,21 @@ mod tests {
 
     #[test]
     fn helper_changes_and_missing_or_stale_artifacts_do_not_authorize_current() {
-        use super::super::sources::Baseline;
-
         let (root, mut app, artifact) = compiled_fixture();
+        let mut index = ArtifactIndex::new(root.path().join("target"));
         let helper = root.path().join("helper.rs");
         fs::write(&helper, "const VALUE: u8 = 1;\n").unwrap();
         let dep_info = "binary: script0.rs helper.rs\n";
         fs::write(&artifact, dep_info).unwrap();
         app.decide(Decision::ApproveFingerprint).unwrap();
         assert!(matches!(
-            loaded_baseline(&app),
-            Baseline::CurrentFingerprint(_)
+            verify_saved(&app, &mut index),
+            Verification::Verified(_)
         ));
 
         fs::write(&helper, "const VALUE: u8 = 2;\n").unwrap();
         fs::write(&artifact, dep_info).unwrap();
-        assert!(!matches!(
-            loaded_baseline(&app),
-            Baseline::CurrentFingerprint(_)
-        ));
+        assert_eq!(verify_saved(&app, &mut index), Verification::Mismatch);
 
         // Restoring the approved bytes is not enough without fresh dep-info.
         fs::write(&helper, "const VALUE: u8 = 1;\n").unwrap();
@@ -337,20 +445,201 @@ mod tests {
             .unwrap()
             .set_times(fs::FileTimes::new().set_modified(past))
             .unwrap();
-        assert!(!matches!(
-            loaded_baseline(&app),
-            Baseline::CurrentFingerprint(_)
+        assert!(matches!(
+            verify_saved(&app, &mut index),
+            Verification::Unavailable(_)
         ));
         fs::remove_file(&artifact).unwrap();
-        assert!(!matches!(
-            loaded_baseline(&app),
-            Baseline::CurrentFingerprint(_)
+        assert!(matches!(
+            verify_saved(&app, &mut index),
+            Verification::Unavailable(_)
         ));
         fs::write(&artifact, dep_info).unwrap();
         fs::remove_file(helper).unwrap();
-        assert!(!matches!(
-            loaded_baseline(&app),
-            Baseline::CurrentFingerprint(_)
+        assert!(matches!(
+            verify_saved(&app, &mut index),
+            Verification::Unavailable(_)
+        ));
+    }
+
+    #[test]
+    fn current_inputs_are_rehashed_even_when_metadata_is_unchanged() {
+        let (root, mut app, artifact) = compiled_fixture();
+        let helper = root.path().join("helper.rs");
+        fs::write(&helper, "const VALUE: u8 = 1;\n").unwrap();
+        fs::write(&artifact, "binary: script0.rs helper.rs\n").unwrap();
+        app.decide(Decision::ApproveFingerprint).unwrap();
+        let mut index = ArtifactIndex::new(root.path().join("target"));
+        assert!(matches!(
+            verify_saved(&app, &mut index),
+            Verification::Verified(_)
+        ));
+
+        let modified = fs::metadata(&helper).unwrap().modified().unwrap();
+        fs::write(&helper, "const VALUE: u8 = 2;\n").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&helper)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert_eq!(verify_saved(&app, &mut index), Verification::Mismatch);
+
+        fs::write(&helper, "const VALUE: u8 = 1;\n").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&helper)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert!(matches!(
+            verify_saved(&app, &mut index),
+            Verification::Verified(_)
+        ));
+
+        let script = root.path().join("script0.rs");
+        let modified = fs::metadata(&script).unwrap().modified().unwrap();
+        fs::write(&script, "fn main(){ }\n").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&script)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert_eq!(verify_saved(&app, &mut index), Verification::Mismatch);
+    }
+
+    #[test]
+    fn artifact_index_discovers_created_removed_and_renamed_artifacts() {
+        let (root, mut app, artifact) = compiled_fixture();
+        let helper = root.path().join("feature.rs");
+        fs::write(&helper, "const FEATURE: bool = true;\n").unwrap();
+        fs::write(&artifact, "binary: script0.rs\n").unwrap();
+        app.decide(Decision::ApproveFingerprint).unwrap();
+        let target = root.path().join("target");
+        let mut index = ArtifactIndex::new(target.clone());
+        assert!(matches!(
+            verify_saved(&app, &mut index),
+            Verification::Verified(_)
+        ));
+
+        let newer = artifact.parent().unwrap().join("script0-abcd.d");
+        let pending = newer.with_extension("pending");
+        let write_newer = |path: &Path| {
+            fs::write(path, "binary: script0.rs feature.rs\n").unwrap();
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(
+                    fs::FileTimes::new()
+                        .set_modified(SystemTime::now() + std::time::Duration::from_secs(60)),
+                )
+                .unwrap();
+        };
+        write_newer(&pending);
+        assert!(matches!(
+            verify_saved(&app, &mut index),
+            Verification::Verified(_)
+        ));
+        fs::rename(&pending, &newer).unwrap();
+        assert_eq!(verify_saved(&app, &mut index), Verification::Mismatch);
+        fs::remove_file(&newer).unwrap();
+        assert!(matches!(
+            verify_saved(&app, &mut index),
+            Verification::Verified(_)
+        ));
+
+        let new_directory = target.join("new-target/debug/build/example");
+        fs::create_dir_all(&new_directory).unwrap();
+        write_newer(&new_directory.join("script0-abcd.d"));
+        assert_eq!(verify_saved(&app, &mut index), Verification::Mismatch);
+        let renamed = target.join("renamed-target");
+        fs::rename(target.join("new-target"), &renamed).unwrap();
+        assert_eq!(verify_saved(&app, &mut index), Verification::Mismatch);
+        fs::remove_dir_all(renamed).unwrap();
+        assert!(matches!(
+            verify_saved(&app, &mut index),
+            Verification::Verified(_)
+        ));
+    }
+
+    #[test]
+    fn artifact_index_recovers_from_absent_and_removed_build_directories() {
+        let (root, mut app, artifact) = compiled_fixture();
+        app.decide(Decision::ApproveFingerprint).unwrap();
+        let target = root.path().join("target");
+        fs::remove_dir_all(&target).unwrap();
+        let mut index = ArtifactIndex::new(target.clone());
+        assert!(matches!(
+            verify_saved(&app, &mut index),
+            Verification::Unavailable(_)
+        ));
+
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        fs::write(&artifact, "binary: script0.rs\n").unwrap();
+        assert!(matches!(
+            verify_saved(&app, &mut index),
+            Verification::Verified(_)
+        ));
+        fs::remove_dir_all(&target).unwrap();
+        assert!(matches!(
+            verify_saved(&app, &mut index),
+            Verification::Unavailable(_)
+        ));
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        fs::write(&artifact, "binary: script0.rs\n").unwrap();
+        assert!(matches!(
+            verify_saved(&app, &mut index),
+            Verification::Verified(_)
+        ));
+    }
+
+    #[test]
+    fn artifact_index_rereads_existing_dep_info_and_build_timestamps() {
+        let (root, mut app, artifact) = compiled_fixture();
+        let helper = root.path().join("feature.rs");
+        fs::write(&helper, "const FEATURE: bool = true;\n").unwrap();
+        fs::write(&artifact, "binary: script0.rs\n").unwrap();
+        let variant = artifact.parent().unwrap().join("script0-abcd.d");
+        fs::write(&variant, "binary: script0.rs feature.rs\n").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&variant)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_modified(SystemTime::now() - std::time::Duration::from_secs(60)),
+            )
+            .unwrap();
+        app.decide(Decision::ApproveFingerprint).unwrap();
+        let mut index = ArtifactIndex::new(root.path().join("target"));
+        assert!(matches!(
+            verify_saved(&app, &mut index),
+            Verification::Verified(_)
+        ));
+
+        // No directory entry changes: an existing variant becomes the newest build.
+        let compiled = SystemTime::now() + std::time::Duration::from_secs(60);
+        fs::File::options()
+            .write(true)
+            .open(&variant)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(compiled))
+            .unwrap();
+        assert_eq!(verify_saved(&app, &mut index), Verification::Mismatch);
+
+        // Even unchanged dep-info timestamps cannot cache its tracked input set.
+        fs::write(&variant, "binary: script0.rs missing.rs\n").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&variant)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(compiled))
+            .unwrap();
+        assert!(matches!(
+            verify_saved(&app, &mut index),
+            Verification::Unavailable(_)
         ));
     }
 
@@ -368,15 +657,14 @@ mod tests {
         )
         .unwrap();
         fs::write(&artifact, "binary: script0.rs\n").unwrap();
-        assert!(
-            verify_current(
+        assert_eq!(
+            ArtifactIndex::new(directory).verify(
                 &app.session.package,
                 &saved,
                 root.path(),
-                &directory,
                 &AtomicBool::new(false),
-            )
-            .is_err()
+            ),
+            Verification::Mismatch
         );
     }
 
@@ -394,18 +682,15 @@ mod tests {
         fs::write(target.join("script1.d"), "binary: script1.rs\n").unwrap();
         let approvals = from_directory(&app.session.package, root.path(), &target).unwrap();
         let cancelled = AtomicBool::new(false);
-        let verify = |saved: &ApprovedVersion| {
-            verify_current(
-                &app.session.package,
-                saved,
-                root.path(),
-                &target,
-                &cancelled,
-            )
+        let mut index = ArtifactIndex::new(target.clone());
+        let mut verify = |saved: &ApprovedVersion| {
+            index.verify(&app.session.package, saved, root.path(), &cancelled)
         };
-        assert!(verify(&approvals[0]).is_err());
+        assert_eq!(verify(&approvals[0]), Verification::Mismatch);
         let saved = ApprovedVersion::Multiple(approvals);
-        let sources = verify(&saved).unwrap();
+        let Verification::Verified(sources) = verify(&saved) else {
+            panic!("all saved scripts must be verified");
+        };
         assert_eq!(sources.len(), 2);
         assert_eq!(sources[0].contents, "fn main() {}\n");
         assert_eq!(sources[1].contents, "fn main() { /* second */ }\n");
@@ -429,15 +714,15 @@ mod tests {
             "binary: script0.rs feature.rs\n",
         )
         .unwrap();
-        assert!(verify(&saved).is_err());
+        assert_eq!(verify(&saved), Verification::Mismatch);
         fs::write(
             target.join("script0-abcd.d"),
             "binary: script0.rs missing.rs\n",
         )
         .unwrap();
-        assert!(verify(&saved).is_err());
+        assert!(matches!(verify(&saved), Verification::Unavailable(_)));
         cancelled.store(true, Ordering::Relaxed);
-        assert!(verify(&saved).is_err());
+        assert!(matches!(verify(&saved), Verification::Unavailable(_)));
     }
 
     #[test]
@@ -477,11 +762,10 @@ mod tests {
 
     #[test]
     fn saved_fingerprint_is_recognized_after_reopening_review() {
-        use super::super::sources::BaselineLoader;
+        use super::super::sources::Baseline;
         use crate::config::edit::ConfigFile;
-        use std::time::{Duration, Instant};
 
-        let (_root, mut app, _artifact) = compiled_fixture();
+        let (root, mut app, _artifact) = compiled_fixture();
         app.decide(Decision::ApproveFingerprint).unwrap();
         let session = ReviewSession {
             package: app.session.package.clone(),
@@ -489,16 +773,13 @@ mod tests {
         };
         let mut reopened = App::new(session).unwrap();
         assert_eq!(reopened.decision, None);
-        let loader = BaselineLoader::start(&reopened.session).unwrap().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(baseline) = loader.poll() {
-                reopened.set_baseline(baseline).unwrap();
-                break;
-            }
-            assert!(Instant::now() < deadline, "approval verification timed out");
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        let mut index = ArtifactIndex::new(root.path().join("target"));
+        let Verification::Verified(sources) = verify_saved(&reopened, &mut index) else {
+            panic!("saved fingerprints must verify after reopening");
+        };
+        reopened
+            .set_baseline(Baseline::CurrentFingerprint(sources))
+            .unwrap();
         assert!(
             !reopened.can_decide(),
             "saved fingerprints were not recognized"

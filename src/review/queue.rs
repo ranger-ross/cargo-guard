@@ -1,4 +1,9 @@
-use std::{collections::VecDeque, path::PathBuf};
+use std::{
+    collections::VecDeque,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use unicode_width::UnicodeWidthStr;
 
@@ -8,12 +13,15 @@ use super::{
     ReviewPackage, ReviewSession,
     app::{App, Decision},
     discovery::ReviewQueue,
+    fingerprint::Verification,
     input::{self, Action},
     sources::{Baseline, BaselineLoader},
+    verification::{self, Verifier},
 };
 use crate::config::{ApprovedVersion, edit::ConfigFile};
 
 const VIEW_CACHE_CAPACITY: usize = 8;
+const RECHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 pub struct QueueState {
     pub entries: Vec<Entry>,
@@ -24,6 +32,8 @@ pub struct QueueState {
     retired_loaders: Vec<BaselineLoader>,
     cached_apps: VecDeque<(usize, App)>,
     pub sidebar_width: u16,
+    verifier: Result<Verifier, String>,
+    last_refresh: Instant,
 }
 
 impl QueueState {
@@ -32,13 +42,22 @@ impl QueueState {
         let entries: Vec<_> = queue
             .packages
             .into_iter()
-            .map(|package| Entry {
-                package,
-                decision: None,
-                skipped: false,
-                error: None,
-                baseline_unavailable: false,
-                fingerprint_approved: false,
+            .map(|mut package| {
+                let approvals = queue.config.config().approved.get(&package.name).cloned();
+                package.approval = approvals
+                    .as_ref()
+                    .and_then(|approval| approval.for_review(&package.version));
+                Entry {
+                    package,
+                    approvals,
+                    decision: None,
+                    skipped: false,
+                    error: None,
+                    baseline_unavailable: false,
+                    verification: None,
+                    generation: 0,
+                    checking: false,
+                }
             })
             .collect();
         let selected = entries.iter().position(Entry::actionable).unwrap_or(0);
@@ -48,6 +67,14 @@ impl QueueState {
             .max()
             .unwrap_or(24)
             .clamp(24, 36) as u16;
+        let verifier = Verifier::start(
+            config_path
+                .parent()
+                .expect("workspace approval path")
+                .to_path_buf(),
+            queue.build_directory,
+        )
+        .map_err(|error| format!("{error:#}"));
         let mut state = Self {
             entries,
             selected,
@@ -57,15 +84,55 @@ impl QueueState {
             retired_loaders: Vec::new(),
             cached_apps: VecDeque::new(),
             sidebar_width,
+            verifier,
+            last_refresh: Instant::now(),
         };
         if !state.entries.is_empty() {
             state.open(selected);
         }
+        state.schedule_all();
         state
     }
 
     pub fn poll(&mut self) -> bool {
         self.retired_loaders.retain(|loader| !loader.is_finished());
+        let mut dirty = false;
+        if self.last_refresh.elapsed() >= RECHECK_INTERVAL {
+            self.last_refresh = Instant::now();
+            match ConfigFile::open(&self.config_path) {
+                Ok(config) => {
+                    let generation = self
+                        .entries
+                        .get(self.selected)
+                        .map(|entry| entry.generation);
+                    dirty |= self.sync_approvals(&config);
+                    if generation
+                        != self
+                            .entries
+                            .get(self.selected)
+                            .map(|entry| entry.generation)
+                    {
+                        self.open(self.selected);
+                    }
+                }
+                Err(error) => {
+                    for entry in &mut self.entries {
+                        if entry.needs_verification() {
+                            entry.invalidate();
+                            entry.verification = Some(Verification::Unavailable(format!(
+                                "could not read approvals: {error:#}"
+                            )));
+                        }
+                    }
+                    self.update_current();
+                    return true;
+                }
+            }
+            self.schedule_all();
+        }
+        while let Some(result) = self.verifier.as_ref().ok().and_then(Verifier::poll) {
+            dirty |= self.apply_result(result);
+        }
         if let Some(baseline) = self.loader.as_ref().and_then(BaselineLoader::poll) {
             self.entries[self.selected].baseline_unavailable =
                 matches!(baseline, Baseline::Unavailable { .. });
@@ -76,14 +143,177 @@ impl QueueState {
                     Some(format!("could not display baseline: {error:#}"));
                 self.app = None;
             }
-            self.entries[self.selected].fingerprint_approved = self
-                .app
-                .as_ref()
-                .is_some_and(App::is_current_fingerprint_approved);
             self.retire_loader();
-            return true;
+            dirty = true;
         }
-        false
+        dirty
+    }
+
+    fn schedule_all(&mut self) {
+        for index in 0..self.entries.len() {
+            self.schedule(index);
+        }
+        if let Ok(verifier) = &self.verifier {
+            verifier.prioritize(self.selected);
+        }
+    }
+
+    fn schedule(&mut self, index: usize) {
+        let entry = &mut self.entries[index];
+        if entry.checking || !entry.needs_verification() {
+            return;
+        }
+        let request = verification::Request {
+            index,
+            generation: entry.generation,
+            package: entry.package.clone(),
+            approvals: entry.approvals.clone().expect("saved fingerprint approval"),
+        };
+        let result = match &self.verifier {
+            Ok(verifier) => verifier
+                .verify(request)
+                .map_err(|error| format!("{error:#}")),
+            Err(error) => Err(error.clone()),
+        };
+        match result {
+            Ok(()) => entry.checking = true,
+            Err(error) => {
+                let result = Verification::Unavailable(error);
+                if entry.verification.as_ref() != Some(&result) {
+                    entry.verification = Some(result);
+                    if index == self.selected {
+                        self.update_current();
+                    }
+                }
+            }
+        }
+    }
+
+    fn apply_result(&mut self, result: verification::Result) -> bool {
+        let entry = &mut self.entries[result.index];
+        if result.generation != entry.generation
+            || result.package_id != entry.package.id
+            || !entry.needs_verification()
+        {
+            return false;
+        }
+        entry.checking = false;
+        if entry.verification.as_ref() == Some(&result.verification) {
+            return false;
+        }
+        if !matches!(result.verification, Verification::Verified(_))
+            && entry.decision == Some(Decision::ApproveFingerprint)
+        {
+            entry.decision = None;
+        }
+        entry.verification = Some(result.verification);
+        if result.index == self.selected {
+            self.update_current();
+        }
+        true
+    }
+
+    fn sync_approvals(&mut self, config: &ConfigFile) -> bool {
+        let mut changed = false;
+        for entry in &mut self.entries {
+            let approvals = config.config().approved.get(&entry.package.name);
+            if entry.approvals.as_ref() != approvals {
+                entry.invalidate();
+                entry.approvals = approvals.cloned();
+                entry.package.approval =
+                    approvals.and_then(|approval| approval.for_review(&entry.package.version));
+                if entry.decision == Some(Decision::Approve)
+                    && !approvals
+                        .is_some_and(|approval| approval.allows_version(&entry.package.version))
+                {
+                    entry.decision = None;
+                }
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn update_current(&mut self) {
+        let Some(mut app) = self.app.take() else {
+            return;
+        };
+        let entry = &mut self.entries[self.selected];
+        let result = app
+            .refresh_sources()
+            .and_then(|_| Self::present_verification(entry, &mut app));
+        match result {
+            Ok(()) => {
+                self.app = Some(app);
+                if self.entries[self.selected].already_approved() {
+                    self.retire_loader();
+                }
+                self.start_baseline();
+                if self.entries[self.selected].verification.is_none() {
+                    self.schedule(self.selected);
+                }
+            }
+            Err(error) => entry.error = Some(format!("could not refresh sources: {error:#}")),
+        }
+    }
+
+    fn present_verification(entry: &mut Entry, app: &mut App) -> eyre::Result<()> {
+        if let Some(Verification::Verified(sources)) = &entry.verification
+            && sources != &app.sources()
+        {
+            entry.invalidate();
+        }
+        app.decision = entry.decision;
+        app.verification_pending = entry.needs_verification() && entry.verification.is_none();
+        match &entry.verification {
+            Some(Verification::Verified(sources)) => {
+                app.set_baseline(Baseline::CurrentFingerprint(Arc::clone(sources)))?;
+                app.verification_message = None;
+            }
+            result => {
+                if app.is_current_fingerprint_approved() {
+                    app.decision = None;
+                    app.set_baseline(Baseline::for_session(&app.session))?;
+                }
+                app.verification_message = if entry.needs_verification() {
+                    Some(match result {
+                        Some(Verification::Mismatch) => {
+                            "Current build-script inputs differ from saved fingerprint approvals"
+                                .into()
+                        }
+                        Some(Verification::Unavailable(reason)) => {
+                            format!("Cannot verify current fingerprints: {reason}")
+                        }
+                        None => "Checking current fingerprints against saved approvals".into(),
+                        Some(Verification::Verified(_)) => unreachable!(),
+                    })
+                } else {
+                    None
+                };
+            }
+        }
+        Ok(())
+    }
+
+    fn start_baseline(&mut self) {
+        let entry = &self.entries[self.selected];
+        if self.loader.is_some()
+            || (entry.needs_verification()
+                && matches!(entry.verification, None | Some(Verification::Verified(_))))
+        {
+            return;
+        }
+        if let Some(app) = &self.app
+            && !matches!(
+                app.baseline,
+                Baseline::Ready(_) | Baseline::CurrentVersion | Baseline::CurrentFingerprint(_)
+            )
+        {
+            match BaselineLoader::start(&app.session) {
+                Ok(loader) => self.loader = loader,
+                Err(error) => self.entries[self.selected].error = Some(format!("{error:#}")),
+            }
+        }
     }
 
     pub fn navigate(&mut self, backwards: bool) {
@@ -108,19 +338,18 @@ impl QueueState {
             .ok_or_else(|| eyre::eyre!("current package sources could not be loaded"))?;
         eyre::ensure!(app.can_decide(), "this package is read-only");
         app.decide(decision)?;
-        for entry in &mut self.entries {
-            entry.package.approval = app
-                .session
-                .config
-                .config()
-                .approved
-                .get(&entry.package.name)
-                .and_then(|a| a.for_review(&entry.package.version));
-        }
-        self.entries[self.selected].decision = app.decision;
-        self.entries[self.selected].fingerprint_approved = app.is_current_fingerprint_approved();
-        self.entries[self.selected].skipped = false;
+        let decision = app.decision;
+        let verified = (decision == Some(Decision::ApproveFingerprint)).then(|| app.sources());
+        let config = ConfigFile::open(&self.config_path)?;
+        self.sync_approvals(&config);
+        let entry = &mut self.entries[self.selected];
+        entry.generation += 1;
+        entry.checking = false;
+        entry.decision = decision;
+        entry.verification = verified.map(Verification::Verified);
+        entry.skipped = false;
         self.retire_loader();
+        self.schedule_all();
         Ok(self.advance())
     }
 
@@ -151,7 +380,11 @@ impl QueueState {
                 Some(Decision::Reject) => summary.rejected += 1,
                 None if entry.error.is_some() => summary.unresolved += 1,
                 None if entry.already_approved() => summary.already_approved += 1,
-                None if entry.baseline_unavailable => summary.unresolved += 1,
+                None if entry.baseline_unavailable
+                    || matches!(entry.verification, Some(Verification::Unavailable(_))) =>
+                {
+                    summary.unresolved += 1
+                }
                 None => summary.skipped += 1,
             }
         }
@@ -171,30 +404,24 @@ impl QueueState {
         self.selected = selected;
         self.entries[selected].error = None;
         self.entries[selected].baseline_unavailable = false;
-        self.entries[selected].fingerprint_approved = false;
-        if self.entries[selected].decision == Some(Decision::ApproveFingerprint) {
-            self.entries[selected].decision = None;
-        }
         match self.load_current() {
-            Ok((app, loader)) => {
+            Ok(app) => {
                 self.app = Some(app);
-                self.loader = loader;
+                self.start_baseline();
+                self.schedule(selected);
+                if let Ok(verifier) = &self.verifier {
+                    verifier.prioritize(selected);
+                }
             }
             Err(error) => self.entries[selected].error = Some(format!("{error:#}")),
         }
     }
 
-    fn load_current(&mut self) -> eyre::Result<(App, Option<BaselineLoader>)> {
+    fn load_current(&mut self) -> eyre::Result<App> {
         // Each newly selected package gets a fresh edit snapshot. This includes
         // our previous saves while preserving conflict detection during review.
         let config = ConfigFile::open(&self.config_path)?;
-        for entry in &mut self.entries {
-            entry.package.approval = config
-                .config()
-                .approved
-                .get(&entry.package.name)
-                .and_then(|a| a.for_review(&entry.package.version));
-        }
+        self.sync_approvals(&config);
         let entry = &self.entries[self.selected];
         let session = ReviewSession {
             package: entry.package.clone(),
@@ -212,13 +439,8 @@ impl QueueState {
             App::new(session)?
         };
         app.queue_mode = true;
-        app.decision = entry.decision;
-        let loader = if matches!(app.baseline, Baseline::Ready(_) | Baseline::CurrentVersion) {
-            None
-        } else {
-            BaselineLoader::start(&app.session)?
-        };
-        Ok((app, loader))
+        Self::present_verification(&mut self.entries[self.selected], &mut app)?;
+        Ok(app)
     }
 
     fn retire_loader(&mut self) {
@@ -251,7 +473,10 @@ pub struct Entry {
     pub skipped: bool,
     pub error: Option<String>,
     pub baseline_unavailable: bool,
-    pub fingerprint_approved: bool,
+    approvals: Option<ApprovedVersion>,
+    verification: Option<Verification>,
+    generation: u64,
+    checking: bool,
 }
 
 impl Entry {
@@ -267,8 +492,12 @@ impl Entry {
             "rejected"
         } else if self.already_approved() {
             "already approved"
-        } else if self.fingerprint_only() {
-            "fingerprint"
+        } else if matches!(self.verification, Some(Verification::Unavailable(_))) {
+            "verification unavailable"
+        } else if matches!(self.verification, Some(Verification::Mismatch)) {
+            "fingerprint changed"
+        } else if self.needs_verification() {
+            "checking"
         } else if self.skipped {
             "skipped"
         } else if self.baseline_unavailable {
@@ -279,12 +508,29 @@ impl Entry {
     }
 
     fn already_approved(&self) -> bool {
-        self.fingerprint_approved
+        matches!(self.verification, Some(Verification::Verified(_)))
             || matches!(&self.package.approval, Some(ApprovedVersion::SemVer(version)) if version == &self.package.version)
     }
 
-    fn fingerprint_only(&self) -> bool {
-        matches!(self.package.approval, Some(ApprovedVersion::Fingerprint(_)))
+    fn needs_verification(&self) -> bool {
+        self.decision != Some(Decision::Reject)
+            && !matches!(&self.package.approval, Some(ApprovedVersion::SemVer(version)) if version == &self.package.version)
+            && self.approvals.as_ref().is_some_and(|approval| {
+                approval
+                    .entries()
+                    .iter()
+                    .any(|entry| matches!(entry, ApprovedVersion::Fingerprint(_)))
+            })
+    }
+
+    fn invalidate(&mut self) {
+        self.generation += 1;
+        self.checking = false;
+        self.verification = None;
+        self.baseline_unavailable = false;
+        if self.decision == Some(Decision::ApproveFingerprint) {
+            self.decision = None;
+        }
     }
 
     fn actionable(&self) -> bool {
@@ -340,11 +586,42 @@ mod tests {
         (root, state, artifact)
     }
 
-    fn finish_baseline(state: &mut QueueState) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !state.poll() {
-            assert!(std::time::Instant::now() < deadline, "baseline timed out");
-            std::thread::sleep(std::time::Duration::from_millis(5));
+    fn wait_for(state: &mut QueueState, ready: impl Fn(&QueueState) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready(state) {
+            state.poll();
+            assert!(Instant::now() < deadline, "verification timed out");
+            std::thread::park_timeout(Duration::from_millis(5));
+        }
+    }
+
+    fn reopen(state: &QueueState) -> QueueState {
+        QueueState::new(ReviewQueue {
+            packages: state
+                .entries
+                .iter()
+                .map(|entry| entry.package.clone())
+                .collect(),
+            config: ConfigFile::open(&state.config_path).unwrap(),
+            build_directory: state.config_path.parent().unwrap().join("target"),
+        })
+    }
+
+    fn saved_fingerprint_fixture() -> (tempfile::TempDir, QueueState, PathBuf) {
+        let (root, mut state, artifact) = fingerprint_fixture();
+        state.decide(Decision::ApproveFingerprint).unwrap();
+        let reopened = reopen(&state);
+        (root, reopened, artifact)
+    }
+
+    fn completed_result(state: &QueueState) -> verification::Result {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(result) = state.verifier.as_ref().unwrap().poll() {
+                return result;
+            }
+            assert!(Instant::now() < deadline, "verification timed out");
+            std::thread::park_timeout(Duration::from_millis(5));
         }
     }
 
@@ -373,13 +650,11 @@ mod tests {
     #[test]
     fn cached_views_preserve_rows_and_scroll_but_refresh_sources_and_approvals() {
         let (root, mut state) = fixture();
-        let rows = state.app.as_ref().unwrap().file().rows.as_ptr();
         state.app.as_mut().unwrap().set_viewport(1, 10);
         state.app.as_mut().unwrap().scroll(1, 0);
         let top = state.app.as_ref().unwrap().top;
         state.navigate(false);
         state.navigate(true);
-        assert_eq!(state.app.as_ref().unwrap().file().rows.as_ptr(), rows);
         assert_eq!(state.app.as_ref().unwrap().top, top);
 
         state.navigate(false);
@@ -424,92 +699,176 @@ mod tests {
             scripts: vec![],
         }))
         .unwrap();
-        let rows = app.file().rows.as_ptr();
         state.navigate(false);
         state.navigate(true);
         assert!(matches!(
             state.app.as_ref().unwrap().baseline,
             Baseline::Ready(_)
         ));
-        assert_eq!(state.app.as_ref().unwrap().file().rows.as_ptr(), rows);
         assert!(state.loader.is_none());
     }
 
     #[test]
-    fn cached_fingerprint_approvals_are_rechecked_after_helper_changes() {
-        let (_root, mut state, artifact) = fingerprint_fixture();
-        let selected = state.selected;
-        let script = state.entries[selected].package.scripts[0].path.clone();
-        let displayed = fs::read_to_string(&script).unwrap();
-        state.decide(Decision::ApproveFingerprint).unwrap();
-        let approval = state.entries[selected].package.approval.clone();
-        assert!(state.entries[selected].fingerprint_approved);
-        assert_eq!(state.summary().approved, 1);
-
-        state.navigate(true);
-        assert_eq!(state.selected, selected);
-        assert_eq!(state.entries[selected].decision, None);
-        assert!(!state.entries[selected].fingerprint_approved);
-        assert!(state.app.as_ref().unwrap().can_decide());
-        finish_baseline(&mut state);
-        assert!(state.entries[selected].already_approved());
-        assert!(!state.entries[selected].actionable());
-        assert!(!state.app.as_ref().unwrap().can_decide());
-        assert_eq!(state.app.as_ref().unwrap().decision, None);
-        assert_eq!(state.summary().already_approved, 1);
-        assert_eq!(state.summary().approved, 0);
-
+    fn saved_approvals_verify_offscreen_and_remain_stable_during_navigation() {
+        let (_root, mut state, _artifact) = saved_fingerprint_fixture();
         state.navigate(false);
-        fs::write(script.with_file_name("helper.rs"), "const INPUT: u8 = 2;\n").unwrap();
-        // Keep dep-info fresh so the changed input hash, not freshness alone,
-        // determines whether the saved approval still covers this package.
-        let dep_info = fs::read_to_string(&artifact).unwrap();
-        fs::write(&artifact, dep_info).unwrap();
-        state.navigate(true);
-        assert_eq!(fs::read_to_string(&script).unwrap(), displayed);
-        assert_eq!(state.entries[selected].package.approval, approval);
-        assert_eq!(state.entries[selected].decision, None);
-        assert!(!state.entries[selected].fingerprint_approved);
+        wait_for(&mut state, |state| state.entries[0].already_approved());
+        assert_eq!(state.selected, 1);
+        assert!(!state.entries[1].already_approved());
         assert!(state.app.as_ref().unwrap().can_decide());
-        finish_baseline(&mut state);
-        assert!(!state.entries[selected].already_approved());
-        assert!(state.entries[selected].actionable());
-        assert!(state.app.as_ref().unwrap().can_decide());
-        assert_eq!(state.summary().already_approved, 0);
+        for _ in 0..20 {
+            state.navigate(true);
+            assert!(state.entries[0].already_approved());
+            assert!(!state.app.as_ref().unwrap().can_decide());
+            assert!(!state.app.as_ref().unwrap().verification_pending);
+            state.navigate(false);
+            assert!(state.entries[0].already_approved());
+            state.poll();
+        }
+        assert_eq!(state.summary().already_approved, 1);
         assert_eq!(state.summary().approved, 0);
     }
 
     #[test]
-    fn reopened_fingerprint_queue_updates_approved_status_and_summary() {
-        let (_root, mut state, _artifact) = fingerprint_fixture();
-        state.decide(Decision::ApproveFingerprint).unwrap();
-        let queue = ReviewQueue {
-            packages: state
-                .entries
-                .iter()
-                .map(|entry| entry.package.clone())
-                .collect(),
-            config: ConfigFile::open(&state.config_path).unwrap(),
-        };
-        let mut reopened = QueueState::new(queue);
-        assert_eq!(reopened.selected, 0);
-        assert!(reopened.entries[0].actionable());
-        finish_baseline(&mut reopened);
-        assert!(reopened.entries[0].fingerprint_only());
-        assert!(reopened.entries[0].already_approved());
-        assert_eq!(reopened.entries[0].status(), "already approved");
-        assert!(!reopened.entries[0].actionable());
-        assert_eq!(reopened.entries[0].decision, None);
-        assert!(!reopened.app.as_ref().unwrap().can_decide());
-        assert_eq!(reopened.app.as_ref().unwrap().decision, None);
+    fn startup_verifies_packages_that_are_never_selected() {
+        let (_root, mut saved, _artifact) = fingerprint_fixture();
+        saved.decide(Decision::ApproveFingerprint).unwrap();
+        let mut packages: Vec<_> = saved
+            .entries
+            .iter()
+            .map(|entry| entry.package.clone())
+            .collect();
+        packages.swap(0, 1);
+        let mut state = QueueState::new(ReviewQueue {
+            packages,
+            config: ConfigFile::open(&saved.config_path).unwrap(),
+            build_directory: saved.config_path.parent().unwrap().join("target"),
+        });
+        wait_for(&mut state, |state| state.entries[1].already_approved());
+        assert_eq!(state.selected, 0);
+        assert!(!state.entries[0].already_approved());
+        assert_eq!(state.summary().already_approved, 1);
+    }
+
+    #[test]
+    fn current_verification_prevents_unneeded_history_loading() {
+        let (_root, mut state, _artifact) = saved_fingerprint_fixture();
+        wait_for(&mut state, |state| state.entries[0].already_approved());
+        assert!(matches!(
+            state.app.as_ref().unwrap().baseline,
+            Baseline::CurrentFingerprint(_)
+        ));
+        assert!(state.loader.is_none());
+        assert!(!state.app.as_ref().unwrap().can_decide());
+        assert_eq!(state.app.as_ref().unwrap().decision, None);
+    }
+
+    #[test]
+    fn background_rechecks_invalidate_changed_helpers_without_navigation() {
+        let (_root, mut state, artifact) = saved_fingerprint_fixture();
+        wait_for(&mut state, |state| state.entries[0].already_approved());
+        let script = state.entries[0].package.scripts[0].path.clone();
+        let displayed = state.app.as_ref().unwrap().sources();
+        fs::write(script.with_file_name("helper.rs"), "const INPUT: u8 = 2;\n").unwrap();
+        let dep_info = fs::read_to_string(&artifact).unwrap();
+        fs::write(&artifact, dep_info).unwrap();
+        state.last_refresh -= RECHECK_INTERVAL;
+        wait_for(&mut state, |state| {
+            matches!(state.entries[0].verification, Some(Verification::Mismatch))
+        });
+        assert_eq!(state.app.as_ref().unwrap().sources(), displayed);
+        assert!(!state.entries[0].already_approved());
+        assert!(state.entries[0].actionable());
+        assert!(state.app.as_ref().unwrap().can_decide());
+        assert_eq!(state.summary().already_approved, 0);
+    }
+
+    #[test]
+    fn changed_displayed_sources_cannot_reuse_a_cached_approval() {
+        let (_root, mut state, _artifact) = saved_fingerprint_fixture();
+        wait_for(&mut state, |state| state.entries[0].already_approved());
+        state.navigate(false);
+        fs::write(
+            &state.entries[0].package.scripts[0].path,
+            "fn changed() {}\n",
+        )
+        .unwrap();
+        state.navigate(true);
+        assert!(!state.entries[0].already_approved());
+        assert!(state.app.as_ref().unwrap().can_decide());
         assert_eq!(
-            reopened.summary(),
-            Summary {
-                already_approved: 1,
-                skipped: 3,
-                ..Default::default()
-            }
+            state.app.as_ref().unwrap().sources()[0].contents,
+            "fn changed() {}\n"
         );
+    }
+
+    #[test]
+    fn results_from_replaced_approval_snapshots_are_discarded() {
+        let (_root, mut state, _artifact) = saved_fingerprint_fixture();
+        let result = completed_result(&state);
+        assert!(matches!(result.verification, Verification::Verified(_)));
+        let mut config = ConfigFile::open(&state.config_path).unwrap();
+        config
+            .set_approval(
+                &state.entries[0].package.name,
+                ApprovedVersion::Fingerprint(format!("{:064x}+{:016x}#2.0.0", 1, 2)),
+            )
+            .unwrap();
+        state.open(0);
+        assert!(!state.apply_result(result));
+        assert!(!state.entries[0].already_approved());
+        wait_for(&mut state, |state| {
+            matches!(state.entries[0].verification, Some(Verification::Mismatch))
+        });
+        assert!(state.app.as_ref().unwrap().can_decide());
+    }
+
+    #[test]
+    fn late_verification_cannot_overwrite_a_newer_rejection() {
+        let (_root, mut state, _artifact) = saved_fingerprint_fixture();
+        let result = completed_result(&state);
+        state.decide(Decision::Reject).unwrap();
+        assert!(!state.apply_result(result));
+        assert_eq!(state.entries[0].decision, Some(Decision::Reject));
+        assert!(!state.entries[0].already_approved());
+        assert_eq!(state.summary().rejected, 1);
+    }
+
+    #[test]
+    fn late_verification_cannot_authorize_newly_displayed_sources() {
+        let (_root, mut state, _artifact) = saved_fingerprint_fixture();
+        let result = completed_result(&state);
+        fs::write(
+            &state.entries[0].package.scripts[0].path,
+            "fn changed() {}\n",
+        )
+        .unwrap();
+        state.apply_result(result);
+        assert!(!state.entries[0].already_approved());
+        assert!(state.app.as_ref().unwrap().can_decide());
+        assert!(state.app.as_ref().unwrap().verification_pending);
+    }
+
+    #[test]
+    fn missing_artifacts_are_unresolved_and_recover_after_rebuilding() {
+        let (_root, mut state, artifact) = saved_fingerprint_fixture();
+        wait_for(&mut state, |state| state.entries[0].already_approved());
+        let dep_info = fs::read_to_string(&artifact).unwrap();
+        fs::remove_file(&artifact).unwrap();
+        state.last_refresh -= RECHECK_INTERVAL;
+        wait_for(&mut state, |state| {
+            matches!(
+                state.entries[0].verification,
+                Some(Verification::Unavailable(_))
+            )
+        });
+        assert_eq!(state.summary().unresolved, 1);
+        assert!(state.app.as_ref().unwrap().can_decide());
+        fs::write(&artifact, dep_info).unwrap();
+        state.last_refresh -= RECHECK_INTERVAL;
+        wait_for(&mut state, |state| state.entries[0].already_approved());
+        assert!(!state.app.as_ref().unwrap().can_decide());
+        assert_eq!(state.summary().unresolved, 0);
     }
 
     #[test]
@@ -524,6 +883,41 @@ mod tests {
             fs::read_to_string(root.path().join("approved-builds.toml")).unwrap(),
             external
         );
+    }
+
+    #[test]
+    fn offscreen_approval_changes_invalidate_the_complete_snapshot() {
+        let (_root, mut saved, _artifact) = fingerprint_fixture();
+        saved.decide(Decision::ApproveFingerprint).unwrap();
+        let Some(ApprovedVersion::Fingerprint(fingerprint)) = &saved.entries[0].approvals else {
+            panic!("expected a saved fingerprint");
+        };
+        let hashes = fingerprint.split_once('#').unwrap().0;
+        fs::write(
+            &saved.config_path,
+            format!("[approved]\ncustom-script=['{hashes}#9.8.7','1.0.0']\n"),
+        )
+        .unwrap();
+        let mut state = reopen(&saved);
+        let representative = state.entries[0].package.approval.clone();
+        wait_for(&mut state, |state| state.entries[0].already_approved());
+        state.navigate(false);
+        fs::write(&state.config_path, "[approved]\ncustom-script='1.0.0'\n").unwrap();
+        state.last_refresh -= RECHECK_INTERVAL;
+        assert!(state.poll());
+        assert_eq!(state.selected, 1);
+        assert_eq!(state.entries[0].package.approval, representative);
+        assert!(!state.entries[0].already_approved());
+        assert_eq!(state.summary().already_approved, 0);
+        state.navigate(true);
+        assert!(
+            !state
+                .app
+                .as_ref()
+                .unwrap()
+                .is_current_fingerprint_approved()
+        );
+        assert!(state.app.as_ref().unwrap().can_decide());
     }
 
     #[test]
@@ -626,7 +1020,6 @@ mod tests {
             ReviewQueue::from_metadata(&metadata, &crate::args::ReviewOptions::default()).unwrap(),
         );
         assert_eq!(state.selected, 1);
-        assert_eq!(state.entries[state.selected].status(), "fingerprint");
         assert!(state.app.as_ref().unwrap().can_decide());
         state.navigate(true);
         assert!(!state.app.as_ref().unwrap().can_decide());

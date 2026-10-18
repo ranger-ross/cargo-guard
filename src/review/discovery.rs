@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+};
 
 use cargo_metadata::{CargoOpt, Metadata, MetadataCommand, Node, NodeDep, Package};
 use eyre::ContextCompat;
@@ -169,6 +172,7 @@ fn dependency_is_active(
 pub struct ReviewQueue {
     pub packages: Vec<ReviewPackage>,
     pub config: ConfigFile,
+    pub build_directory: PathBuf,
 }
 
 impl ReviewQueue {
@@ -185,7 +189,16 @@ impl ReviewQueue {
             })
             .map(|package| ReviewPackage::from_package(package, &config))
             .collect();
-        Ok(Self { packages, config })
+        Ok(Self {
+            packages,
+            config,
+            build_directory: metadata
+                .build_directory
+                .as_ref()
+                .unwrap_or(&metadata.target_directory)
+                .clone()
+                .into_std_path_buf(),
+        })
     }
 }
 

@@ -37,7 +37,7 @@ pub struct ScriptSource {
 pub enum Baseline {
     NewPackage,
     CurrentVersion,
-    CurrentFingerprint(Vec<ScriptSource>),
+    CurrentFingerprint(Arc<[ScriptSource]>),
     Fingerprint,
     Loading(semver::Version),
     Ready(PackageSources),
@@ -100,29 +100,12 @@ pub struct BaselineLoader {
 
 impl BaselineLoader {
     pub fn start(session: &ReviewSession) -> eyre::Result<Option<Self>> {
-        let initial = Baseline::for_session(session);
-        if matches!(initial, Baseline::CurrentVersion) {
+        let Baseline::Loading(version) = Baseline::for_session(session) else {
             return Ok(None);
-        }
-        // Capture one approval snapshot before starting the worker. In a mixed
-        // array, the representative historical version may not be a fingerprint.
-        let approvals = session
-            .config
-            .config()
-            .approved
-            .get(&session.package.name)
-            .cloned();
-        let has_fingerprints = approvals.as_ref().is_some_and(|approval| {
-            approval.entries().iter().any(|entry| {
-                matches!(entry, ApprovedVersion::Fingerprint(value) if ParsedFingerprint::parse(value).is_some())
-            })
-        });
-        let version = match &initial {
-            Baseline::Loading(version) => version.clone(),
-            _ if has_fingerprints => session.package.version.clone(),
-            _ => return Ok(None),
         };
-        let package = session.package.clone();
+        // Keep every matching saved fingerprint to authenticate historical
+        // sources, including all build scripts and compiled feature variants.
+        let approvals = session.config.config().approved.get(&session.package.name);
         let request = SourceRequest {
             name: session.package.name.clone(),
             version: version.clone(),
@@ -145,7 +128,6 @@ impl BaselineLoader {
             {
                 Some(ApprovedVersion::Fingerprint(_)) => Some(
                     approvals
-                        .as_ref()
                         .into_iter()
                         .flat_map(ApprovedVersion::entries)
                         .filter_map(|approval| match approval {
@@ -165,51 +147,24 @@ impl BaselineLoader {
         let (sender, receiver) = mpsc::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = cancelled.clone();
+        let owner = thread::current();
         let worker = thread::Builder::new()
             .name("approved-sources".into())
             .spawn(move || {
-                if has_fingerprints {
-                    let current = (|| -> eyre::Result<Vec<ScriptSource>> {
-                        let mut command = MetadataCommand::new();
-                        command
-                            .manifest_path(request.workspace_root.join("Cargo.toml"))
-                            .current_dir(&request.workspace_root)
-                            .no_deps()
-                            .other_options(vec!["--offline".into()]);
-                        let metadata = execute_metadata(&command, &worker_cancelled)
-                            .context("could not locate current compiled inputs")?;
-                        let directory = metadata
-                            .build_directory
-                            .as_ref()
-                            .unwrap_or(&metadata.target_directory);
-                        super::fingerprint::verify_current(
-                            &package,
-                            approvals.as_ref().expect("fingerprint approval snapshot"),
-                            &request.workspace_root,
-                            directory.as_std_path(),
-                            &worker_cancelled,
-                        )
-                    })();
-                    if let Ok(sources) = current {
-                        let _ = sender.send(Baseline::CurrentFingerprint(sources));
-                        return;
-                    }
-                }
+                // Current-artifact verification belongs to the queue worker;
+                // this independently cancellable worker only retrieves history.
                 if worker_cancelled.load(Ordering::Relaxed) {
                     return;
                 }
-                let baseline = if matches!(initial, Baseline::Loading(_)) {
-                    match load_sources(&request, &worker_cancelled) {
-                        Ok(sources) => Baseline::Ready(sources),
-                        Err(error) => Baseline::Unavailable {
-                            version,
-                            reason: format!("{error:#}"),
-                        },
-                    }
-                } else {
-                    initial
+                let baseline = match load_sources(&request, &worker_cancelled) {
+                    Ok(sources) => Baseline::Ready(sources),
+                    Err(error) => Baseline::Unavailable {
+                        version,
+                        reason: format!("{error:#}"),
+                    },
                 };
                 let _ = sender.send(baseline);
+                owner.unpark();
             })
             .context("could not start baseline source loader")?;
         Ok(Some(Self {

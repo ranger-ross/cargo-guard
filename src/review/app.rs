@@ -1,4 +1,4 @@
-use std::fs;
+use std::{fs, sync::Arc};
 
 use super::{
     ReviewSession,
@@ -13,7 +13,7 @@ pub struct App {
     pub session: ReviewSession,
     pub baseline: Baseline,
     pub files: Vec<ReviewFile>,
-    current: Vec<ScriptSource>,
+    current: Arc<[ScriptSource]>,
     highlighter: Highlighter,
     pub selected: usize,
     pub top: usize,
@@ -26,12 +26,14 @@ pub struct App {
     pub show_help: bool,
     pub queue_mode: bool,
     pub decision_blocked: Option<String>,
+    pub verification_message: Option<String>,
+    pub verification_pending: bool,
 }
 
 impl App {
     pub fn new(session: ReviewSession) -> eyre::Result<Self> {
         let highlighter = Highlighter::new()?;
-        let current = read_sources(&session)?;
+        let current: Arc<[ScriptSource]> = read_sources(&session)?.into();
         let baseline = Baseline::for_session(&session);
         let files = diff::build_files(&current, &baseline, &highlighter)?;
         Ok(Self {
@@ -51,6 +53,8 @@ impl App {
             show_help: false,
             queue_mode: false,
             decision_blocked: None,
+            verification_message: None,
+            verification_pending: false,
         })
     }
 
@@ -58,54 +62,50 @@ impl App {
         &self.files[self.selected]
     }
 
-    /// Reuse expensive highlighted/diffed rows, but always refresh the edit
-    /// snapshot and compare source contents before displaying a cached view.
-    /// Fingerprints must be rechecked asynchronously even when entry points
-    /// match, because their tracked helper inputs may have changed.
+    /// Refresh the edit snapshot without discarding unchanged verified sources.
     pub fn refresh(&mut self, session: ReviewSession) -> eyre::Result<()> {
-        let current = read_sources(&session)?;
-        let fingerprint_approval = session
-            .config
-            .config()
-            .approved
-            .get(&session.package.name)
-            .is_some_and(|approval| {
-                approval
-                    .entries()
-                    .into_iter()
-                    .any(|entry| matches!(entry, ApprovedVersion::Fingerprint(_)))
-            });
-        let recheck_fingerprints = self.is_current_fingerprint_approved()
-            || (fingerprint_approval
-                && !matches!(
-                    &session.package.approval,
-                    Some(ApprovedVersion::SemVer(version)) if version == &session.package.version
-                ));
-        let invalidated =
-            current != self.current || session.package.approval != self.session.package.approval;
-        if invalidated
-            || recheck_fingerprints
-            || matches!(self.baseline, Baseline::Unavailable { .. })
-        {
+        let current: Arc<[ScriptSource]> = read_sources(&session)?.into();
+        let invalidated = current != self.current
+            || session.config.config().approved.get(&session.package.name)
+                != self
+                    .session
+                    .config
+                    .config()
+                    .approved
+                    .get(&self.session.package.name);
+        if invalidated {
             let baseline = Baseline::for_session(&session);
-            if invalidated
-                || matches!(self.baseline, Baseline::Ready(_) | Baseline::NewPackage)
-                || matches!(baseline, Baseline::NewPackage)
-            {
-                let files = diff::build_files(&current, &baseline, &self.highlighter)?;
-                self.replace_files(baseline, files);
-            } else {
-                self.baseline = baseline;
+            let files = diff::build_files(&current, &baseline, &self.highlighter)?;
+            self.replace_files(baseline, files);
+            if self.decision == Some(Decision::ApproveFingerprint) {
+                self.decision = None;
             }
+            self.verification_message = None;
         }
         self.current = current;
         self.session = session;
-        if self.decision == Some(Decision::ApproveFingerprint) {
-            self.decision = None;
-        }
         self.show_help = false;
         self.notice = None;
         Ok(())
+    }
+
+    pub fn sources(&self) -> Arc<[ScriptSource]> {
+        Arc::clone(&self.current)
+    }
+
+    pub fn refresh_sources(&mut self) -> eyre::Result<bool> {
+        let current = read_sources(&self.session)?;
+        if current.as_slice() == self.current.as_ref() {
+            return Ok(false);
+        }
+        let baseline = Baseline::for_session(&self.session);
+        let files = diff::build_files(&current, &baseline, &self.highlighter)?;
+        self.replace_files(baseline, files);
+        self.current = current.into();
+        if self.decision == Some(Decision::ApproveFingerprint) {
+            self.decision = None;
+        }
+        Ok(true)
     }
 
     pub fn set_baseline(&mut self, baseline: Baseline) -> eyre::Result<()> {
@@ -114,6 +114,12 @@ impl App {
                 verified == &self.current,
                 "verified build script sources differ from the displayed sources; reopen review"
             );
+        }
+        if let (Baseline::CurrentFingerprint(old), Baseline::CurrentFingerprint(new)) =
+            (&self.baseline, &baseline)
+            && old == new
+        {
+            return Ok(());
         }
         let files = diff::build_files(&self.current, &baseline, &self.highlighter)?;
         self.replace_files(baseline, files);
@@ -218,8 +224,8 @@ impl App {
         if self.is_current_fingerprint_approved() {
             return "Baseline: current build-script fingerprints are approved".into();
         }
-        if self.prefers_fingerprint() && matches!(self.baseline, Baseline::Loading(_)) {
-            return "Baseline: checking current fingerprints against saved approvals".into();
+        if let Some(message) = &self.verification_message {
+            return message.clone();
         }
         let mut message = self.baseline.message();
         if matches!(self.baseline, Baseline::Ready(_))
@@ -278,6 +284,9 @@ impl App {
         if self.is_current_fingerprint_approved() {
             return "Approved current build-script fingerprints".into();
         }
+        if let Some(message) = &self.verification_message {
+            return message.clone();
+        }
         if let Some(reason) = &self.decision_blocked {
             return format!("Read-only: {reason}");
         }
@@ -302,11 +311,6 @@ impl App {
                     "Version changed: approved v{version} → current v{}",
                     self.session.package.version
                 )
-            }
-            Some(ApprovedVersion::Fingerprint(_))
-                if matches!(self.baseline, Baseline::Loading(_)) =>
-            {
-                "Checking current build-script fingerprints against saved approvals".into()
             }
             Some(ApprovedVersion::Fingerprint(_)) => {
                 "Current build-script inputs need fingerprint approval".into()
@@ -368,7 +372,7 @@ impl App {
         );
         let approvals = super::fingerprint::approvals(&self.session)?;
         eyre::ensure!(
-            read_sources(&self.session)? == self.current,
+            read_sources(&self.session)?.as_slice() == self.current.as_ref(),
             "build script sources changed since opening review; reopen review before approving"
         );
         self.session
@@ -546,21 +550,11 @@ pub(super) mod tests {
         let (_root, mut app) = fixture(&["fn main() {}\n", "// second script\n"]);
         assert!(app.can_decide());
         app.set_baseline(Baseline::CurrentFingerprint(
-            read_sources(&app.session).unwrap(),
+            read_sources(&app.session).unwrap().into(),
         ))
         .unwrap();
         assert!(app.is_current_fingerprint_approved());
         assert!(!app.can_decide());
-        assert!(app.approval_status().starts_with("Approved"));
-        assert_eq!(app.decision, None);
-
-        let session = ReviewSession {
-            package: app.session.package.clone(),
-            config: ConfigFile::open(app.session.config.path()).unwrap(),
-        };
-        app.refresh(session).unwrap();
-        assert!(!app.is_current_fingerprint_approved());
-        assert!(app.can_decide());
         assert_eq!(app.decision, None);
     }
 
@@ -575,7 +569,7 @@ pub(super) mod tests {
         renamed[0].path = "other.rs".into();
         for snapshots in [changed, missing, renamed] {
             assert!(
-                app.set_baseline(Baseline::CurrentFingerprint(snapshots))
+                app.set_baseline(Baseline::CurrentFingerprint(snapshots.into()))
                     .is_err()
             );
             assert!(!app.is_current_fingerprint_approved());

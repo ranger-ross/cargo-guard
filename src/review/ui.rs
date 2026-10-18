@@ -44,8 +44,11 @@ pub fn render_queue(frame: &mut Frame, state: &mut QueueState) {
             let (marker, color) = match entry.status() {
                 "approved" | "already approved" => ("✓", Color::Green),
                 "rejected" => ("×", Color::Red),
-                "load error" | "baseline unavailable" => ("!", Color::Yellow),
-                "fingerprint" => ("?", Color::Yellow),
+                "load error" | "baseline unavailable" | "verification unavailable" => {
+                    ("!", Color::Yellow)
+                }
+                "fingerprint changed" => ("?", Color::Yellow),
+                "checking" => ("~", Color::DarkGray),
                 "skipped" => ("–", Color::DarkGray),
                 _ => ("·", Color::DarkGray),
             };
@@ -331,7 +334,7 @@ fn render_help(frame: &mut Frame, app: &App) {
             "s                Skip to the next pending package",
         ));
         lines.push(Line::styled(
-            "✓ approved  × rejected  ! unresolved  ? fingerprint  – skipped",
+            "✓ approved  × rejected  ~ checking  ? changed  ! unresolved  – skipped",
             muted(),
         ));
     }
@@ -443,12 +446,22 @@ fn baseline_note(app: &App) -> Option<Line<'static>> {
     if app.is_current_fingerprint_approved() {
         return None;
     }
+    if let Some(message) = &app.verification_message {
+        return Some(status_line(
+            if app.verification_pending {
+                "Checking"
+            } else {
+                "warning"
+            },
+            message.clone(),
+            if app.verification_pending {
+                Color::DarkGray
+            } else {
+                Color::Yellow
+            },
+        ));
+    }
     match &app.baseline {
-        Baseline::Loading(_) if app.prefers_fingerprint() => Some(status_line(
-            "Checking",
-            "current fingerprints against saved approvals".into(),
-            Color::Green,
-        )),
         Baseline::Loading(version) => Some(status_line(
             "Fetching",
             format!("approved v{version}"),
@@ -608,10 +621,13 @@ mod tests {
         assert!(text.contains("a fingerprints"));
         assert!(app.can_decide());
 
-        app.set_baseline(Baseline::CurrentFingerprint(vec![ScriptSource {
-            path: "script0.rs".into(),
-            contents: "fn main() {}".into(),
-        }]))
+        app.set_baseline(Baseline::CurrentFingerprint(
+            vec![ScriptSource {
+                path: "script0.rs".into(),
+                contents: "fn main() {}".into(),
+            }]
+            .into(),
+        ))
         .unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let text = screen(&terminal);
