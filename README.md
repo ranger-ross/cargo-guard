@@ -1,6 +1,11 @@
 # Cargo Guard
 
-Cargo build script allow list
+[![CI Status](https://github.com/ranger-ross/cargo-guard/workflows/Test/badge.svg)](https://github.com/ranger-ross/cargo-guard/actions)
+[![Crates.io](https://img.shields.io/crates/v/cargo-guard.svg)](https://crates.io/crates/cargo-guard)
+[![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/ranger-ross/reqwest-metrics/blob/master/LICENSE)
+
+Cargo build script allow. 
+Just `cargo build`, no wrappers needed.
 
 ## Setup
 
