@@ -73,6 +73,18 @@ impl ConfigFile {
         package: &str,
         approvals: &[ApprovedVersion],
     ) -> eyre::Result<()> {
+        eyre::ensure!(
+            !approvals.iter().any(ApprovedVersion::is_blanket),
+            "blanket approvals must be added manually"
+        );
+        if self
+            .config
+            .approved
+            .get(package)
+            .is_some_and(ApprovedVersion::is_blanket)
+        {
+            return Ok(());
+        }
         let mut document = self.document.clone();
         let table = document
             .entry("approved")
@@ -91,6 +103,9 @@ impl ConfigFile {
             let new = match approval {
                 ApprovedVersion::SemVer(version) => version.to_string(),
                 ApprovedVersion::Fingerprint(fingerprint) => fingerprint.clone(),
+                ApprovedVersion::Blanket(_) => {
+                    eyre::bail!("blanket approvals must be added manually")
+                }
                 ApprovedVersion::Multiple(_) => eyre::bail!("add one approval at a time"),
             };
             let mut value = if replace_fingerprint && index == 0 {
@@ -270,6 +285,28 @@ mod tests {
 
     fn fingerprint(value: u64) -> String {
         format!("{value:064x}+{:016x}#1.0.0", 0)
+    }
+
+    #[test]
+    fn review_preserves_manual_blanket_approvals_without_creating_them() {
+        let root = tempfile::tempdir().unwrap();
+        let path = config_path(root.path());
+        let original = "[approved]\nexample = 'approved' # trusted\n";
+        fs::write(&path, original).unwrap();
+        let mut file = ConfigFile::for_workspace(root.path()).unwrap();
+        file.set_approval("example", version("2.0.0")).unwrap();
+        file.set_approval("example", ApprovedVersion::Fingerprint(fingerprint(1)))
+            .unwrap();
+        file.remove_version("example", &"2.0.0".parse().unwrap())
+            .unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        let blanket = file.config.approved["example"].clone();
+        assert!(file.set_approval("other", blanket).is_err());
+        assert!(!file.config.approved.contains_key("other"));
+        file.set_approval("other", version("1.0.0")).unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("example = 'approved' # trusted"));
+        assert!(file.config.approved["example"].is_blanket());
     }
 
     #[test]

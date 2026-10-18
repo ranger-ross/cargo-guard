@@ -178,15 +178,30 @@ pub struct Config {
     pub approved: BTreeMap<String, ApprovedVersion>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub enum BlanketApproval {
+    #[serde(rename = "approved")]
+    Approved,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum ApprovedVersion {
+    Blanket(BlanketApproval),
     SemVer(semver::Version),
     Fingerprint(String),
     Multiple(#[serde(deserialize_with = "deserialize_approvals")] Vec<ApprovedVersion>),
 }
 
 impl ApprovedVersion {
+    pub fn is_blanket(&self) -> bool {
+        match self {
+            Self::Blanket(_) => true,
+            Self::Multiple(entries) => entries.iter().any(Self::is_blanket),
+            _ => false,
+        }
+    }
+
     pub fn entries(&self) -> Vec<&Self> {
         match self {
             Self::Multiple(entries) => entries.iter().flat_map(Self::entries).collect(),
@@ -195,13 +210,17 @@ impl ApprovedVersion {
     }
 
     pub fn allows_version(&self, version: &semver::Version) -> bool {
-        self.entries()
-            .iter()
-            .any(|entry| matches!(entry, Self::SemVer(v) if v == version))
+        match self {
+            Self::Blanket(_) => true,
+            Self::SemVer(approved) => approved == version,
+            Self::Multiple(entries) => entries.iter().any(|entry| entry.allows_version(version)),
+            Self::Fingerprint(_) => false,
+        }
     }
 
     pub fn allows_fingerprint(&self, fingerprint: &str) -> bool {
         match self {
+            Self::Blanket(_) => true,
             Self::Fingerprint(approved) => fingerprints_match(approved, fingerprint),
             Self::Multiple(entries) => entries
                 .iter()
@@ -213,6 +232,9 @@ impl ApprovedVersion {
     /// The current approval, or the nearest historical version for source review.
     /// The complete allow list remains in ConfigFile when editing.
     pub fn for_review(&self, current: &semver::Version) -> Option<Self> {
+        if self.is_blanket() {
+            return Some(Self::Blanket(BlanketApproval::Approved));
+        }
         let entries = self.entries();
         let mut versions: Vec<_> = entries
             .iter()
@@ -269,14 +291,19 @@ pub fn load_config_from(path: &Path) -> eyre::Result<Config> {
 fn deserialize_approvals<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Vec<ApprovedVersion>, D::Error> {
-    Vec::<String>::deserialize(deserializer).map(|entries| {
+    Vec::<String>::deserialize(deserializer).and_then(|entries| {
         entries
             .into_iter()
             .map(|entry| {
-                entry
+                if entry == "approved" {
+                    return Err(serde::de::Error::custom(
+                        "\"approved\" must be a standalone string, not a list entry",
+                    ));
+                }
+                Ok(entry
                     .parse()
                     .map(ApprovedVersion::SemVer)
-                    .unwrap_or(ApprovedVersion::Fingerprint(entry))
+                    .unwrap_or(ApprovedVersion::Fingerprint(entry)))
             })
             .collect()
     })
@@ -337,6 +364,44 @@ mod tests {
             Some(personal.path)
         );
         assert_eq!(validate_path(GLOBAL_PATH, None).unwrap(), None);
+    }
+
+    #[test]
+    fn blanket_approval_matches_all_versions_and_inputs_but_requires_exact_keyword() {
+        let config: Config =
+            toml::from_str("[approved]\nall='approved'\ncase='Approved'\nspace='approved '\n")
+                .unwrap();
+        let roundtrip: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(roundtrip.approved, config.approved);
+        let approval = &config.approved["all"];
+        for version in ["0.0.1", "1.0.0", "99.0.0-rc.1+build.2"] {
+            let version = version.parse().unwrap();
+            assert!(approval.allows_version(&version));
+            assert_eq!(
+                approval.for_review(&version),
+                Some(ApprovedVersion::Blanket(BlanketApproval::Approved))
+            );
+        }
+        assert!(approval.allows_fingerprint(&format!("{:064x}+{:016x}#3.0.0", 1, 2)));
+        for key in ["case", "space"] {
+            assert!(!config.approved[key].is_blanket());
+            assert!(!config.approved[key].allows_version(&"1.0.0".parse().unwrap()));
+        }
+    }
+
+    #[test]
+    fn blanket_approval_is_rejected_inside_lists() {
+        for value in [
+            "['approved']",
+            "['1.0.0', 'approved']",
+            "['approved', '1.0.0']",
+            "['old-hash', 'approved', '2.0.0']",
+        ] {
+            assert!(
+                toml::from_str::<Config>(&format!("[approved]\nfoo={value}\n")).is_err(),
+                "accepted blanket approval in {value}"
+            );
+        }
     }
 
     #[test]

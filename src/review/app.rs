@@ -101,6 +101,9 @@ impl App {
         }
         self.current = current;
         self.session = session;
+        if self.is_blanket_approved() {
+            self.decision = None;
+        }
         self.show_help = false;
         self.notice = None;
         Ok(())
@@ -151,6 +154,10 @@ impl App {
         if let Some(reason) = &self.decision_blocked {
             eyre::bail!("{reason}");
         }
+        eyre::ensure!(
+            !self.is_blanket_approved(),
+            "all versions and fingerprints are manually approved; edit the configuration to change this approval"
+        );
         if decision == Decision::ApproveFingerprint {
             return self.approve_fingerprints();
         }
@@ -280,6 +287,14 @@ impl App {
         }
     }
 
+    pub fn is_blanket_approved(&self) -> bool {
+        self.session
+            .package
+            .approval
+            .as_ref()
+            .is_some_and(ApprovedVersion::is_blanket)
+    }
+
     pub fn is_current_version_approved(&self) -> bool {
         matches!(
             &self.session.package.approval,
@@ -294,7 +309,10 @@ impl App {
 
     /// Display supplemental approval without changing the selected write destination.
     pub fn displayed_approval_scope(&self) -> Option<ApprovalScope> {
-        if self.is_current_version_approved() || self.is_current_fingerprint_approved() {
+        if self.is_blanket_approved()
+            || self.is_current_version_approved()
+            || self.is_current_fingerprint_approved()
+        {
             Some(self.session.config.target().scope)
         } else if self.globally_approved {
             Some(ApprovalScope::Global)
@@ -305,6 +323,7 @@ impl App {
 
     pub fn can_decide(&self) -> bool {
         self.decision_blocked.is_none()
+            && !self.is_blanket_approved()
             && !self.is_current_version_approved()
             && !self.is_current_fingerprint_approved()
     }
@@ -332,6 +351,9 @@ impl App {
             };
         }
         match &self.session.package.approval {
+            Some(ApprovedVersion::Blanket(_)) => {
+                "Approved: all versions and fingerprints (manual blanket approval)".into()
+            }
             Some(ApprovedVersion::SemVer(version)) if version == &self.session.package.version => {
                 format!("Approved: v{version}")
             }
@@ -525,6 +547,53 @@ pub(super) mod tests {
             config: ConfigFile::for_workspace(root.path()).unwrap(),
         };
         (root, App::new(session).unwrap())
+    }
+
+    #[test]
+    fn manual_blanket_approval_survives_version_and_source_changes() {
+        let (root, app) = fixture(&["fn main() {}\n"]);
+        let path = app.session.config.path().to_path_buf();
+        let policy = "# Manual approval\n[approved]\nexample = 'approved'\n";
+        fs::write(&path, policy).unwrap();
+        let mut session = app.session;
+        session.config = ConfigFile::open(session.config.target().clone()).unwrap();
+        session.package.approval =
+            session.config.config().approved["example"].for_review(&session.package.version);
+        let mut app = App::new(session).unwrap();
+        for version in ["0.1.0", "9.8.7"] {
+            app.session.package.version = version.parse().unwrap();
+            assert!(app.is_blanket_approved());
+            assert!(!app.can_decide());
+            assert_eq!(
+                app.displayed_approval_scope(),
+                Some(ApprovalScope::Workspace)
+            );
+            assert!(
+                app.approval_status()
+                    .contains("all versions and fingerprints")
+            );
+            assert!(matches!(app.baseline, Baseline::Blanket));
+            assert!(
+                super::super::sources::BaselineLoader::start(&app.session)
+                    .unwrap()
+                    .is_none()
+            );
+            for decision in [
+                Decision::ApproveFingerprint,
+                Decision::PinVersion,
+                Decision::Reject,
+            ] {
+                assert!(app.decide(decision).is_err());
+                assert_eq!(app.decision, None);
+                assert!(app.pin_dialog.is_none());
+                assert_eq!(fs::read_to_string(&path).unwrap(), policy);
+            }
+        }
+        fs::write(&app.session.package.scripts[0].path, "changed inputs\n").unwrap();
+        assert!(app.refresh_sources().unwrap());
+        assert!(matches!(app.baseline, Baseline::Blanket));
+        assert!(!app.can_decide());
+        assert!(!root.path().join("target").exists());
     }
 
     #[test]

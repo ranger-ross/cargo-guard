@@ -538,6 +538,7 @@ fn heading(app: &App) -> Line<'static> {
         ("Reviewing", Color::Green)
     };
     let supplemental_only = app.globally_approved
+        && !app.is_blanket_approved()
         && !app.is_current_version_approved()
         && !app.is_current_fingerprint_approved();
     let baseline_version = if supplemental_only {
@@ -563,6 +564,7 @@ fn heading(app: &App) -> Line<'static> {
     } else {
         match &package.approval {
             None => " (new)",
+            Some(ApprovedVersion::Blanket(_)) => " (all versions and fingerprints)",
             Some(ApprovedVersion::Fingerprint(_)) => " (fingerprint)",
             _ => "",
         }
@@ -790,6 +792,24 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal.draw(|frame| render(frame, &mut app)).unwrap();
         }
+    }
+
+    #[test]
+    fn blanket_approval_displays_its_scope_without_version_or_fingerprint_checks() {
+        let (_root, mut app) = fixture(&["fn main() {}\n"]);
+        app.session.package.approval = Some(ApprovedVersion::Blanket(
+            crate::config::BlanketApproval::Approved,
+        ));
+        app.set_baseline(Baseline::for_session(&app.session))
+            .unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let text = screen(&terminal);
+        assert!(text.contains("Approved example v0.1.0 (all versions and fingerprints)"));
+        assert!(!text.contains("Fetching"));
+        assert!(!text.contains("Checking"));
+        assert!(!text.contains("[a]"));
+        assert!(!text.contains("[r]"));
     }
 
     #[test]

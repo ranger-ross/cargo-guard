@@ -84,6 +84,9 @@ foo = ["1.0.0", "1.2.0"]
 
 # Allow multiple version and fingeprints mixed
 foo = ["1.0.0", "f7609b919173e7121493266d0f89db724a1e47bb105ebd05397f869639603eec+61d8c10f3feb6de7#1.1.5"]
+
+# Allow all version from this crate
+foo = "approved"
 ```
 
 

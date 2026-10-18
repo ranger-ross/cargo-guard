@@ -305,9 +305,15 @@ impl QueueState {
                 entry.approvals = approvals.cloned();
                 entry.package.approval =
                     approvals.and_then(|approval| approval.for_review(&entry.package.version));
-                if entry.decision == Some(Decision::PinVersion)
-                    && !approvals
-                        .is_some_and(|approval| approval.allows_version(&entry.package.version))
+                if entry
+                    .package
+                    .approval
+                    .as_ref()
+                    .is_some_and(ApprovedVersion::is_blanket)
+                    || (entry.decision == Some(Decision::PinVersion)
+                        && !approvals.is_some_and(|approval| {
+                            approval.allows_version(&entry.package.version)
+                        }))
                 {
                     entry.decision = None;
                 }
@@ -404,7 +410,10 @@ impl QueueState {
         if let Some(app) = &self.app
             && !matches!(
                 app.baseline,
-                Baseline::Ready(_) | Baseline::CurrentVersion | Baseline::CurrentFingerprint(_)
+                Baseline::Ready(_)
+                    | Baseline::Blanket
+                    | Baseline::CurrentVersion
+                    | Baseline::CurrentFingerprint(_)
             )
         {
             match BaselineLoader::start(&app.session) {
@@ -722,12 +731,18 @@ impl Entry {
 
     fn already_approved(&self) -> bool {
         matches!(self.verification, Some(Verification::Verified(_)))
-            || matches!(&self.package.approval, Some(ApprovedVersion::SemVer(version)) if version == &self.package.version)
+            || self
+                .approvals
+                .as_ref()
+                .is_some_and(|approval| approval.allows_version(&self.package.version))
     }
 
     fn needs_verification(&self) -> bool {
         self.decision != Some(Decision::Reject)
-            && !matches!(&self.package.approval, Some(ApprovedVersion::SemVer(version)) if version == &self.package.version)
+            && !self
+                .approvals
+                .as_ref()
+                .is_some_and(|approval| approval.allows_version(&self.package.version))
             && self.approvals.as_ref().is_some_and(|approval| {
                 approval
                     .entries()
@@ -848,6 +863,137 @@ mod tests {
         let path = target.path.clone();
         state.global_target = Some(target);
         path
+    }
+
+    #[test]
+    fn blanket_approvals_cover_every_queued_version_without_verification() {
+        let (root, state) = fixture();
+        let policy = "# Manual approval\n[approved]\nduplicate = 'approved'\n";
+        fs::write(&state.approval_target.path, policy).unwrap();
+        let mut state = reopen(&state);
+        let indices: Vec<_> = state
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| (entry.package.name == "duplicate").then_some(index))
+            .collect();
+        assert_eq!(indices.len(), 2);
+        assert_eq!(state.summary().already_approved, 2);
+        for index in indices {
+            state.open(index);
+            let entry = &state.entries[index];
+            assert!(entry.already_approved());
+            assert!(!entry.actionable());
+            assert!(!entry.needs_verification());
+            assert!(!entry.checking);
+            assert!(entry.verification.is_none());
+            assert_eq!(entry.status(), "already approved");
+            assert!(state.loader.is_none());
+            let app = state.app.as_ref().unwrap();
+            assert!(matches!(app.baseline, Baseline::Blanket));
+            assert!(!app.can_decide());
+            assert!(app.verification_message.is_none());
+            for decision in [
+                Decision::ApproveFingerprint,
+                Decision::PinVersion,
+                Decision::Reject,
+            ] {
+                assert!(state.decide(decision).is_err());
+            }
+            assert_eq!(
+                fs::read_to_string(&state.approval_target.path).unwrap(),
+                policy
+            );
+        }
+        assert!(!root.path().join("target").exists());
+    }
+
+    #[test]
+    fn manual_blanket_refresh_clears_decisions_and_removal_restores_review() {
+        let (_root, mut state) = fixture();
+        let name = state.entries[0].package.name.clone();
+        state.decide(Decision::Reject).unwrap();
+        state.open(0);
+        assert_eq!(state.entries[0].decision, Some(Decision::Reject));
+        let policy = format!("[approved]\n{name} = 'approved'\n");
+        fs::write(&state.approval_target.path, &policy).unwrap();
+        state.last_refresh -= RECHECK_INTERVAL;
+        state.poll();
+        assert_eq!(state.entries[0].decision, None);
+        assert_eq!(state.entries[0].status(), "already approved");
+        assert!(matches!(
+            state.app.as_ref().unwrap().baseline,
+            Baseline::Blanket
+        ));
+        assert!(!state.app.as_ref().unwrap().can_decide());
+        assert!(state.loader.is_none());
+        assert_eq!(
+            fs::read_to_string(&state.approval_target.path).unwrap(),
+            policy
+        );
+
+        fs::write(&state.approval_target.path, "[approved]\n").unwrap();
+        state.last_refresh -= RECHECK_INTERVAL;
+        state.poll();
+        assert!(state.entries[0].actionable());
+        assert!(state.app.as_ref().unwrap().can_decide());
+        assert!(matches!(
+            state.app.as_ref().unwrap().baseline,
+            Baseline::NewPackage
+        ));
+    }
+
+    #[test]
+    fn global_blanket_is_informational_until_selected_as_the_write_target() {
+        let (_root, mut state) = fixture();
+        let name = &state.entries[0].package.name;
+        let target = ApprovalTarget {
+            path: state.workspace_root.join("global-approvals.toml"),
+            scope: crate::config::ApprovalScope::Global,
+        };
+        let policy = format!("[approved]\n{name} = 'approved'\n");
+        fs::write(&target.path, &policy).unwrap();
+        state.global_target = Some(target.clone());
+        let mut state = reopen(&state);
+        assert!(state.entries[0].globally_approved());
+        assert!(!state.entries[0].needs_global_verification());
+        assert!(!state.entries[0].global_checking);
+        assert!(state.entries[0].global_verification.is_none());
+        assert!(state.entries[0].actionable());
+        assert_eq!(state.entries[0].status(), "approved globally");
+        assert_eq!(
+            state.app.as_ref().unwrap().displayed_approval_scope(),
+            Some(crate::config::ApprovalScope::Global)
+        );
+        assert!(state.app.as_ref().unwrap().can_decide());
+        state.decide(Decision::PinVersion).unwrap();
+        assert_eq!(fs::read_to_string(&target.path).unwrap(), policy);
+        let workspace_policy = fs::read(&state.approval_target.path).unwrap();
+
+        let workspace_path = state.approval_target.path.clone();
+        state.approval_target = target.clone();
+        state.global_target = None;
+        let mut state = reopen(&state);
+        state.open(0);
+        assert!(state.entries[0].already_approved());
+        assert!(!state.entries[0].needs_verification());
+        assert!(matches!(
+            state.app.as_ref().unwrap().baseline,
+            Baseline::Blanket
+        ));
+        assert_eq!(
+            state.app.as_ref().unwrap().displayed_approval_scope(),
+            Some(crate::config::ApprovalScope::Global)
+        );
+        for decision in [
+            Decision::ApproveFingerprint,
+            Decision::PinVersion,
+            Decision::Reject,
+        ] {
+            assert!(state.decide(decision).is_err());
+        }
+        assert_eq!(fs::read_to_string(&target.path).unwrap(), policy);
+        assert_eq!(fs::read(&workspace_path).unwrap(), workspace_policy);
     }
 
     fn global_fingerprint_fixture() -> (tempfile::TempDir, QueueState, PathBuf) {

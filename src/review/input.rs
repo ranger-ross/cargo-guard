@@ -125,19 +125,22 @@ mod tests {
     }
 
     #[test]
-    fn approved_versions_ignore_approval_and_rejection_keys() {
+    fn approved_versions_and_blankets_ignore_approval_and_rejection_keys() {
         let (_root, mut app) = fixture(&["fn main() {}"]);
-        app.session.package.approval = Some(crate::config::ApprovedVersion::SemVer(
-            app.session.package.version.clone(),
-        ));
-        for character in ['a', 'r', 'f'] {
-            assert_eq!(
-                handle_key(
-                    &mut app,
-                    KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)
-                ),
-                Action::Continue
-            );
+        for approval in [
+            crate::config::ApprovedVersion::SemVer(app.session.package.version.clone()),
+            crate::config::ApprovedVersion::Blanket(crate::config::BlanketApproval::Approved),
+        ] {
+            app.session.package.approval = Some(approval);
+            for character in ['a', 'r', 'f'] {
+                assert_eq!(
+                    handle_key(
+                        &mut app,
+                        KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)
+                    ),
+                    Action::Continue
+                );
+            }
         }
     }
 

@@ -36,6 +36,7 @@ pub struct ScriptSource {
 #[derive(Debug)]
 pub enum Baseline {
     NewPackage,
+    Blanket,
     CurrentVersion,
     CurrentFingerprint(Arc<[ScriptSource]>),
     Fingerprint,
@@ -59,6 +60,7 @@ impl Baseline {
                 unreachable!("review selects a representative approval")
             }
             None => Self::NewPackage,
+            Some(ApprovedVersion::Blanket(_)) => Self::Blanket,
             Some(ApprovedVersion::Fingerprint(fingerprint)) => {
                 ParsedFingerprint::parse(fingerprint)
                     .map(|parsed| Self::Loading(parsed.version))
@@ -74,6 +76,7 @@ impl Baseline {
     pub fn message(&self) -> String {
         match self {
             Self::NewPackage => "Baseline: none (new approval)".into(),
+            Self::Blanket => "Baseline: all versions and fingerprints are manually approved".into(),
             Self::CurrentVersion => "Baseline: current version is already approved".into(),
             Self::CurrentFingerprint(_) => "Baseline: current build-script fingerprints are already approved".into(),
             Self::Fingerprint => {
