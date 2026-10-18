@@ -103,4 +103,4 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.2
 
       - name: Run tests
-        run: cargo nextest run --all-features --all-targets
+        run: cargo nextest run --all-features --all-targets --no-fail-fast

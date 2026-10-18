@@ -1210,7 +1210,10 @@ mod tests {
             reopened.approval_target.scope,
             crate::config::ApprovalScope::Global
         );
-        assert_eq!(reopened.approval_target.path, global);
+        assert_eq!(
+            reopened.approval_target.path,
+            global.canonicalize().unwrap()
+        );
         assert_eq!(reopened.workspace_root, state.workspace_root);
         let next = reopened
             .entries

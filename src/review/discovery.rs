@@ -335,7 +335,7 @@ mod tests {
             global_queue.workspace_root,
             metadata.workspace_root.as_std_path()
         );
-        assert_eq!(global_queue.config.path(), global);
+        assert_eq!(global_queue.config.path(), global.canonicalize().unwrap());
         assert!(
             global_queue
                 .packages
