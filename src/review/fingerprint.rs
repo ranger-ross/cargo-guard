@@ -225,8 +225,7 @@ fn calculate(
             .last()
             .with_context(|| format!(
                 "No compiled dep-info found for {} v{}.\n\
-                 Build a workspace target that uses this dependency with the intended features, target and \
-                 Cargo build directory, then retry fingerprint approval.\n\n\
+                 Build a workspace target using this dependency with the same features, target and build directory, then retry.\n\
                  Script: {}\n\
                  Searched: {}",
                 package.name, package.version, script.path.display(), directory.display()
@@ -243,7 +242,7 @@ fn calculate(
                     .modified()?;
                 eyre::ensure!(
                     modified <= *compiled,
-                    "{} is newer than {}; rebuild to refresh tracked inputs (cargo clean -p {} if needed)",
+                    "{} is newer than {}. Rebuild (cargo clean -p {} if needed)",
                     path.display(),
                     artifact.display(),
                     package.name
@@ -265,11 +264,11 @@ fn calculate(
         check_fresh()?;
         eyre::ensure!(
             fs::read_to_string(artifact)? == *contents,
-            "compiled inputs changed during review; reopen review"
+            "compiled inputs changed. Reopen review"
         );
         eyre::ensure!(
             fs::metadata(artifact)?.modified()? == *compiled,
-            "compiled artifact changed during review; reopen review"
+            "compiled artifact changed. Reopen review"
         );
         eyre::ensure!(
             !cancelled.load(Ordering::Relaxed),

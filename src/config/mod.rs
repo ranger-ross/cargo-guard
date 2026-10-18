@@ -55,14 +55,16 @@ impl<'a> RunnerPaths<'a> {
 }
 
 fn validate_path(name: &str, value: Option<std::ffi::OsString>) -> eyre::Result<Option<PathBuf>> {
-    value.map(|value| {
-        let path = PathBuf::from(value);
-        eyre::ensure!(
-            !path.as_os_str().is_empty() && path.is_absolute(),
-            "{name} must be a nonempty absolute path; use an absolute path or Cargo relative = true"
-        );
-        Ok(path)
-    }).transpose()
+    value
+        .map(|value| {
+            let path = PathBuf::from(value);
+            eyre::ensure!(
+                !path.as_os_str().is_empty() && path.is_absolute(),
+                "{name} must be an absolute path (or use Cargo relative = true)"
+            );
+            Ok(path)
+        })
+        .transpose()
 }
 
 pub fn review_global_path(cwd: &Path) -> eyre::Result<Option<PathBuf>> {
@@ -94,9 +96,7 @@ pub fn review_target(
             Some(home) => std::path::absolute(home).context("could not resolve CARGO_HOME")?,
             None => env::home_dir()
                 .ok_or_else(|| {
-                    eyre::eyre!(
-                        "could not find home directory; set {GLOBAL_PATH} to an absolute path"
-                    )
+                    eyre::eyre!("home directory not found. Set {GLOBAL_PATH} to an absolute path")
                 })?
                 .join(".cargo"),
         };

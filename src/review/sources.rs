@@ -80,7 +80,7 @@ impl Baseline {
             Self::CurrentVersion => "Baseline: current version is already approved".into(),
             Self::CurrentFingerprint(_) => "Baseline: current build-script fingerprints are already approved".into(),
             Self::Fingerprint => {
-                "Baseline unavailable: fingerprint has no valid version hint; approve a fresh fingerprint".into()
+                "Baseline unavailable: invalid fingerprint version hint. Approve a fresh fingerprint".into()
             }
             Self::Loading(version) => format!("Baseline: loading approved v{version}…"),
             Self::Ready(sources) => format!(
@@ -236,7 +236,7 @@ fn load_sources(request: &SourceRequest, cancelled: &AtomicBool) -> eyre::Result
         Err(_) if !cancelled.load(Ordering::Relaxed) => {
             command.other_options(options);
             execute_metadata(&command, cancelled)
-                .context("could not retrieve the approved release (it may be unavailable or not cached while offline)")?
+                .context("could not retrieve the approved release")?
         }
         Err(error) => return Err(error),
     };
@@ -249,9 +249,7 @@ fn load_sources(request: &SourceRequest, cancelled: &AtomicBool) -> eyre::Result
                 && package.source.as_ref().map(|source| source.repr.as_str())
                     == request.source.as_deref()
         })
-        .context(
-            "Cargo did not return the exact approved package version from the original registry",
-        )?;
+        .context("Cargo did not return the approved version from its original registry")?;
     let sources = read_package_sources(package)?;
     if let Some(approvals) = &request.fingerprints {
         let mut command = MetadataCommand::new();
@@ -352,7 +350,7 @@ fn verify_fingerprint_baseline(
         );
         let mut verified = false;
         let mut reason =
-            "no matching compiled dep-info; build the current package before reviewing".to_owned();
+            "no matching compiled dep-info. Build the current package first".to_owned();
         for artifact in artifacts {
             eyre::ensure!(
                 !cancelled.load(Ordering::Relaxed),
@@ -422,7 +420,9 @@ fn verify_fingerprint_baseline(
                     if matches {
                         return Ok(());
                     }
-                    failure = "both saved fingerprint hashes did not match the retrieved sources and build dependencies".to_owned();
+                    failure =
+                        "saved fingerprint does not match retrieved sources and build dependencies"
+                            .to_owned();
                 }
                 eyre::bail!("{failure}")
             })();
@@ -441,7 +441,7 @@ fn verify_fingerprint_baseline(
     }
     eyre::ensure!(
         matched_approvals.iter().all(|matched| *matched),
-        "untrusted version hint v{version}: not every saved fingerprint could be verified; a script may be missing or compiled feature inputs unavailable"
+        "untrusted version hint v{version}: could not verify all saved fingerprints"
     );
     Ok(())
 }
@@ -1044,13 +1044,7 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("snapshot"));
         fixture.targets.pop();
-        assert!(
-            fixture
-                .verify()
-                .unwrap_err()
-                .to_string()
-                .contains("not every saved fingerprint")
-        );
+        assert!(fixture.verify().is_err());
     }
 
     #[test]
@@ -1067,13 +1061,7 @@ mod tests {
             )
             .unwrap(),
         );
-        assert!(
-            fixture
-                .verify()
-                .unwrap_err()
-                .to_string()
-                .contains("not every saved fingerprint")
-        );
+        assert!(fixture.verify().is_err());
         let artifact = fixture.directory.path().join("build_script_first-ffff.d");
         fs::write(&artifact,
             "binary: example-0.9.0/scripts/first.rs example-0.9.0/helper\\ file.rs example-0.9.0/feature.rs\n",

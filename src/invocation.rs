@@ -239,9 +239,7 @@ impl CargoSelection {
 
     fn finish(self, needs_owner: bool) -> eyre::Result<(usize, Option<usize>)> {
         let nearest = self.nearest.ok_or_else(|| {
-            eyre::eyre!(
-                "no live invoking Cargo process found; standalone runner invocation is unsupported"
-            )
+            eyre::eyre!("no invoking Cargo process found. Run build scripts through Cargo")
         })?;
         if needs_owner {
             ensure!(
@@ -278,7 +276,7 @@ struct CargoArguments {
 fn metadata(process: &ProcessSnapshot, cargo: &Path) -> eyre::Result<Metadata> {
     ensure!(
         process.exe == cargo,
-        "Cargo process {} uses a different executable from CARGO; cross-toolchain guarded ancestry is unsupported",
+        "Cargo process {} uses a different executable from CARGO",
         process.pid
     );
     ensure!(

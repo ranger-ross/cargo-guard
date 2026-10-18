@@ -84,13 +84,12 @@ fn check_approval(
     };
     let guidance = || {
         format!(
-            "Approvals ({}): {}\nRun cargo guard review{} {}@{} to review this script. If missing, this creates {}.",
+            "Approvals ({}): {}\nRun cargo guard review{} {}@{}",
             target.scope,
             target.path.display(),
             flag,
             build_script.name,
-            build_script.version,
-            target.path.display()
+            build_script.version
         )
     };
     let approval = approvals.config.approved.get(&build_script.name);

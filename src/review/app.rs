@@ -134,7 +134,7 @@ impl App {
         if let Baseline::CurrentFingerprint(verified) = &baseline {
             eyre::ensure!(
                 verified == &self.current,
-                "verified build script sources differ from the displayed sources; reopen review"
+                "displayed sources differ from verified sources. Reopen review"
             );
         }
         if let (Baseline::CurrentFingerprint(old), Baseline::CurrentFingerprint(new)) =
@@ -156,7 +156,7 @@ impl App {
         }
         eyre::ensure!(
             !self.is_blanket_approved(),
-            "all versions and fingerprints are manually approved; edit the configuration to change this approval"
+            "blanket approval must be changed in the config file"
         );
         if decision == Decision::ApproveFingerprint {
             return self.approve_fingerprints();
@@ -427,12 +427,12 @@ impl App {
         self.pin_dialog = None;
         eyre::ensure!(
             read_sources(&self.session)?.as_slice() == self.current.as_ref(),
-            "build script sources changed since opening review; reopen review before approving"
+            "build script sources changed. Reopen review before approving"
         );
         let approvals = super::fingerprint::approvals(&self.session);
         eyre::ensure!(
             read_sources(&self.session)?.as_slice() == self.current.as_ref(),
-            "build script sources changed since opening review; reopen review before approving"
+            "build script sources changed. Reopen review before approving"
         );
         let approvals = match approvals {
             Ok(approvals) => approvals,

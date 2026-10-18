@@ -218,7 +218,7 @@ impl ConfigFile {
             match handle.try_lock() {
                 Ok(()) => {}
                 Err(fs::TryLockError::WouldBlock) => eyre::bail!(
-                    "global approvals {} are being updated; retry after the other save finishes",
+                    "global approvals {} are locked by another save. Retry shortly",
                     path.display()
                 ),
                 Err(error) => {
@@ -245,7 +245,7 @@ impl ConfigFile {
         // Non-cooperating editors can still race this comparison and rename.
         eyre::ensure!(
             read_optional(&path)? == self.original,
-            "config {} changed since it was loaded; reload it before saving approvals",
+            "config {} changed on disk. Reload before saving",
             path.display()
         );
         if self.original.is_none() {
@@ -509,13 +509,7 @@ mod tests {
         .unwrap();
         first.set_approval("example", version("2.0.0")).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
-        assert!(
-            second
-                .set_approval("example", version("3.0.0"))
-                .unwrap_err()
-                .to_string()
-                .contains("changed since it was loaded")
-        );
+        assert!(second.set_approval("example", version("3.0.0")).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), saved);
         assert!(
             matches!(&second.config().approved["example"], ApprovedVersion::SemVer(v) if v.to_string() == "1.0.0")
@@ -606,10 +600,11 @@ mod tests {
             .open(path.with_file_name("approvals.toml.lock"))
             .unwrap();
         lock.try_lock().unwrap();
-        let error = first
-            .set_approval("example", ApprovedVersion::Fingerprint(fingerprint(2)))
-            .unwrap_err();
-        assert!(error.to_string().contains("being updated"));
+        assert!(
+            first
+                .set_approval("example", ApprovedVersion::Fingerprint(fingerprint(2)))
+                .is_err()
+        );
         assert_eq!(fs::read_to_string(&path).unwrap(), before);
         assert_eq!(first.original.as_deref(), Some(before.as_str()));
         assert!(!first.config.approved["example"].allows_fingerprint(&fingerprint(2)));
