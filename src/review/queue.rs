@@ -317,7 +317,8 @@ mod tests {
 
     fn fixture() -> (tempfile::TempDir, QueueState) {
         let (root, metadata) = super::super::tests::fixture();
-        let queue = ReviewQueue::from_metadata(&metadata).unwrap();
+        let queue =
+            ReviewQueue::from_metadata(&metadata, &crate::args::ReviewOptions::default()).unwrap();
         (root, QueueState::new(queue))
     }
 
@@ -528,7 +529,8 @@ mod tests {
     #[test]
     fn view_cache_is_bounded() {
         let (_root, metadata) = super::super::tests::fixture();
-        let mut queue = ReviewQueue::from_metadata(&metadata).unwrap();
+        let mut queue =
+            ReviewQueue::from_metadata(&metadata, &crate::args::ReviewOptions::default()).unwrap();
         let template = queue.packages[0].clone();
         for index in 0..VIEW_CACHE_CAPACITY + 4 {
             let mut package = template.clone();
@@ -548,7 +550,8 @@ mod tests {
     fn navigation_benchmark() {
         let (root, metadata) = super::super::tests::fixture();
         let code: String = (0..200).map(|i| format!("fn helper_{i}() {{ let message = \"build script input\"; println!(\"{{message}}\"); }}\n")).collect();
-        let queue = ReviewQueue::from_metadata(&metadata).unwrap();
+        let queue =
+            ReviewQueue::from_metadata(&metadata, &crate::args::ReviewOptions::default()).unwrap();
         for package in &queue.packages {
             for script in &package.scripts {
                 fs::write(&script.path, &code).unwrap();
@@ -594,7 +597,9 @@ mod tests {
             .manifest_path(root.path().join("Cargo.toml"))
             .exec()
             .unwrap();
-        let reopened = QueueState::new(ReviewQueue::from_metadata(&metadata).unwrap());
+        let reopened = QueueState::new(
+            ReviewQueue::from_metadata(&metadata, &crate::args::ReviewOptions::default()).unwrap(),
+        );
         assert_eq!(
             reopened.entries[reopened.selected].package.name,
             "default-script"
@@ -617,7 +622,9 @@ mod tests {
             "[approved]\ncustom-script='2.0.0'\ndefault-script='fingerprint'\nduplicate=['1.0.0','2.0.0']\n",
         )
         .unwrap();
-        let mut state = QueueState::new(ReviewQueue::from_metadata(&metadata).unwrap());
+        let mut state = QueueState::new(
+            ReviewQueue::from_metadata(&metadata, &crate::args::ReviewOptions::default()).unwrap(),
+        );
         assert_eq!(state.selected, 1);
         assert_eq!(state.entries[state.selected].status(), "fingerprint");
         assert!(state.app.as_ref().unwrap().can_decide());

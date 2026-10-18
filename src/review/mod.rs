@@ -49,7 +49,7 @@ pub fn run(package: Option<&str>, options: &ReviewOptions) -> eyre::Result<()> {
         .context("could not load workspace metadata for review")?;
     if let Some(selector) = package {
         let (name, version) = package_selector(selector)?;
-        let candidates = discovery::resolved_packages(&metadata)?;
+        let candidates = discovery::resolved_packages(&metadata, options)?;
         let named: Vec<_> = candidates
             .into_iter()
             .filter(|p| p.name.as_str() == name && version.as_ref().is_none_or(|v| v == &p.version))
@@ -64,17 +64,21 @@ pub fn run(package: Option<&str>, options: &ReviewOptions) -> eyre::Result<()> {
             );
             return Ok(());
         }
-        tui::run(ReviewSession::from_metadata(&metadata, selector)?)
+        tui::run(ReviewSession::from_metadata(&metadata, selector, options)?)
     } else {
-        let queue = discovery::ReviewQueue::from_metadata(&metadata)?;
+        let queue = discovery::ReviewQueue::from_metadata(&metadata, options)?;
         tui::run_queue(queue)
     }
 }
 
 impl ReviewSession {
-    fn from_metadata(metadata: &Metadata, name: &str) -> eyre::Result<Self> {
+    fn from_metadata(
+        metadata: &Metadata,
+        name: &str,
+        options: &ReviewOptions,
+    ) -> eyre::Result<Self> {
         let (name, version) = package_selector(name)?;
-        let mut candidates: Vec<_> = discovery::resolved_packages(metadata)?
+        let mut candidates: Vec<_> = discovery::resolved_packages(metadata, options)?
             .into_iter()
             .filter(|package| package.name.as_str() == name)
             .filter(|package| version.as_ref().is_none_or(|v| v == &package.version))
@@ -85,6 +89,17 @@ impl ReviewSession {
                 .cmp(&b.version)
                 .then_with(|| a.id.repr.cmp(&b.id.repr))
         });
+        if candidates.is_empty()
+            && metadata.packages.iter().any(|package| {
+                package.name.as_str() == name
+                    && version.as_ref().is_none_or(|v| v == &package.version)
+                    && !crate::workspace::is_member(metadata, package)
+            })
+        {
+            eyre::bail!(
+                "package `{name}` is present in Cargo metadata but is not active in the selected dependency graph; check the enabled features and --target before building or reviewing it"
+            );
+        }
         eyre::ensure!(
             !candidates.is_empty(),
             "package `{name}` was not found in the workspace dependency graph"
@@ -165,13 +180,24 @@ mod tests {
     #[test]
     fn version_selector_disambiguates_packages() {
         let (_root, metadata) = fixture();
-        let session = ReviewSession::from_metadata(&metadata, "duplicate@2.0.0").unwrap();
+        let session = ReviewSession::from_metadata(
+            &metadata,
+            "duplicate@2.0.0",
+            &crate::args::ReviewOptions::default(),
+        )
+        .unwrap();
         assert_eq!(
             session.package.version,
             "2.0.0".parse::<semver::Version>().unwrap()
         );
-        assert!(ReviewSession::from_metadata(&metadata, "duplicate@3.0.0").is_err());
-        assert!(ReviewSession::from_metadata(&metadata, "duplicate@invalid").is_err());
+        assert!(
+            ReviewSession::from_metadata(&metadata, "duplicate@3.0.0", &ReviewOptions::default())
+                .is_err()
+        );
+        assert!(
+            ReviewSession::from_metadata(&metadata, "duplicate@invalid", &ReviewOptions::default())
+                .is_err()
+        );
     }
 
     fn write(root: &Path, path: &str, content: &str) {
@@ -253,8 +279,15 @@ mod tests {
 
         let (root, metadata) = fixture();
         let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
-        let mut app =
-            App::new(ReviewSession::from_metadata(&metadata, "default-script").unwrap()).unwrap();
+        let mut app = App::new(
+            ReviewSession::from_metadata(
+                &metadata,
+                "default-script",
+                &crate::args::ReviewOptions::default(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(app.file().status, FileStatus::Added);
         assert_eq!(
             input::handle_key(&mut app, key('a')),
@@ -262,8 +295,15 @@ mod tests {
         );
         app.decide(Decision::Approve).unwrap();
         let saved = fs::read(app.session.config.path()).unwrap();
-        let mut reopened =
-            App::new(ReviewSession::from_metadata(&metadata, "default-script").unwrap()).unwrap();
+        let mut reopened = App::new(
+            ReviewSession::from_metadata(
+                &metadata,
+                "default-script",
+                &crate::args::ReviewOptions::default(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         assert!(reopened.is_current_version_approved());
         assert_eq!(input::handle_key(&mut reopened, key('r')), Action::Continue);
         assert_eq!(input::handle_key(&mut reopened, key('q')), Action::Quit);
@@ -279,8 +319,15 @@ mod tests {
             .other_options(vec!["--offline".into()])
             .exec()
             .unwrap();
-        let mut app =
-            App::new(ReviewSession::from_metadata(&upgraded, "default-script").unwrap()).unwrap();
+        let mut app = App::new(
+            ReviewSession::from_metadata(
+                &upgraded,
+                "default-script",
+                &crate::args::ReviewOptions::default(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         // Supply the fixture's previous source snapshot; real registry retrieval
         // is exercised separately by the source-loading tests.
         app.set_baseline(Baseline::Ready(PackageSources {
@@ -300,10 +347,22 @@ mod tests {
         app.decide(Decision::Reject).unwrap();
         assert_eq!(fs::read(app.session.config.path()).unwrap(), saved);
 
-        let mut app =
-            App::new(ReviewSession::from_metadata(&upgraded, "default-script").unwrap()).unwrap();
+        let mut app = App::new(
+            ReviewSession::from_metadata(
+                &upgraded,
+                "default-script",
+                &crate::args::ReviewOptions::default(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
         app.decide(Decision::Approve).unwrap();
-        let reopened = ReviewSession::from_metadata(&upgraded, "default-script").unwrap();
+        let reopened = ReviewSession::from_metadata(
+            &upgraded,
+            "default-script",
+            &crate::args::ReviewOptions::default(),
+        )
+        .unwrap();
         assert!(
             matches!(reopened.package.approval, Some(ApprovedVersion::SemVer(v)) if v == semver::Version::new(1, 1, 0))
         );
@@ -313,7 +372,12 @@ mod tests {
     #[test]
     fn discovers_dependency_scripts_and_workspace_approvals() {
         let (root, metadata) = fixture();
-        let session = ReviewSession::from_metadata(&metadata, "default-script").unwrap();
+        let session = ReviewSession::from_metadata(
+            &metadata,
+            "default-script",
+            &crate::args::ReviewOptions::default(),
+        )
+        .unwrap();
         assert_eq!(session.package.scripts.len(), 1);
         assert_eq!(
             session.package.scripts[0].path,
@@ -327,7 +391,12 @@ mod tests {
             "approved-builds.toml",
             "[approved]\ncustom-script = '1.0.0'\n",
         );
-        let session = ReviewSession::from_metadata(&metadata, "custom-script").unwrap();
+        let session = ReviewSession::from_metadata(
+            &metadata,
+            "custom-script",
+            &crate::args::ReviewOptions::default(),
+        )
+        .unwrap();
         assert_eq!(session.package.version, semver::Version::new(2, 0, 0));
         assert_eq!(
             session.package.scripts[0].path,
@@ -351,10 +420,14 @@ mod tests {
             ("no-script", "has no build scripts"),
             ("duplicate", "ambiguous"),
         ] {
-            let error = ReviewSession::from_metadata(&metadata, name)
-                .err()
-                .unwrap()
-                .to_string();
+            let error = ReviewSession::from_metadata(
+                &metadata,
+                name,
+                &crate::args::ReviewOptions::default(),
+            )
+            .err()
+            .unwrap()
+            .to_string();
             assert!(error.contains(message), "{error}");
             if name == "duplicate" {
                 assert!(error.contains("duplicate v1.0.0"));
@@ -382,7 +455,12 @@ mod tests {
         second.name = "build-script-second".into();
         second.src_path = second.src_path.parent().unwrap().join("second.rs");
         package.targets.push(second);
-        let session = ReviewSession::from_metadata(&metadata, "custom-script").unwrap();
+        let session = ReviewSession::from_metadata(
+            &metadata,
+            "custom-script",
+            &crate::args::ReviewOptions::default(),
+        )
+        .unwrap();
         assert_eq!(session.package.scripts.len(), 2);
         assert!(session.package.scripts[0].path.ends_with("custom.rs"));
         assert!(session.package.scripts[1].path.ends_with("second.rs"));

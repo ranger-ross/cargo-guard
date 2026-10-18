@@ -528,7 +528,11 @@ mod tests {
     #[test]
     fn renders_queue_and_selected_package_at_different_sizes() {
         let (_root, metadata) = crate::review::tests::fixture();
-        let queue = crate::review::discovery::ReviewQueue::from_metadata(&metadata).unwrap();
+        let queue = crate::review::discovery::ReviewQueue::from_metadata(
+            &metadata,
+            &crate::args::ReviewOptions::default(),
+        )
+        .unwrap();
         let mut state = QueueState::new(queue);
         let mut terminal = Terminal::new(TestBackend::new(160, 30)).unwrap();
         terminal

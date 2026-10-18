@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use cargo_metadata::{CargoOpt, Metadata, MetadataCommand, Package};
+use cargo_metadata::{CargoOpt, Metadata, MetadataCommand, Node, NodeDep, Package};
 use eyre::ContextCompat;
 
 use super::ReviewPackage;
@@ -30,10 +30,13 @@ pub fn metadata_command(options: &ReviewOptions) -> MetadataCommand {
     command
 }
 
-/// Metadata's packages list can include inactive packages. Walk the resolved
-/// edges from every workspace member, keeping normal/build/dev dependencies.
+/// Metadata can expose inactive optional edges through weak feature forwarding.
+/// Walk enabled edges from every workspace member, retaining normal/build/dev.
 /// This is a package graph, not Cargo's exact compilation-unit graph.
-pub fn resolved_packages(metadata: &Metadata) -> eyre::Result<Vec<&Package>> {
+pub fn resolved_packages<'a>(
+    metadata: &'a Metadata,
+    options: &ReviewOptions,
+) -> eyre::Result<Vec<&'a Package>> {
     let resolve = metadata
         .resolve
         .as_ref()
@@ -47,6 +50,20 @@ pub fn resolved_packages(metadata: &Metadata) -> eyre::Result<Vec<&Package>> {
         .packages
         .iter()
         .map(|package| (package.id.repr.as_str(), package))
+        .collect();
+    let workspace_names: BTreeSet<_> = metadata
+        .packages
+        .iter()
+        .filter(|package| crate::workspace::is_member(metadata, package))
+        .map(|package| package.name.as_str())
+        .collect();
+    // Metadata omits direct CLI dependency-feature activation from Node.features.
+    let explicit_dependencies: BTreeSet<_> = options
+        .features
+        .iter()
+        .flat_map(|value| value.split(|c: char| c == ',' || c.is_whitespace()))
+        .filter_map(|feature| feature.split_once('/').map(|(dependency, _)| dependency))
+        .filter(|dependency| !workspace_names.contains(dependency))
         .collect();
     let mut pending: Vec<_> = metadata.workspace_members.iter().collect();
     let mut visited = BTreeSet::new();
@@ -62,7 +79,21 @@ pub fn resolved_packages(metadata: &Metadata) -> eyre::Result<Vec<&Package>> {
             .get(id.repr.as_str())
             .with_context(|| format!("missing package metadata for {id}"))?;
         result.push(*package);
-        pending.extend(node.deps.iter().map(|dependency| &dependency.pkg));
+        let mut enabled = enabled_optional_dependencies(package, node);
+        if resolve.root.as_ref().map_or_else(
+            || metadata.workspace_members.contains(id),
+            |root| root == id,
+        ) {
+            enabled.extend(explicit_dependencies.iter().copied());
+        }
+        for dependency in &node.deps {
+            let target = packages
+                .get(dependency.pkg.repr.as_str())
+                .with_context(|| format!("missing package metadata for {}", dependency.pkg))?;
+            if dependency_is_active(package, dependency, target, &enabled)? {
+                pending.push(&dependency.pkg);
+            }
+        }
     }
     result.sort_by(|a, b| {
         a.name
@@ -73,15 +104,77 @@ pub fn resolved_packages(metadata: &Metadata) -> eyre::Result<Vec<&Package>> {
     Ok(result)
 }
 
+fn enabled_optional_dependencies<'a>(package: &'a Package, node: &'a Node) -> BTreeSet<&'a str> {
+    node.features
+        .iter()
+        .flat_map(|feature| package.features.get(feature.as_str()).into_iter().flatten())
+        .map(String::as_str)
+        .chain(node.features.iter().map(|feature| feature.as_str()))
+        .filter_map(|feature| {
+            feature.strip_prefix("dep:").or_else(|| {
+                feature
+                    .split_once('/')
+                    .map(|(dependency, _)| dependency)
+                    .filter(|dependency| !dependency.ends_with('?'))
+            })
+        })
+        .collect()
+}
+
+fn dependency_is_active(
+    package: &Package,
+    edge: &NodeDep,
+    target: &Package,
+    enabled: &BTreeSet<&str>,
+) -> eyre::Result<bool> {
+    let matches_name = |name: &str| {
+        name.bytes()
+            .map(|byte| if byte == b'-' { b'_' } else { byte })
+            .eq(edge.name.bytes())
+    };
+    let mut declared = false;
+    for dependency in &package.dependencies {
+        if dependency.name != target.name.as_str() || !dependency.req.matches(&target.version) {
+            continue;
+        }
+        let key = dependency.rename.as_deref().unwrap_or(&dependency.name);
+        if !matches_name(key)
+            && !(dependency.rename.is_none()
+                && target
+                    .targets
+                    .iter()
+                    .any(|target| matches_name(&target.name)))
+        {
+            continue;
+        }
+        declared = true;
+        if edge
+            .dep_kinds
+            .iter()
+            .any(|kind| kind.kind == dependency.kind && kind.target == dependency.target)
+            && (!dependency.optional || enabled.contains(key))
+        {
+            return Ok(true);
+        }
+    }
+    eyre::ensure!(
+        declared,
+        "could not match resolved dependency {} to a declaration in {}",
+        edge.name,
+        package.name
+    );
+    Ok(false)
+}
+
 pub struct ReviewQueue {
     pub packages: Vec<ReviewPackage>,
     pub config: ConfigFile,
 }
 
 impl ReviewQueue {
-    pub fn from_metadata(metadata: &Metadata) -> eyre::Result<Self> {
+    pub fn from_metadata(metadata: &Metadata, options: &ReviewOptions) -> eyre::Result<Self> {
         let config = ConfigFile::for_workspace(metadata.workspace_root.as_std_path())?;
-        let packages: Vec<_> = resolved_packages(metadata)?
+        let packages: Vec<_> = resolved_packages(metadata, options)?
             .into_iter()
             .filter(|package| !crate::workspace::is_member(metadata, package))
             .filter(|package| {
@@ -178,7 +271,7 @@ mod tests {
         let mut command = metadata_command(options);
         command.manifest_path(root.join("Cargo.toml"));
         let metadata = command.exec().unwrap();
-        ReviewQueue::from_metadata(&metadata).unwrap()
+        ReviewQueue::from_metadata(&metadata, options).unwrap()
     }
 
     #[test]
@@ -225,6 +318,80 @@ mod tests {
     }
 
     #[test]
+    fn weak_feature_forwarding_does_not_activate_optional_backend_or_its_dependencies() {
+        let root = tempfile::tempdir().unwrap();
+        write(
+            root.path(),
+            "Cargo.toml",
+            "[package]\nname='consumer'\nversion='1.0.0'\n\
+             [workspace]\nexclude=['backend','leaf']\n\
+             [features]\ndefault=['style']\nstyle=['backend-alias?/color']\n\
+             backend=['dep:backend-alias']\nstrong=['backend-alias/color']\n\
+             [dependencies]\nbackend-alias={package='backend',path='backend',optional=true}\n",
+        );
+        write(root.path(), "src/lib.rs", "");
+        write(
+            root.path(),
+            "backend/Cargo.toml",
+            "[package]\nname='backend'\nversion='1.0.0'\n[workspace]\n\
+             [features]\ncolor=[]\n[dependencies]\nleaf={path='../leaf'}\n",
+        );
+        write(
+            root.path(),
+            "leaf/Cargo.toml",
+            "[package]\nname='leaf'\nversion='1.0.0'\n[workspace]\n[lib]\nname='custom_leaf'\n",
+        );
+        for package in ["backend", "leaf"] {
+            write(root.path(), &format!("{package}/src/lib.rs"), "");
+            write(
+                root.path(),
+                &format!("{package}/build.rs"),
+                "compile_error!(\"review must not build scripts\");",
+            );
+        }
+        let metadata = metadata_command(&ReviewOptions::default())
+            .manifest_path(root.path().join("Cargo.toml"))
+            .exec()
+            .unwrap();
+        let inactive =
+            ReviewQueue::from_metadata(&metadata, &crate::args::ReviewOptions::default()).unwrap();
+        assert!(
+            super::super::ReviewSession::from_metadata(
+                &metadata,
+                "leaf",
+                &ReviewOptions::default()
+            )
+            .is_err()
+        );
+        assert!(
+            inactive.packages.is_empty(),
+            "weak forwarding activated an unused backend: {:?}",
+            inactive.packages
+        );
+        for feature in ["backend", "strong", "backend-alias/color"] {
+            let options = ReviewOptions {
+                features: vec![feature.into()],
+                ..Default::default()
+            };
+            let metadata = metadata_command(&options)
+                .manifest_path(root.path().join("Cargo.toml"))
+                .exec()
+                .unwrap();
+            let active = ReviewQueue::from_metadata(&metadata, &options).unwrap();
+            let selected =
+                super::super::ReviewSession::from_metadata(&metadata, "leaf", &options).unwrap();
+            assert_eq!(selected.package.name, "leaf");
+            let names: Vec<_> = active
+                .packages
+                .iter()
+                .map(|package| package.name.as_str())
+                .collect();
+            assert_eq!(names, ["backend", "leaf"]);
+        }
+        assert!(!root.path().join("target").exists());
+    }
+
+    #[test]
     fn filters_target_specific_edges() {
         let root = fixture();
         for (target, included, excluded) in [
@@ -247,7 +414,8 @@ mod tests {
     #[test]
     fn retains_multiple_versions_for_independent_review() {
         let (root, metadata) = super::super::tests::fixture();
-        let queue = ReviewQueue::from_metadata(&metadata).unwrap();
+        let queue =
+            ReviewQueue::from_metadata(&metadata, &crate::args::ReviewOptions::default()).unwrap();
         assert_eq!(
             queue
                 .packages
