@@ -285,6 +285,56 @@ fn fingerprint_approval_checks_both_hashes_but_ignores_version_hints() {
 }
 
 #[test]
+fn fingerprint_approval_survives_a_real_package_version_change() {
+    let fixture = Fixture::new("[approved]\nguarded-dep = 'legacy-hash'\n");
+    let root = fixture.temp.path().join("workspace");
+    write(
+        &root,
+        "dep/build.rs",
+        r#"fn main() {
+    std::fs::write(
+        std::env::var_os("CARGO_GUARD_E2E_MARKER").expect("missing marker path"),
+        format!("{}:{}\n", env!("CARGO_PKG_VERSION"), include_str!("helper.txt")),
+    )
+    .expect("could not write execution marker");
+}
+"#,
+    );
+    write(&root, "dep/helper.txt", "reviewed");
+
+    let rejected = fixture.build();
+    assert_rejected(&rejected, &fixture.marker(), "guarded-dep v1.0.0");
+    let fingerprint = rejected_fingerprint(&rejected);
+    let policy = format!("[approved]\nguarded-dep = '{fingerprint}'\n");
+    write(&root, "approved-builds.toml", &policy);
+
+    assert_success(&fixture.build());
+    assert_eq!(fs::read(fixture.marker()).unwrap(), b"1.0.0:reviewed\n");
+    fs::remove_file(fixture.marker()).unwrap();
+
+    let manifest = fs::read_to_string(root.join("dep/Cargo.toml")).unwrap();
+    write(
+        &root,
+        "dep/Cargo.toml",
+        &manifest.replace("version = \"1.0.0\"", "version = \"2.0.0\""),
+    );
+    assert_success(&fixture.build());
+    assert_eq!(fs::read(fixture.marker()).unwrap(), b"2.0.0:reviewed\n");
+    assert_eq!(
+        fs::read_to_string(root.join("approved-builds.toml")).unwrap(),
+        policy
+    );
+    fs::remove_file(fixture.marker()).unwrap();
+
+    write(&root, "dep/helper.txt", "unreviewed");
+    assert_rejected(&fixture.build(), &fixture.marker(), "guarded-dep v2.0.0");
+    assert_eq!(
+        fs::read_to_string(root.join("approved-builds.toml")).unwrap(),
+        policy
+    );
+}
+
+#[test]
 fn review_generated_fingerprint_approval_authorizes_a_real_build() {
     let fixture = Fixture::new("[approved]\n");
     let root = fixture.temp.path().join("workspace");
