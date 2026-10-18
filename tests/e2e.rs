@@ -1,8 +1,12 @@
 use std::{
     fmt::Write as _,
     fs,
+    io::{Read, Write as _},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
 };
 
 use sha2::{Digest, Sha256};
@@ -228,6 +232,50 @@ fn fingerprint_approval_checks_both_hashes_but_ignores_version_hints() {
     assert_ne!(changed_script_hash, script_hash);
     assert_eq!(same_inputs_hash, changed_inputs_hash);
     assert!(!fixture.marker().exists());
+}
+
+#[test]
+fn review_generated_fingerprint_approval_authorizes_a_real_build() {
+    let fixture = Fixture::new("[approved]\n");
+    let root = fixture.temp.path().join("workspace");
+    write(
+        &root,
+        "dep/build.rs",
+        r#"fn main() {
+    std::fs::write(
+        std::env::var_os("CARGO_GUARD_E2E_MARKER").expect("missing marker path"),
+        include_str!("helper.txt"),
+    )
+    .expect("could not write execution marker");
+}
+"#,
+    );
+    write(&root, "dep/helper.txt", "reviewed contents\n");
+
+    assert_rejected(&fixture.build(), &fixture.marker(), "guarded-dep v1.0.0");
+    let mut review = fixture.command("workspace", false, &fixture.marker());
+    review.args([
+        env!("CARGO_BIN_EXE_cargo-guard"),
+        "review",
+        "guarded-dep@1.0.0",
+    ]);
+    approve_review(&review);
+    assert!(
+        !fixture.marker().exists(),
+        "review executed the build script"
+    );
+
+    let policy_path = root.join("approved-builds.toml");
+    let saved = fs::read_to_string(&policy_path).unwrap();
+
+    assert_success(&fixture.build());
+    assert_eq!(fs::read(fixture.marker()).unwrap(), b"reviewed contents\n");
+    fs::remove_file(fixture.marker()).unwrap();
+
+    write(&root, "dep/helper.txt", "unreviewed contents\n");
+    let changed = fixture.build();
+    assert_rejected(&changed, &fixture.marker(), "guarded-dep v1.0.0");
+    assert_eq!(fs::read_to_string(&policy_path).unwrap(), saved);
 }
 
 #[test]
@@ -497,16 +545,25 @@ CARGO_GUARD_GLOBAL_APPROVED_BUILDS_PATH = {global}
         marker: &Path,
         args: &[&str],
     ) -> Output {
+        self.command(workspace, configured_root, marker)
+            .arg("cargo")
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("could not run rustup run {TOOLCHAIN} cargo {args:?}: {error}")
+            })
+    }
+
+    fn command(&self, workspace: &str, configured_root: bool, marker: &Path) -> Command {
         let root = self.temp.path();
         let cargo_home = root.join("cargo-home");
         fs::create_dir_all(&cargo_home)
             .unwrap_or_else(|error| panic!("could not create {}: {error}", cargo_home.display()));
         let mut command = Command::new("rustup");
         command
-            .args(["run", TOOLCHAIN, "cargo"])
-            .args(args)
-            .current_dir(root.join(workspace))
-            .stdin(Stdio::null());
+            .args(["run", TOOLCHAIN])
+            .current_dir(root.join(workspace));
         for (key, _) in std::env::vars_os() {
             if key == "CARGO" || key.to_string_lossy().starts_with("CARGO_") {
                 command.env_remove(key);
@@ -528,15 +585,124 @@ CARGO_GUARD_GLOBAL_APPROVED_BUILDS_PATH = {global}
             .env("CARGO_HOME", cargo_home)
             .env("CARGO_TARGET_DIR", root.join(format!("target-{workspace}")))
             .env("CARGO_NET_OFFLINE", "true")
-            .env("CARGO_GUARD_E2E_MARKER", marker)
-            .output()
-            .unwrap_or_else(|error| {
-                panic!(
-                    "could not run rustup run {TOOLCHAIN} cargo {args:?} in {}: {error}",
-                    root.join(workspace).display()
-                )
-            })
+            .env("CARGO_GUARD_E2E_MARKER", marker);
+        command
     }
+}
+
+#[derive(Default)]
+struct TerminalResponses {
+    cursor: Option<(u16, u16)>,
+}
+
+impl vt100::Callbacks for TerminalResponses {
+    fn unhandled_csi(
+        &mut self,
+        screen: &mut vt100::Screen,
+        _intermediate: Option<u8>,
+        _second_intermediate: Option<u8>,
+        params: &[&[u16]],
+        command: char,
+    ) {
+        if command == 'n' && params == [&[6]] {
+            self.cursor = Some(screen.cursor_position());
+        }
+    }
+}
+
+fn approve_review(command: &Command) {
+    let mut builder = portable_pty::CommandBuilder::new(command.get_program());
+    builder.args(command.get_args());
+    builder.cwd(command.get_current_dir().unwrap());
+    for (key, value) in command.get_envs() {
+        match value {
+            Some(value) => builder.env(key, value),
+            None => builder.env_remove(key),
+        }
+    }
+    builder.env("TERM", "xterm-256color");
+    let size = portable_pty::PtySize {
+        rows: 40,
+        cols: 160,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    let pair = portable_pty::native_pty_system().openpty(size).unwrap();
+    let mut reader = pair.master.try_clone_reader().unwrap();
+    let mut writer = pair.master.take_writer().unwrap();
+    let mut child = pair.slave.spawn_command(builder).unwrap();
+    drop(pair.slave);
+    let (sender, receiver) = mpsc::channel();
+    let output = thread::spawn(move || {
+        let mut buffer = [0; 4096];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => {
+                    if sender.send(Ok(buffer[..count].to_vec())).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(error));
+                    break;
+                }
+            }
+        }
+    });
+    let mut terminal =
+        vt100::Parser::new_with_callbacks(size.rows, size.cols, 0, TerminalResponses::default());
+    let mut accepted = false;
+    let mut last_screen = String::new();
+    let mut read_error = None;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let result = (|| -> eyre::Result<()> {
+        loop {
+            if let Some(status) = child.try_wait()? {
+                eyre::ensure!(status.success(), "review exited with {status}");
+                eyre::ensure!(accepted, "review exited before accepting a fingerprint");
+                return Ok(());
+            }
+            eyre::ensure!(Instant::now() < deadline, "review timed out");
+            match receiver.recv_timeout(Duration::from_millis(100)) {
+                Ok(Ok(bytes)) => {
+                    terminal.process(&bytes);
+                    if let Some((row, column)) = terminal.callbacks_mut().cursor.take() {
+                        write!(writer, "\x1b[{};{}R", row + 1, column + 1)?;
+                        writer.flush()?;
+                    }
+                    let screen = terminal.screen().contents();
+                    if !screen.trim().is_empty() {
+                        last_screen = screen;
+                    }
+                    if !accepted
+                        && last_screen.contains("guarded-dep v1.0.0")
+                        && last_screen.contains("a accept")
+                    {
+                        writer.write_all(b"a")?;
+                        writer.flush()?;
+                        accepted = true;
+                    }
+                }
+                Ok(Err(error)) => read_error = Some(error),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    })();
+    if child.try_wait().unwrap().is_none() {
+        child.kill().expect("could not stop failed review");
+        child.wait().expect("could not reap failed review");
+    }
+    drop(writer);
+    drop(pair.master);
+    output.join().unwrap();
+    assert!(
+        result.is_ok(),
+        "{result:?}\nterminal read error: {read_error:?}\n{last_screen}"
+    );
 }
 
 fn create_workspace(root: &Path, approvals: Option<&str>) {
