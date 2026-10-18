@@ -58,9 +58,7 @@ fn run_review(queue: ReviewQueue, queue_mode: bool) -> eyre::Result<()> {
                 match event {
                     Event::Resize(..) => dirty = true,
                     Event::Mouse(mouse) => {
-                        if let Some(app) = &mut state.app {
-                            dirty |= app.handle_mouse(mouse);
-                        }
+                        dirty |= state.handle_mouse(mouse);
                     }
                     Event::Key(key) => {
                         dirty = true;

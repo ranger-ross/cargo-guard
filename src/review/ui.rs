@@ -30,17 +30,36 @@ pub fn render_queue(frame: &mut Frame, state: &mut QueueState) {
     };
     let [packages, package_help] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(packages);
-    let visible = usize::from(packages.height.saturating_sub(if wide { 1 } else { 2 })).max(1);
+    let block = Block::new()
+        .borders(if wide {
+            Borders::RIGHT
+        } else {
+            Borders::BOTTOM
+        })
+        .border_style(muted())
+        .title(Line::styled(
+            format!("Packages {}/{}", state.selected + 1, state.entries.len()),
+            muted(),
+        ));
+    let rows = block.inner(packages);
+    let visible = usize::from(rows.height).max(1);
     let start = state
         .selected
         .saturating_sub(visible / 2)
         .min(state.entries.len().saturating_sub(visible));
+    state.package_rows = Rect {
+        height: usize::from(rows.height).min(state.entries.len() - start) as u16,
+        ..rows
+    };
+    state.package_start = start;
+    let hovered = state.hovered_package();
     let items: Vec<_> = state
         .entries
         .iter()
+        .enumerate()
         .skip(start)
         .take(visible)
-        .map(|entry| {
+        .map(|(index, entry)| {
             let (marker, color) = match entry.status() {
                 "approved" | "already approved" => ("✓", Color::Green),
                 "rejected" => ("×", Color::Red),
@@ -56,22 +75,15 @@ pub fn render_queue(frame: &mut Frame, state: &mut QueueState) {
                 Span::styled(format!("{marker} "), Style::default().fg(color)),
                 Span::raw(format!("{} v{}", entry.package.name, entry.package.version)),
             ]))
+            .style(if hovered == Some(index) {
+                Style::default().fg(Color::White).bg(Color::Rgb(35, 40, 48))
+            } else {
+                Style::default()
+            })
         })
         .collect();
     let list = List::new(items)
-        .block(
-            Block::new()
-                .borders(if wide {
-                    Borders::RIGHT
-                } else {
-                    Borders::BOTTOM
-                })
-                .border_style(muted())
-                .title(Line::styled(
-                    format!("Packages {}/{}", state.selected + 1, state.entries.len()),
-                    muted(),
-                )),
-        )
+        .block(block)
         .highlight_symbol("> ")
         .highlight_style(bold(Color::Green));
     frame.render_stateful_widget(

@@ -7,7 +7,10 @@ use std::{
 
 use unicode_width::UnicodeWidthStr;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::{Position, Rect};
 
 use super::{
     ReviewPackage, ReviewSession,
@@ -32,6 +35,9 @@ pub struct QueueState {
     retired_loaders: Vec<BaselineLoader>,
     cached_apps: VecDeque<(usize, App)>,
     pub sidebar_width: u16,
+    pub package_rows: Rect,
+    pub package_start: usize,
+    package_pointer: Option<Position>,
     verifier: Result<Verifier, String>,
     last_refresh: Instant,
 }
@@ -84,6 +90,9 @@ impl QueueState {
             retired_loaders: Vec::new(),
             cached_apps: VecDeque::new(),
             sidebar_width,
+            package_rows: Rect::default(),
+            package_start: 0,
+            package_pointer: None,
             verifier,
             last_refresh: Instant::now(),
         };
@@ -370,6 +379,40 @@ impl QueueState {
             KeyCode::Char('s') => Action::Skip,
             _ => Action::Continue,
         }
+    }
+
+    pub fn handle_mouse(&mut self, event: MouseEvent) -> bool {
+        let previous_hover = self.hovered_package();
+        self.package_pointer = (!event.modifiers.contains(KeyModifiers::SHIFT)
+            && !matches!(event.kind, MouseEventKind::Drag(_)))
+        .then_some(Position::new(event.column, event.row));
+        let hover_changed = previous_hover != self.hovered_package();
+        if event.modifiers.contains(KeyModifiers::SHIFT)
+            || self.app.as_ref().is_some_and(|app| app.show_help)
+        {
+            return hover_changed;
+        }
+        if event.kind == MouseEventKind::Down(MouseButton::Left)
+            && let Some(selected) = self.hovered_package()
+            && selected != self.selected
+        {
+            self.open(selected);
+            return true;
+        }
+        let source_changed = self.app.as_mut().is_some_and(|app| app.handle_mouse(event));
+        hover_changed || source_changed
+    }
+
+    pub fn hovered_package(&self) -> Option<usize> {
+        if self.app.as_ref().is_some_and(|app| app.show_help) {
+            return None;
+        }
+        let pointer = self.package_pointer?;
+        if !self.package_rows.contains(pointer) {
+            return None;
+        }
+        let index = self.package_start + usize::from(pointer.y - self.package_rows.y);
+        (index < self.entries.len()).then_some(index)
     }
 
     pub fn summary(&self) -> Summary {
