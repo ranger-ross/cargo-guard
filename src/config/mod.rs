@@ -32,8 +32,8 @@ pub struct ApprovalTarget {
     pub scope: ApprovalScope,
 }
 
-pub struct RunnerPaths {
-    pub workspace_root: Option<PathBuf>,
+pub struct RunnerPaths<'a> {
+    pub workspace_root: &'a Path,
     pub global: Option<PathBuf>,
 }
 
@@ -43,16 +43,10 @@ pub struct LoadedApprovals {
 }
 
 const GLOBAL_PATH: &str = "CARGO_GUARD_GLOBAL_APPROVED_BUILDS_PATH";
-const WORKSPACE_ROOT: &str = "CARGO_GUARD_WORKSPACE_ROOT";
 
-impl RunnerPaths {
-    pub fn from_env() -> eyre::Result<Self> {
-        let workspace_root = validate_path(WORKSPACE_ROOT, env::var_os(WORKSPACE_ROOT))?;
+impl<'a> RunnerPaths<'a> {
+    pub fn from_env(workspace_root: &'a Path) -> eyre::Result<Self> {
         let global = validate_path(GLOBAL_PATH, env::var_os(GLOBAL_PATH))?;
-        eyre::ensure!(
-            workspace_root.is_some() || global.is_some(),
-            "set CARGO_GUARD_WORKSPACE_ROOT or CARGO_GUARD_GLOBAL_APPROVED_BUILDS_PATH in Cargo [env] configuration"
-        );
         Ok(Self {
             workspace_root,
             global,
@@ -114,16 +108,14 @@ pub fn review_target(
     })
 }
 
-pub fn load_runner_approvals(paths: &RunnerPaths) -> eyre::Result<LoadedApprovals> {
-    let workspace = paths.workspace_root.as_deref().map(|root| ApprovalTarget {
-        path: config_path(root),
+pub fn load_runner_approvals(paths: &RunnerPaths<'_>) -> eyre::Result<LoadedApprovals> {
+    let workspace = ApprovalTarget {
+        path: config_path(paths.workspace_root),
         scope: ApprovalScope::Workspace,
-    });
-    if let Some(target) = workspace.as_ref()
-        && let Some(config) = read_runner_config(&target.path)?
-    {
+    };
+    if let Some(config) = read_runner_config(&workspace.path)? {
         return Ok(LoadedApprovals {
-            target: target.clone(),
+            target: workspace,
             config,
         });
     }
@@ -132,7 +124,7 @@ pub fn load_runner_approvals(paths: &RunnerPaths) -> eyre::Result<LoadedApproval
             path: path.clone(),
             scope: ApprovalScope::Global,
         },
-        None => workspace.ok_or_else(|| eyre::eyre!("no approval destination configured"))?,
+        None => workspace,
     };
     let config = if target.scope == ApprovalScope::Global {
         read_runner_config(&target.path)?
@@ -319,15 +311,11 @@ mod tests {
         let global = root.path().join("global/approved-builds.toml");
         for paths in [
             RunnerPaths {
-                workspace_root: Some(root.path().to_owned()),
+                workspace_root: root.path(),
                 global: None,
             },
             RunnerPaths {
-                workspace_root: None,
-                global: Some(global.clone()),
-            },
-            RunnerPaths {
-                workspace_root: Some(root.path().to_owned()),
+                workspace_root: root.path(),
                 global: Some(global.clone()),
             },
         ] {

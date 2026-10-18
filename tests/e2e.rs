@@ -111,7 +111,6 @@ pub const DIRECTIVE_VALUE: &str = env!("CARGO_GUARD_E2E_DIRECTIVE_VALUE");
 
     let output = fixture.cargo(
         "workspace",
-        false,
         &fixture.marker(),
         &["run", "--offline", "--quiet", "--color", "never"],
     );
@@ -190,7 +189,7 @@ fn global_blanket_approval_yields_to_workspace_policy() {
     let marker = fixture.workspace_marker("workspace");
     fixture.approve_global("[approved]\nguarded-dep = 'approved'\n");
 
-    assert_success(&fixture.build_workspace("workspace", false));
+    assert_success(&fixture.build_workspace("workspace"));
     assert_eq!(fs::read(&marker).unwrap(), b"executed\n");
     fs::remove_file(&marker).unwrap();
 
@@ -200,7 +199,7 @@ fn global_blanket_approval_yields_to_workspace_policy() {
         "[approved]\nguarded-dep = '9.0.0'\n",
     );
     fixture.clean_dependency("workspace");
-    let rejected = fixture.build_workspace("workspace", true);
+    let rejected = fixture.build_workspace("workspace");
     assert_rejected(&rejected, &marker, "guarded-dep v1.0.0");
     let stderr = String::from_utf8_lossy(&rejected.stderr);
     assert!(
@@ -221,7 +220,7 @@ fn global_blanket_approval_yields_to_workspace_policy() {
         "[approved]\nguarded-dep = 'approved'\n",
     );
     fixture.clean_dependency("workspace");
-    assert_success(&fixture.build_workspace("workspace", true));
+    assert_success(&fixture.build_workspace("workspace"));
     assert_eq!(fs::read(&marker).unwrap(), b"executed\n");
     assert_eq!(
         fs::read_to_string(fixture.global_path()).unwrap(),
@@ -353,7 +352,7 @@ fn review_generated_fingerprint_approval_authorizes_a_real_build() {
     write(&root, "dep/helper.txt", "reviewed contents\n");
 
     assert_rejected(&fixture.build(), &fixture.marker(), "guarded-dep v1.0.0");
-    let mut review = fixture.command("workspace", false, &fixture.marker());
+    let mut review = fixture.command("workspace", &fixture.marker());
     review.args([
         env!("CARGO_BIN_EXE_cargo-guard"),
         "review",
@@ -379,10 +378,10 @@ fn review_generated_fingerprint_approval_authorizes_a_real_build() {
 }
 
 #[test]
-fn global_version_approval_authorizes_two_rootless_workspaces() {
+fn global_version_approval_authorizes_two_workspaces() {
     let fixture = Fixture::global();
     for workspace in ["workspace", "workspace-b"] {
-        let rejected = fixture.build_workspace(workspace, false);
+        let rejected = fixture.build_workspace(workspace);
         assert_rejected(
             &rejected,
             &fixture.workspace_marker(workspace),
@@ -398,7 +397,7 @@ fn global_version_approval_authorizes_two_rootless_workspaces() {
 
     fixture.approve_global("[approved]\nguarded-dep = '1.0.0'\n");
     for workspace in ["workspace", "workspace-b"] {
-        assert_success(&fixture.build_workspace(workspace, false));
+        assert_success(&fixture.build_workspace(workspace));
         assert_eq!(
             fs::read(fixture.workspace_marker(workspace)).unwrap(),
             b"executed\n"
@@ -415,7 +414,7 @@ fn global_version_approval_authorizes_two_rootless_workspaces() {
 }
 
 #[test]
-fn rootless_global_build_requires_workspace_member_approval() {
+fn global_build_autoapproves_workspace_member_scripts() {
     let fixture = Fixture::global();
     let root = fixture.temp.path().join("workspace");
     write(
@@ -433,11 +432,7 @@ fn rootless_global_build_requires_workspace_member_approval() {
     let member_marker = fixture
         .workspace_marker("workspace")
         .with_extension("member");
-    let rejected = fixture.build_workspace("workspace", false);
-    assert_rejected(&rejected, &member_marker, "consumer v0.1.0");
-
-    fixture.approve_global("[approved]\nguarded-dep = '1.0.0'\nconsumer = '0.1.0'\n");
-    assert_success(&fixture.build_workspace("workspace", false));
+    assert_success(&fixture.build_workspace("workspace"));
     assert_eq!(fs::read(member_marker).unwrap(), b"executed\n");
     assert!(!root.join("approved-builds.toml").exists());
 }
@@ -446,7 +441,7 @@ fn rootless_global_build_requires_workspace_member_approval() {
 fn global_fingerprint_is_shared_but_workspace_policy_remains_authoritative() {
     let fixture = Fixture::global();
     fixture.approve_global("[approved]\nguarded-dep = 'legacy-hash'\n");
-    let rejected = fixture.build_workspace("workspace", true);
+    let rejected = fixture.build_workspace("workspace");
     assert_rejected(
         &rejected,
         &fixture.workspace_marker("workspace"),
@@ -456,7 +451,7 @@ fn global_fingerprint_is_shared_but_workspace_policy_remains_authoritative() {
     fixture.approve_global(&format!("[approved]\nguarded-dep = '{fingerprint}'\n"));
 
     for workspace in ["workspace", "workspace-b"] {
-        assert_success(&fixture.build_workspace(workspace, true));
+        assert_success(&fixture.build_workspace(workspace));
         assert_eq!(
             fs::read(fixture.workspace_marker(workspace)).unwrap(),
             b"executed\n"
@@ -474,7 +469,7 @@ fn global_fingerprint_is_shared_but_workspace_policy_remains_authoritative() {
     let second_root = fixture.temp.path().join("workspace-b");
     fs::remove_file(fixture.workspace_marker("workspace-b")).unwrap();
     write(&second_root, "dep/helper.txt", "changed");
-    let changed = fixture.build_workspace("workspace-b", true);
+    let changed = fixture.build_workspace("workspace-b");
     assert_rejected(
         &changed,
         &fixture.workspace_marker("workspace-b"),
@@ -488,7 +483,7 @@ fn global_fingerprint_is_shared_but_workspace_policy_remains_authoritative() {
     write(&first_root, "approved-builds.toml", "[approved]\n");
     fs::remove_file(fixture.workspace_marker("workspace")).unwrap();
     fixture.clean_dependency("workspace");
-    let authoritative = fixture.build_workspace("workspace", true);
+    let authoritative = fixture.build_workspace("workspace");
     assert_rejected(
         &authoritative,
         &fixture.workspace_marker("workspace"),
@@ -504,6 +499,340 @@ fn global_fingerprint_is_shared_but_workspace_policy_remains_authoritative() {
         fs::read_to_string(fixture.global_path()).unwrap(),
         format!("[approved]\nguarded-dep = '{fingerprint}'\n")
     );
+}
+
+#[test]
+fn manifest_path_uses_invoking_workspace_from_dependency_and_unrelated_directories() {
+    let fixture = Fixture::global();
+    fs::create_dir(fixture.temp.path().join("unrelated")).unwrap();
+    for (directory, manifest) in [
+        ("workspace/dep", "../Cargo.toml"),
+        ("unrelated", "../workspace/Cargo.toml"),
+    ] {
+        let output = fixture
+            .command("workspace", &fixture.marker())
+            .current_dir(fixture.temp.path().join(directory))
+            .args([
+                "cargo",
+                "build",
+                "--offline",
+                "--color",
+                "never",
+                "--manifest-path",
+                manifest,
+            ])
+            .output()
+            .unwrap();
+        assert_rejected(&output, &fixture.marker(), "guarded-dep v1.0.0");
+    }
+    fixture.approve_global("[approved]\nguarded-dep = '1.0.0'\n");
+    let output = fixture
+        .command("workspace", &fixture.marker())
+        .current_dir(fixture.temp.path().join("unrelated"))
+        .args([
+            "cargo",
+            "build",
+            "--offline",
+            "--manifest-path=../workspace/Cargo.toml",
+        ])
+        .output()
+        .unwrap();
+    assert_success(&output);
+    assert_eq!(fs::read(fixture.marker()).unwrap(), b"executed\n");
+}
+
+#[test]
+fn member_directory_build_autoapproves_members_but_not_excluded_dependencies() {
+    let fixture = Fixture::global();
+    let root = fixture.temp.path().join("workspace");
+    let manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    write(
+        &root,
+        "Cargo.toml",
+        &manifest.replace("[workspace]", "[workspace]\nmembers = ['member']"),
+    );
+    write(
+        &root,
+        "member/Cargo.toml",
+        "[package]\nname='member'\nversion='1.0.0'\nedition='2024'\n[dependencies]\nguarded-dep={path='../dep'}\n",
+    );
+    write(&root, "member/src/lib.rs", "");
+    write(
+        &root,
+        "member/build.rs",
+        r#"fn main() {
+    let marker = std::path::PathBuf::from(std::env::var_os("CARGO_GUARD_E2E_MARKER").unwrap());
+    std::fs::write(marker.with_extension("member"), b"executed\n").unwrap();
+}
+"#,
+    );
+    let build = || {
+        fixture
+            .command("workspace", &fixture.marker())
+            .current_dir(root.join("member"))
+            .args(["cargo", "build", "--offline", "--color", "never"])
+            .output()
+            .unwrap()
+    };
+    assert_rejected(&build(), &fixture.marker(), "guarded-dep v1.0.0");
+    fixture.approve_global("[approved]\nguarded-dep = '1.0.0'\n");
+    assert_success(&build());
+    assert_eq!(
+        fs::read(fixture.marker().with_extension("member")).unwrap(),
+        b"executed\n"
+    );
+    assert!(!root.join("approved-builds.toml").exists());
+}
+
+#[test]
+fn alias_hiding_manifest_path_is_rejected_even_with_global_approval() {
+    let fixture = Fixture::global();
+    fixture.approve_global("[approved]\nguarded-dep = 'approved'\n");
+    let config_path = fixture.temp.path().join("cargo-home/config.toml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    let manifest = toml::Value::String(
+        fixture
+            .temp
+            .path()
+            .join("workspace/Cargo.toml")
+            .to_str()
+            .unwrap()
+            .into(),
+    );
+    fs::write(
+        config_path,
+        format!("{config}\n[alias]\nguarded-build = ['build', '--offline', '--manifest-path', {manifest}]\n"),
+    )
+    .unwrap();
+    let output = fixture
+        .command("workspace", &fixture.marker())
+        .current_dir(fixture.temp.path().join("workspace/dep"))
+        .args(["cargo", "guarded-build"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(!fixture.marker().exists(), "{output:?}");
+}
+
+#[test]
+fn shared_custom_target_directory_preserves_discovery_on_cached_script_reruns() {
+    let fixture = Fixture::global();
+    fixture.approve_global("[approved]\nguarded-dep = '1.0.0'\n");
+    let target = fixture.temp.path().join("shared-artifacts");
+    for workspace in ["workspace", "workspace-b"] {
+        let root = fixture.temp.path().join(workspace);
+        let script = fs::read_to_string(root.join("dep/build.rs")).unwrap();
+        write(
+            &root,
+            "dep/build.rs",
+            &script.replace(
+                "fn main() {",
+                "fn main() {\n    println!(\"cargo::rerun-if-env-changed=CARGO_GUARD_E2E_RERUN\");",
+            ),
+        );
+        let build = |rerun: &str| {
+            fixture
+                .command(workspace, &fixture.workspace_marker(workspace))
+                .args(["cargo", "build", "--offline", "--target-dir"])
+                .arg(&target)
+                .env("CARGO_GUARD_E2E_RERUN", rerun)
+                .output()
+                .unwrap()
+        };
+        assert_success(&build("initial"));
+        assert_eq!(
+            fs::read(fixture.workspace_marker(workspace)).unwrap(),
+            b"executed\n"
+        );
+        fs::remove_file(fixture.workspace_marker(workspace)).unwrap();
+        write(&root, "approved-builds.toml", "[approved]\n");
+        // Only an observed environment input changes: Cargo reuses the compiled
+        // build script, so discovery cannot depend on a rustc invocation.
+        assert_rejected(
+            &build("changed"),
+            &fixture.workspace_marker(workspace),
+            "guarded-dep v1.0.0",
+        );
+    }
+}
+
+#[test]
+fn nested_cargo_keeps_outer_workspace_policy_authoritative() {
+    let fixture = Fixture::global();
+    let root = fixture.temp.path().join("workspace");
+    let inner = fixture.temp.path().join("inner");
+    fixture.approve_global("[approved]\nguarded-dep='1.0.0'\ninner='1.0.0'\n");
+    write(
+        &root,
+        "approved-builds.toml",
+        "[approved]\nguarded-dep='1.0.0'\n",
+    );
+    write(
+        &inner,
+        "Cargo.toml",
+        "[package]\nname='inner'\nversion='1.0.0'\nedition='2024'\n[workspace]\n",
+    );
+    write(&inner, "src/lib.rs", "");
+    write(
+        &inner,
+        "approved-builds.toml",
+        "[approved]\ninner='1.0.0'\n",
+    );
+    write(
+        &inner,
+        "build.rs",
+        r#"fn main() {
+    let marker = std::path::PathBuf::from(std::env::var_os("CARGO_GUARD_E2E_MARKER").unwrap());
+    std::fs::write(marker.with_extension("inner"), b"executed\n").unwrap();
+}
+"#,
+    );
+    write(
+        &root,
+        "dep/build.rs",
+        r#"fn main() {
+    let inner = std::path::PathBuf::from(std::env::var_os("CARGO_GUARD_E2E_INNER").unwrap());
+    let status = std::process::Command::new(std::env::var_os("CARGO").unwrap())
+        .args(["build", "--offline", "--color", "never", "--manifest-path"])
+        .arg(inner.join("Cargo.toml"))
+        .arg("--target-dir")
+        .arg(inner.join("artifacts"))
+        .current_dir(&inner)
+        .status()
+        .unwrap();
+    assert!(status.success(), "nested Cargo build was rejected");
+}
+"#,
+    );
+    let build = || {
+        fixture
+            .command("workspace", &fixture.marker())
+            .args(["cargo", "build", "--offline", "--color", "never"])
+            .env("CARGO_GUARD_E2E_INNER", &inner)
+            .output()
+            .unwrap()
+    };
+    let rejected = build();
+    assert_rejected(
+        &rejected,
+        &fixture.marker().with_extension("inner"),
+        "inner v1.0.0",
+    );
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains(root.join("approved-builds.toml").to_str().unwrap()),
+        "{rejected:?}"
+    );
+    write(
+        &root,
+        "approved-builds.toml",
+        "[approved]\nguarded-dep='1.0.0'\ninner='1.0.0'\n",
+    );
+    assert_success(&build());
+    assert_eq!(
+        fs::read(fixture.marker().with_extension("inner")).unwrap(),
+        b"executed\n"
+    );
+}
+
+#[test]
+fn version_list_approvals_authorize_only_matching_dependency_versions() {
+    for (approvals, allowed) in [
+        ("['0.9.0', '1.0.0']", true),
+        ("['wrong-fingerprint', '1.0.0']", true),
+        ("[]", false),
+        ("['0.9.0', '0.8.0']", false),
+    ] {
+        let fixture = Fixture::new(&format!("[approved]\nguarded-dep={approvals}\n"));
+        let output = fixture.build();
+        if allowed {
+            assert_success(&output);
+            assert_eq!(fs::read(fixture.marker()).unwrap(), b"executed\n");
+        } else {
+            assert_rejected(&output, &fixture.marker(), "guarded-dep v1.0.0");
+        }
+    }
+}
+
+#[test]
+fn invalid_workspace_approval_files_never_fall_back_to_global_policy() {
+    for contents in [
+        "[approved]\n",
+        "[approved]\nguarded-dep='2.0.0'\n",
+        "invalid toml",
+        "unrelated=true",
+    ] {
+        let fixture = Fixture::global();
+        fixture.approve_global("[approved]\nguarded-dep='1.0.0'\n");
+        write(
+            &fixture.temp.path().join("workspace"),
+            "approved-builds.toml",
+            contents,
+        );
+        let output = fixture.build_workspace("workspace");
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            !fixture.workspace_marker("workspace").exists(),
+            "{output:?}"
+        );
+    }
+    let fixture = Fixture::global();
+    fixture.approve_global("[approved]\nguarded-dep='1.0.0'\n");
+    let policy = fixture.temp.path().join("workspace/approved-builds.toml");
+    fs::create_dir(&policy).unwrap();
+    let output = fixture.build_workspace("workspace");
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        !fixture.workspace_marker("workspace").exists(),
+        "{output:?}"
+    );
+    #[cfg(unix)]
+    {
+        fs::remove_dir(&policy).unwrap();
+        std::os::unix::fs::symlink(fixture.temp.path().join("missing-policy"), &policy).unwrap();
+        let output = fixture.build_workspace("workspace");
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            !fixture.workspace_marker("workspace").exists(),
+            "{output:?}"
+        );
+    }
+}
+
+#[test]
+fn workspace_approval_does_not_read_invalid_global_file() {
+    let fixture = Fixture::global();
+    fixture.approve_global("malformed");
+    write(
+        &fixture.temp.path().join("workspace"),
+        "approved-builds.toml",
+        "[approved]\nguarded-dep='1.0.0'\n",
+    );
+    assert_success(&fixture.build_workspace("workspace"));
+    assert_eq!(
+        fs::read(fixture.workspace_marker("workspace")).unwrap(),
+        b"executed\n"
+    );
+}
+
+#[test]
+fn invalid_global_path_is_rejected_even_with_workspace_approvals() {
+    let fixture = Fixture::new("[approved]\nguarded-dep='1.0.0'\n");
+    for invalid in ["", "relative", "~/approvals.toml"] {
+        let output = fixture
+            .command("workspace", &fixture.marker())
+            .args(["cargo", "build", "--offline", "--color", "never"])
+            .env("CARGO_GUARD_GLOBAL_APPROVED_BUILDS_PATH", invalid)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("CARGO_GUARD_GLOBAL_APPROVED_BUILDS_PATH"),
+            "{output:?}"
+        );
+        assert!(!fixture.marker().exists(), "{output:?}");
+    }
 }
 
 fn rejected_fingerprint(output: &Output) -> String {
@@ -540,9 +869,6 @@ target-applies-to-host = true
 
 [host]
 runner = [{binary}]
-
-[env]
-CARGO_GUARD_WORKSPACE_ROOT = {{ value = ".", relative = true }}
 "#,
             ),
         );
@@ -599,10 +925,9 @@ CARGO_GUARD_GLOBAL_APPROVED_BUILDS_PATH = {global}
         self.temp.path().join(format!("{workspace}-script-ran"))
     }
 
-    fn build_workspace(&self, workspace: &str, configured_root: bool) -> Output {
+    fn build_workspace(&self, workspace: &str) -> Output {
         self.cargo(
             workspace,
-            configured_root,
             &self.workspace_marker(workspace),
             &["build", "--offline", "--color", "never"],
         )
@@ -611,7 +936,6 @@ CARGO_GUARD_GLOBAL_APPROVED_BUILDS_PATH = {global}
     fn clean_dependency(&self, workspace: &str) {
         let output = self.cargo(
             workspace,
-            true,
             &self.workspace_marker(workspace),
             &[
                 "clean",
@@ -632,20 +956,13 @@ CARGO_GUARD_GLOBAL_APPROVED_BUILDS_PATH = {global}
     fn build(&self) -> Output {
         self.cargo(
             "workspace",
-            false,
             &self.marker(),
             &["build", "--offline", "--color", "never"],
         )
     }
 
-    fn cargo(
-        &self,
-        workspace: &str,
-        configured_root: bool,
-        marker: &Path,
-        args: &[&str],
-    ) -> Output {
-        self.command(workspace, configured_root, marker)
+    fn cargo(&self, workspace: &str, marker: &Path, args: &[&str]) -> Output {
+        self.command(workspace, marker)
             .arg("cargo")
             .args(args)
             .stdin(Stdio::null())
@@ -655,7 +972,7 @@ CARGO_GUARD_GLOBAL_APPROVED_BUILDS_PATH = {global}
             })
     }
 
-    fn command(&self, workspace: &str, configured_root: bool, marker: &Path) -> Command {
+    fn command(&self, workspace: &str, marker: &Path) -> Command {
         let root = self.temp.path();
         let cargo_home = root.join("cargo-home");
         fs::create_dir_all(&cargo_home)
@@ -677,9 +994,6 @@ CARGO_GUARD_GLOBAL_APPROVED_BUILDS_PATH = {global}
             "RUSTC_BOOTSTRAP",
         ] {
             command.env_remove(key);
-        }
-        if configured_root {
-            command.env("CARGO_GUARD_WORKSPACE_ROOT", root.join(workspace));
         }
         command
             .env("CARGO_HOME", cargo_home)

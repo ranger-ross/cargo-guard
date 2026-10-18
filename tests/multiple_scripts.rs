@@ -58,7 +58,7 @@ fn real_multiple_scripts_have_independent_fingerprints() {
         root,
         ".cargo/config.toml",
         &format!(
-            "[unstable]\nhost-config=true\ntarget-applies-to-host=true\n[host]\nrunner={binary}\n[env]\nCARGO_GUARD_WORKSPACE_ROOT={{value='.',relative=true}}\n"
+            "[unstable]\nhost-config=true\ntarget-applies-to-host=true\n[host]\nrunner={binary}\n"
         ),
     );
     let mut approved = BTreeSet::from(["not-approved".to_owned()]);

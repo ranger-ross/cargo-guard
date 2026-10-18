@@ -321,13 +321,14 @@ fn invalid_cargo_configuration_fails_without_default_writes() {
 
 #[cfg(unix)]
 #[test]
-fn default_global_file_does_not_activate_runner_without_explicit_variables() {
+fn configured_global_approval_does_not_authorize_standalone_runner() {
     let fixture = Fixture::new();
     let approvals = "[approved]\nempty-review = '1.0.0'\n";
     write(&fixture.default_global(), approvals);
     let marker = fixture.temp.path().join("script-ran");
     let output = fixture
         .command()
+        .env(GLOBAL_ENV, fixture.default_global())
         .env("CARGO_MANIFEST_PATH", fixture.workspace.join("Cargo.toml"))
         .env("CARGO_PKG_NAME", "empty-review")
         .env("CARGO_PKG_VERSION", "1.0.0")
@@ -338,11 +339,9 @@ fn default_global_file_does_not_activate_runner_without_explicit_variables() {
         .unwrap();
     let text = diagnostics(&output);
     assert!(!output.status.success(), "{text}");
-    assert!(text.contains(GLOBAL_ENV), "{text}");
-    assert!(text.contains("CARGO_GUARD_WORKSPACE_ROOT"), "{text}");
     assert!(
         !marker.exists(),
-        "runner executed without activation\n{text}"
+        "runner executed without an invoking Cargo build\n{text}"
     );
     assert_eq!(
         fs::read_to_string(fixture.default_global()).unwrap(),
