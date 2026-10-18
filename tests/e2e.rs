@@ -70,6 +70,56 @@ fn approved_dependency_build_script_executes() {
 }
 
 #[test]
+fn cargo_directives_and_generated_code_survive_the_runner() {
+    let fixture = Fixture::new("[approved]\nguarded-dep = '1.0.0'\n");
+    let root = fixture.temp.path().join("workspace");
+    write(
+        &root,
+        "dep/build.rs",
+        r#"fn main() {
+    let out_dir = std::path::PathBuf::from(
+        std::env::var_os("OUT_DIR").expect("missing output directory"),
+    );
+    std::fs::write(
+        out_dir.join("generated.rs"),
+        "pub const GENERATED_VALUE: u32 = 42;\n",
+    )
+    .expect("could not write generated code");
+    println!("cargo::rustc-env=CARGO_GUARD_E2E_DIRECTIVE_VALUE=from build script");
+}
+"#,
+    );
+    write(
+        &root,
+        "dep/src/lib.rs",
+        r#"include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+pub const DIRECTIVE_VALUE: &str = env!("CARGO_GUARD_E2E_DIRECTIVE_VALUE");
+"#,
+    );
+    write(
+        &root,
+        "src/main.rs",
+        r#"fn main() {
+    println!(
+        "{}:{}",
+        guarded_dep::GENERATED_VALUE,
+        guarded_dep::DIRECTIVE_VALUE,
+    );
+}
+"#,
+    );
+
+    let output = fixture.cargo(
+        "workspace",
+        false,
+        &fixture.marker(),
+        &["run", "--offline", "--quiet", "--color", "never"],
+    );
+    assert_success(&output);
+    assert_eq!(output.stdout, b"42:from build script\n");
+}
+
+#[test]
 fn blanket_approval_survives_version_and_source_changes_but_is_package_specific() {
     let policy = "[approved]\nguarded-dep = 'approved'\n";
     let fixture = Fixture::new(policy);
