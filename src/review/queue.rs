@@ -15,6 +15,7 @@ use ratatui::layout::{Position, Rect};
 use super::{
     ReviewPackage, ReviewSession,
     app::{App, Decision},
+    diagnostic::Diagnostic,
     discovery::ReviewQueue,
     fingerprint::Verification,
     input::{self, Action},
@@ -30,6 +31,7 @@ pub struct QueueState {
     pub entries: Vec<Entry>,
     pub selected: usize,
     pub app: Option<App>,
+    pub error_diagnostic: Diagnostic,
     config_path: PathBuf,
     loader: Option<BaselineLoader>,
     retired_loaders: Vec<BaselineLoader>,
@@ -84,6 +86,7 @@ impl QueueState {
         let mut state = Self {
             entries,
             selected,
+            error_diagnostic: Diagnostic::default(),
             app: None,
             config_path,
             loader: None,
@@ -372,7 +375,11 @@ impl QueueState {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Action::Quit;
         }
+        if key.code == KeyCode::Char('y') && self.error_diagnostic.selection.is_active() {
+            return Action::CopySelection;
+        }
         match key.code {
+            KeyCode::Esc if self.error_diagnostic.selection.clear() => Action::Continue,
             KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
             KeyCode::Char('j') => Action::NextPackage,
             KeyCode::Char('k') => Action::PreviousPackage,
@@ -399,7 +406,11 @@ impl QueueState {
             self.open(selected);
             return true;
         }
-        let source_changed = self.app.as_mut().is_some_and(|app| app.handle_mouse(event));
+        let source_changed = if let Some(app) = &mut self.app {
+            app.handle_mouse(event)
+        } else {
+            self.error_diagnostic.handle_mouse(event).unwrap_or(false)
+        };
         hover_changed || source_changed
     }
 
@@ -413,6 +424,16 @@ impl QueueState {
         }
         let index = self.package_start + usize::from(pointer.y - self.package_rows.y);
         (index < self.entries.len()).then_some(index)
+    }
+
+    pub fn selected_text(&self) -> Option<String> {
+        if let Some(app) = &self.app {
+            app.diagnostic
+                .selected_text()
+                .or_else(|| app.selection.text(&app.file().rows))
+        } else {
+            self.error_diagnostic.selected_text()
+        }
     }
 
     pub fn summary(&self) -> Summary {
@@ -435,6 +456,7 @@ impl QueueState {
     }
 
     fn open(&mut self, selected: usize) {
+        self.error_diagnostic.reset_view();
         // Cancellation is requested immediately, but joining a worker (which
         // may be waiting for Cargo) must not block package navigation.
         self.retire_loader();

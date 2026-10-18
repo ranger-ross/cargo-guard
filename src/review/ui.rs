@@ -106,50 +106,86 @@ pub fn render_queue(frame: &mut Frame, state: &mut QueueState) {
     if let Some(app) = &mut state.app {
         render_area(frame, app, review);
     } else {
-        let entry = &state.entries[state.selected];
-        frame.render_widget(
-            Paragraph::new(vec![
-                status_line(
-                    "Reviewing",
-                    format!("{} v{}", entry.package.name, entry.package.version),
-                    Color::Green,
-                ),
-                Line::default(),
-                status_line(
-                    "error",
-                    entry
-                        .error
-                        .as_deref()
-                        .unwrap_or("could not load sources")
-                        .to_owned(),
-                    Color::Red,
-                ),
-                Line::default(),
-                Line::styled("s skip   q quit", muted()),
-            ])
-            .wrap(Wrap { trim: false }),
-            review,
-        );
+        render_failure_area(frame, state, review);
     }
 }
 
+pub fn render_failure(frame: &mut Frame, state: &mut QueueState) {
+    render_failure_area(frame, state, frame.area());
+}
+
+fn render_failure_area(frame: &mut Frame, state: &mut QueueState, area: Rect) {
+    let entry = &state.entries[state.selected];
+    let report = entry
+        .error
+        .clone()
+        .unwrap_or_else(|| "Could not load build script sources".into());
+    state.error_diagnostic.set_report(report, true);
+    let [header, error, footer] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+    frame.render_widget(
+        Paragraph::new(status_line(
+            "Reviewing",
+            format!("{} v{}", entry.package.name, entry.package.version),
+            Color::Green,
+        )),
+        header,
+    );
+    state.error_diagnostic.render(frame, error);
+    frame.render_widget(
+        Paragraph::new("y copy selection  Esc clear selection  q quit").style(muted()),
+        footer,
+    );
+}
+
+fn update_diagnostic(app: &mut App) {
+    let error = app.notice.as_ref().is_some_and(|notice| notice.is_error);
+    let message = if error {
+        app.notice.as_ref().map(|notice| notice.message.clone())
+    } else if let Some(reason) = &app.decision_blocked {
+        Some(reason.clone())
+    } else if !app.verification_pending
+        && !app.is_current_fingerprint_approved()
+        && app.verification_message.is_some()
+    {
+        app.verification_message.clone()
+    } else if let Baseline::Unavailable { version, reason } = &app.baseline {
+        Some(format!(
+            "Could not load approved v{version} sources.\n\n{reason}"
+        ))
+    } else {
+        None
+    };
+    app.diagnostic
+        .set_report(message.unwrap_or_default(), error);
+}
+
 fn render_area(frame: &mut Frame, app: &mut App, area: Rect) {
+    update_diagnostic(app);
     let note = baseline_note(app);
-    let notice = app.notice.as_ref().map(|notice| {
-        status_line(
-            if notice.is_error { "error" } else { "Finished" },
-            notice.message.clone(),
-            if notice.is_error {
-                Color::Red
-            } else {
-                Color::Green
-            },
-        )
-    });
+    let notice = app
+        .notice
+        .as_ref()
+        .filter(|notice| !notice.is_error)
+        .map(|notice| status_line("Finished", notice.message.clone(), Color::Green));
     let multiple = app.files.len() > 1;
-    let [header, notice_area, baseline, tabs, source, footer] = Layout::vertical([
+    let diagnostic_height = app.diagnostic.height(area.width, area.height);
+    let [
+        header,
+        notice_area,
+        diagnostic,
+        baseline,
+        tabs,
+        source,
+        footer,
+    ] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(message_height(notice.as_ref(), area.width)),
+        Constraint::Length(diagnostic_height),
         Constraint::Length(message_height(note.as_ref(), area.width)),
         Constraint::Length(if multiple { 2 } else { 0 }),
         Constraint::Min(0),
@@ -165,6 +201,7 @@ fn render_area(frame: &mut Frame, app: &mut App, area: Rect) {
     if let Some(note) = note {
         frame.render_widget(Paragraph::new(note).wrap(Wrap { trim: false }), baseline);
     }
+    app.diagnostic.render(frame, diagnostic);
     if multiple {
         let labels: Vec<_> = app
             .files
@@ -314,7 +351,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     if app.queue_mode {
         keys.push(("s", "skip"));
     }
-    if app.selection.is_active() {
+    if app.selection.is_active() || app.diagnostic.selection.is_active() {
         keys.push(("y", "copy"));
         keys.push(("Esc", "clear"));
     }
@@ -361,6 +398,7 @@ fn render_help(frame: &mut Frame, app: &App) {
         Line::from("[ / ]            Previous / next change"),
         Line::from("Tab / Shift+Tab  Next / previous file"),
         Line::from("y / Esc          Copy selection / clear selection"),
+        Line::from("Drag / y         Select and copy source or diagnostic text"),
     ];
     if app.queue_mode {
         lines.push(Line::from(
@@ -476,26 +514,17 @@ fn heading(app: &App) -> Line<'static> {
 }
 
 fn baseline_note(app: &App) -> Option<Line<'static>> {
-    if let Some(reason) = &app.decision_blocked {
-        return Some(status_line("warning", reason.clone(), Color::Yellow));
+    if app.decision_blocked.is_some() {
+        return None;
     }
     if app.is_current_fingerprint_approved() {
         return None;
     }
     if let Some(message) = &app.verification_message {
-        return Some(status_line(
-            if app.verification_pending {
-                "Checking"
-            } else {
-                "warning"
-            },
-            message.clone(),
-            if app.verification_pending {
-                Color::DarkGray
-            } else {
-                Color::Yellow
-            },
-        ));
+        if !app.verification_pending {
+            return None;
+        }
+        return Some(status_line("Checking", message.clone(), Color::DarkGray));
     }
     match &app.baseline {
         Baseline::Loading(version) => Some(status_line(
@@ -503,11 +532,7 @@ fn baseline_note(app: &App) -> Option<Line<'static>> {
             format!("approved v{version}"),
             Color::Green,
         )),
-        Baseline::Unavailable { version, reason } => Some(status_line(
-            "warning",
-            format!("approved v{version} source unavailable: {reason}"),
-            Color::Yellow,
-        )),
+        Baseline::Unavailable { .. } => None,
         Baseline::Ready(_)
             if app
                 .files

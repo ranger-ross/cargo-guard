@@ -9,6 +9,7 @@ use crate::{
 };
 
 mod app;
+mod diagnostic;
 mod diff;
 mod discovery;
 mod fingerprint;

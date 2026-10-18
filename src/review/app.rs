@@ -2,6 +2,7 @@ use std::{fs, sync::Arc};
 
 use super::{
     ReviewSession,
+    diagnostic::Diagnostic,
     diff::{self, FileStatus, ReviewFile},
     highlight::Highlighter,
     selection::Selection,
@@ -30,6 +31,7 @@ pub struct App {
     pub verification_message: Option<String>,
     pub verification_pending: bool,
     pub selection: Selection,
+    pub diagnostic: Diagnostic,
 }
 
 impl App {
@@ -58,6 +60,7 @@ impl App {
             verification_message: None,
             verification_pending: false,
             selection: Selection::default(),
+            diagnostic: Diagnostic::default(),
         })
     }
 
@@ -68,6 +71,7 @@ impl App {
     /// Refresh the edit snapshot without discarding unchanged verified sources.
     pub fn refresh(&mut self, session: ReviewSession) -> eyre::Result<()> {
         self.selection.clear();
+        self.diagnostic.reset_view();
         let current: Arc<[ScriptSource]> = read_sources(&session)?.into();
         let invalidated = current != self.current
             || session.config.config().approved.get(&session.package.name)
@@ -212,7 +216,7 @@ impl App {
 
     pub fn report_decision_error(&mut self, error: eyre::Report) {
         self.notice = Some(Notice {
-            message: format!("Decision failed: {error:#}"),
+            message: format!("{error:#}"),
             is_error: true,
         });
     }

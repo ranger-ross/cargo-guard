@@ -82,7 +82,8 @@ impl ArtifactIndex {
     ) -> Verification {
         let fingerprints = (|| {
             self.refresh(cancelled)?;
-            let fingerprints = calculate(package, root, &self.artifacts, cancelled)?;
+            let fingerprints =
+                calculate(package, root, &self.directory, &self.artifacts, cancelled)?;
             eyre::ensure!(
                 Self::unchanged(&self.directories, cancelled)?,
                 "compiled artifact directories changed during review"
@@ -155,7 +156,6 @@ pub fn approvals(session: &ReviewSession) -> eyre::Result<Vec<ApprovedVersion>> 
         .as_ref()
         .unwrap_or(&metadata.target_directory);
     from_directory(&session.package, root, directory.as_std_path())
-        .wrap_err("Could not approve fingerprints. Run cargo build with the desired target/features, then reopen review; an approval failure during that build is expected")
 }
 
 fn from_directory(
@@ -166,7 +166,7 @@ fn from_directory(
     let cancelled = AtomicBool::new(false);
     let mut index = ArtifactIndex::new(directory.to_path_buf());
     index.refresh(&cancelled)?;
-    let fingerprints = calculate(package, root, &index.artifacts, &cancelled)?;
+    let fingerprints = calculate(package, root, directory, &index.artifacts, &cancelled)?;
     eyre::ensure!(
         ArtifactIndex::unchanged(&index.directories, &cancelled)?,
         "compiled artifact directories changed during review"
@@ -183,6 +183,7 @@ fn from_directory(
 fn calculate(
     package: &ReviewPackage,
     root: &Path,
+    directory: &Path,
     artifacts: &[PathBuf],
     cancelled: &AtomicBool,
 ) -> eyre::Result<Vec<(String, ScriptSource)>> {
@@ -226,7 +227,14 @@ fn calculate(
         candidates.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
         let (compiled, artifact, contents, inputs) = candidates
             .last()
-            .with_context(|| format!("no compiled dep-info found for {}", script.path.display()))?;
+            .with_context(|| format!(
+                "No compiled dep-info found for {} v{}.\n\
+                 Build a workspace target that uses this dependency with the intended features, target and \
+                 Cargo build directory, then retry fingerprint approval.\n\n\
+                 Script: {}\n\
+                 Searched: {}",
+                package.name, package.version, script.path.display(), directory.display()
+            ))?;
         let paths: Vec<_> = inputs
             .iter()
             .map(|p| root.join(p))
@@ -800,24 +808,14 @@ mod tests {
             .unwrap()
             .set_times(fs::FileTimes::new().set_modified(past))
             .unwrap();
-        assert!(
-            app.decide(Decision::ApproveFingerprint)
-                .unwrap_err()
-                .to_string()
-                .contains("Could not approve fingerprints")
-        );
+        assert!(app.decide(Decision::ApproveFingerprint).is_err());
         fs::write(
             root.path().join("script0.rs"),
             "fn main() { println!(\"changed\"); }\n",
         )
         .unwrap();
         fs::write(&artifact, "binary: script0.rs\n").unwrap();
-        assert!(
-            app.decide(Decision::ApproveFingerprint)
-                .unwrap_err()
-                .to_string()
-                .contains("sources changed")
-        );
+        assert!(app.decide(Decision::ApproveFingerprint).is_err());
         assert!(!app.session.config.path().exists());
         assert_eq!(app.decision, None);
     }

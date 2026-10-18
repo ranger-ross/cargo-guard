@@ -36,7 +36,7 @@ fn run_review(queue: ReviewQueue, queue_mode: bool) -> eyre::Result<()> {
         "interactive review requires a terminal on stdin and stdout"
     );
     let mut state = QueueState::new(queue);
-    set_mode(&mut state, queue_mode)?;
+    set_mode(&mut state, queue_mode);
     {
         // Initialize without ratatui's restoring panic hook: unwinding must
         // stop and join the event reader before restoring terminal modes.
@@ -53,7 +53,7 @@ fn run_review(queue: ReviewQueue, queue_mode: bool) -> eyre::Result<()> {
         let mut dirty = true;
         'review: loop {
             dirty |= state.poll();
-            set_mode(&mut state, queue_mode)?;
+            set_mode(&mut state, queue_mode);
             while let Some(event) = events.poll()? {
                 match event {
                     Event::Resize(..) => dirty = true,
@@ -81,8 +81,7 @@ fn run_review(queue: ReviewQueue, queue_mode: bool) -> eyre::Result<()> {
                                 }
                             },
                             Action::CopySelection => {
-                                if let Some(app) = &mut state.app
-                                    && let Some(text) = app.selection.text(&app.file().rows)
+                                if let Some(text) = state.selected_text()
                                     && !text.is_empty()
                                 {
                                     let result = crossterm::execute!(
@@ -90,16 +89,25 @@ fn run_review(queue: ReviewQueue, queue_mode: bool) -> eyre::Result<()> {
                                         CopyToClipboard::to_clipboard_from(text)
                                     );
                                     if let Err(error) = result {
-                                        app.notice = Some(Notice {
-                                            message: format!("Could not copy selection: {error}"),
-                                            is_error: true,
-                                        });
+                                        let message = format!("Could not copy text: {error}");
+                                        if let Some(app) = &mut state.app {
+                                            app.notice = Some(Notice {
+                                                message,
+                                                is_error: true,
+                                            });
+                                        } else {
+                                            let entry = &mut state.entries[state.selected];
+                                            entry.error = Some(format!(
+                                                "{message}\n\n{}",
+                                                entry.error.as_deref().unwrap_or_default()
+                                            ));
+                                        }
                                     }
                                 }
                             }
                             Action::Continue => {}
                         }
-                        set_mode(&mut state, queue_mode)?;
+                        set_mode(&mut state, queue_mode);
                     }
                     _ => {}
                 }
@@ -111,6 +119,8 @@ fn run_review(queue: ReviewQueue, queue_mode: bool) -> eyre::Result<()> {
                             ui::render_queue(frame, &mut state);
                         } else if let Some(app) = &mut state.app {
                             ui::render(frame, app);
+                        } else {
+                            ui::render_failure(frame, &mut state);
                         }
                     })
                     .context("could not render review")?;
@@ -127,19 +137,10 @@ fn run_review(queue: ReviewQueue, queue_mode: bool) -> eyre::Result<()> {
     Ok(())
 }
 
-fn set_mode(state: &mut QueueState, queue_mode: bool) -> eyre::Result<()> {
+fn set_mode(state: &mut QueueState, queue_mode: bool) {
     if let Some(app) = &mut state.app {
         app.queue_mode = queue_mode;
-    } else if !queue_mode {
-        eyre::bail!(
-            "{}",
-            state.entries[state.selected]
-                .error
-                .as_deref()
-                .unwrap_or("could not load reviewed package")
-        );
     }
-    Ok(())
 }
 
 struct TerminalEvents {

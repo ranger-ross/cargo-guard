@@ -55,6 +55,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
             return Action::CopySelection;
         }
         KeyCode::Esc if app.selection.clear() => {}
+        KeyCode::Esc if app.diagnostic.selection.clear() => {}
         KeyCode::Char('q') | KeyCode::Esc => return Action::Quit,
         KeyCode::Down => app.scroll(1, 0),
         KeyCode::Up => app.scroll(-1, 0),

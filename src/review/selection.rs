@@ -11,10 +11,10 @@ use super::{
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct Point {
-    row: usize,
-    column: usize,
-    end: usize,
+pub(super) struct Point {
+    pub row: usize,
+    pub column: usize,
+    pub end: usize,
 }
 
 #[derive(Default)]
@@ -35,6 +35,75 @@ impl Selection {
 
     pub fn is_active(&self) -> bool {
         self.anchor.is_some()
+    }
+
+    pub fn is_dragging(&self) -> bool {
+        self.dragging
+    }
+
+    pub fn bounds(&self) -> Option<(Point, Point)> {
+        let anchor = self.anchor?;
+        let cursor = self.cursor?;
+        Some((anchor.min(cursor), anchor.max(cursor)))
+    }
+
+    pub fn handle_mouse<'a, I: Iterator<Item = &'a str>>(
+        &mut self,
+        event: MouseEvent,
+        top: usize,
+        left: u16,
+        count: usize,
+        graphemes: impl Fn(usize) -> I,
+    ) -> bool {
+        let inside = self.area.contains(Position::new(event.column, event.row));
+        let point = || {
+            if self.area.is_empty() || count == 0 {
+                return None;
+            }
+            let row = (top
+                + usize::from(event.row.clamp(self.area.y, self.area.bottom() - 1) - self.area.y))
+            .min(count - 1);
+            let column = usize::from(left)
+                + usize::from(event.column.clamp(self.area.x, self.area.right() - 1) - self.area.x);
+            let mut start = 0;
+            for grapheme in graphemes(row) {
+                let end = start + grapheme.width();
+                if end > column {
+                    return Some(Point {
+                        row,
+                        column: start,
+                        end,
+                    });
+                }
+                start = end;
+            }
+            Some(Point {
+                row,
+                column: start,
+                end: start,
+            })
+        };
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let point = inside.then(point).flatten();
+                let changed = self.clear();
+                if let Some(point) = point {
+                    self.anchor = Some(point);
+                    self.cursor = Some(point);
+                    self.dragging = true;
+                    return true;
+                }
+                changed
+            }
+            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+                if self.dragging =>
+            {
+                self.cursor = point();
+                self.dragging = !matches!(event.kind, MouseEventKind::Up(_));
+                true
+            }
+            _ => false,
+        }
     }
 
     pub fn columns(&self, row: usize) -> Option<Range<usize>> {
@@ -90,72 +159,53 @@ impl App {
         if self.show_help || event.modifiers.contains(KeyModifiers::SHIFT) {
             return false;
         }
+        if let Some(changed) = self.diagnostic.handle_mouse(event) {
+            if event.kind == MouseEventKind::Down(MouseButton::Left) {
+                self.selection.clear();
+            }
+            return changed;
+        }
+        let cleared = event.kind == MouseEventKind::Down(MouseButton::Left)
+            && self.diagnostic.selection.clear();
         let inside = self
             .selection
             .area
             .contains(Position::new(event.column, event.row));
-        match event.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                let changed = self.selection.clear();
-                if inside && let Some(point) = self.selection_point(event) {
-                    self.selection.anchor = Some(point);
-                    self.selection.cursor = Some(point);
-                    self.selection.dragging = true;
-                    return true;
-                }
-                changed
+        if inside
+            && matches!(
+                event.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            )
+        {
+            self.scroll(
+                if event.kind == MouseEventKind::ScrollUp {
+                    -3
+                } else {
+                    3
+                },
+                0,
+            );
+            if !self.selection.is_dragging() {
+                return true;
             }
-            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
-                if self.selection.dragging =>
-            {
-                self.selection.cursor = self.selection_point(event);
-                self.selection.dragging = !matches!(event.kind, MouseEventKind::Up(_));
-                true
-            }
-            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if inside => {
-                self.scroll(
-                    if event.kind == MouseEventKind::ScrollUp {
-                        -3
-                    } else {
-                        3
-                    },
-                    0,
-                );
-                if self.selection.dragging {
-                    self.selection.cursor = self.selection_point(event);
-                }
-                true
-            }
-            _ => false,
-        }
-    }
-
-    fn selection_point(&self, event: MouseEvent) -> Option<Point> {
-        let area = self.selection.area;
-        if area.is_empty() {
-            return None;
-        }
-        let row = self.top + usize::from(event.row.clamp(area.y, area.bottom() - 1) - area.y);
-        let row = row.min(self.file().rows.len().checked_sub(1)?);
-        let column = usize::from(self.left)
-            + usize::from(event.column.clamp(area.x, area.right() - 1) - area.x);
-        let mut start = 0;
-        for grapheme in graphemes(&self.file().rows[row]) {
-            let end = start + grapheme.width();
-            if end > column {
-                return Some(Point {
-                    row,
-                    column: start,
-                    end,
+            let event = MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                ..event
+            };
+            let rows = &self.files[self.selected].rows;
+            self.selection
+                .handle_mouse(event, self.top, self.left, rows.len(), |row| {
+                    graphemes(&rows[row])
                 });
-            }
-            start = end;
+            return true;
         }
-        Some(Point {
-            row,
-            column: start,
-            end: start,
-        })
+        let rows = &self.files[self.selected].rows;
+        let changed = self
+            .selection
+            .handle_mouse(event, self.top, self.left, rows.len(), |row| {
+                graphemes(&rows[row])
+            });
+        cleared || changed
     }
 }
 
