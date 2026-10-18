@@ -4,7 +4,7 @@
 [![Crates.io](https://img.shields.io/crates/v/cargo-guard.svg)](https://crates.io/crates/cargo-guard)
 [![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/ranger-ross/reqwest-metrics/blob/master/LICENSE)
 
-Cargo build script allow. 
+Cargo build script allowlist.
 Just `cargo build`, no wrappers needed.
 
 ## Setup
