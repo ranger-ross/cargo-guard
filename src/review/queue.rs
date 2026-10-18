@@ -827,11 +827,17 @@ mod tests {
         (root, state, artifact)
     }
 
+    #[track_caller]
     fn wait_for(state: &mut QueueState, ready: impl Fn(&QueueState) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !ready(state) {
             state.poll();
-            assert!(Instant::now() < deadline, "verification timed out");
+            assert!(
+                Instant::now() < deadline,
+                "verification timed out: checking={}, verification={:?}",
+                state.entries[0].checking,
+                state.entries[0].verification,
+            );
             std::thread::park_timeout(Duration::from_millis(5));
         }
     }
