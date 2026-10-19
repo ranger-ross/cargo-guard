@@ -13,6 +13,8 @@ Just `cargo build`, no wrappers needed.
 
 ```sh
 cargo install cargo-guard
+# or
+cargo binstall cargo-guard
 ```
 
 ### 2. Configure Cargo
@@ -107,6 +109,12 @@ taking a fingerprint of a build script and only requiring a re-approval if it ha
 The fingerprint attempts to track the most common attack vectors for build.rs attacks but does not guarantee to
 capture everything.
 
+## Motivations
+
+The goal of this project is to reduce the risk of a malious build script harming the Rust ecosystem.
+Build scripts are a known attack vector in the Rust supply chain and it [not thoeritical](https://blog.rust-lang.org/2026/08/20/supply-chain-attack-on-arrayref/).
+This project is an initial attempt at this problem taking inspiration from npm/pnpm's [allow scripts](https://docs.npmjs.com/cli/v11/commands/npm-approve-scripts) feature.
+Long term, Cargo itself should probably handle this in a first class way. (see [cargo#13681](https://github.com/rust-lang/cargo/issues/13681))
 
 ## Limitations
 
