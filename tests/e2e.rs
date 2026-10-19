@@ -67,6 +67,92 @@ fn approved_dependency_build_script_executes() {
 }
 
 #[test]
+fn force_build_bypasses_approval_policy_without_changing_it() {
+    for approvals in [
+        Some("[approved]\n"),
+        Some("[approved]\nguarded-dep = '2.0.0'\n"),
+        Some("invalid toml ["),
+        None,
+    ] {
+        let fixture = Fixture::new(approvals.unwrap_or(""));
+        let path = fixture.temp.path().join("workspace/approved-builds.toml");
+        if approvals.is_none() {
+            fs::remove_file(&path).unwrap();
+        }
+        let output = fixture
+            .command("workspace", &fixture.marker())
+            .args(["cargo", "build", "--offline", "--color", "never"])
+            .env("CARGO_GUARD_FORCE_BUILD", "force")
+            .output()
+            .unwrap();
+        assert_success(&output);
+        assert_eq!(fs::read(fixture.marker()).unwrap(), b"executed\n");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.lines().any(|line| {
+                line.starts_with("warning:") && line.contains("CARGO_GUARD_FORCE_BUILD=force")
+            }),
+            "missing Cargo warning:\n{stderr}"
+        );
+        assert_eq!(fs::read_to_string(&path).ok().as_deref(), approvals);
+
+        fixture.clean_dependency("workspace");
+        fs::remove_file(fixture.marker()).unwrap();
+        let rejected = fixture.build();
+        assert!(!rejected.status.success(), "{rejected:?}");
+        assert!(!fixture.marker().exists());
+    }
+}
+
+#[test]
+fn force_build_requires_exactly_force() {
+    let fixture = Fixture::new("[approved]\n");
+    for value in ["", "0", "1", "true", "Force", "force "] {
+        let output = fixture
+            .command("workspace", &fixture.marker())
+            .args(["cargo", "build", "--offline", "--color", "never"])
+            .env("CARGO_GUARD_FORCE_BUILD", value)
+            .output()
+            .unwrap();
+        assert_rejected(&output, &fixture.marker(), "guarded-dep v1.0.0");
+    }
+}
+
+#[test]
+fn force_build_preserves_build_script_failure() {
+    let fixture = Fixture::new("[approved]\n");
+    write(
+        &fixture.temp.path().join("workspace"),
+        "dep/build.rs",
+        "fn main() { std::process::exit(42); }\n",
+    );
+    let output = fixture
+        .command("workspace", &fixture.marker())
+        .args(["cargo", "build", "--offline", "--color", "never"])
+        .env("CARGO_GUARD_FORCE_BUILD", "force")
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let binary = fixture.temp.path().join(format!(
+        "failing-build-script{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    let compiled = fixture
+        .command("workspace", &fixture.marker())
+        .args(["rustc", "dep/build.rs", "-o"])
+        .arg(&binary)
+        .output()
+        .unwrap();
+    assert_success(&compiled);
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-guard"))
+        .arg(&binary)
+        .env("CARGO_GUARD_FORCE_BUILD", "force")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(42), "{output:?}");
+}
+
+#[test]
 fn cargo_directives_and_generated_code_survive_the_runner() {
     let fixture = Fixture::new("[approved]\nguarded-dep = '1.0.0'\n");
     let root = fixture.temp.path().join("workspace");

@@ -1,4 +1,8 @@
-use std::{ffi::OsString, path::Path, process::Command};
+use std::{
+    ffi::{OsStr, OsString},
+    path::Path,
+    process::Command,
+};
 
 use eyre::Context;
 
@@ -37,27 +41,33 @@ fn run(args: &[OsString]) -> eyre::Result<()> {
     let (binary, args) = args.split_first().ok_or_else(|| {
         eyre::eyre!("expected the build script binary path as the first argument")
     })?;
-    let invocation = invocation::discover()?;
-    let policy_workspace = invocation
-        .policy_workspace
-        .as_ref()
-        .unwrap_or(&invocation.workspace);
-    let paths = RunnerPaths::from_env(policy_workspace.workspace_root.as_std_path())?;
-    let manifest = std::env::var_os("CARGO_MANIFEST_PATH")
-        .ok_or_else(|| eyre::eyre!("could not read CARGO_MANIFEST_PATH"))?;
-    if !workspace::contains_manifest(policy_workspace, Path::new(&manifest))? {
-        check_approval(&config::load_runner_approvals(&paths)?)?;
-    }
-
-    let status = Command::new(binary)
-        .args(args)
-        .env(
+    let mut command = Command::new(binary);
+    command.args(args);
+    if std::env::var_os("CARGO_GUARD_FORCE_BUILD").as_deref() == Some(OsStr::new("force")) {
+        println!(
+            "cargo::warning=CARGO_GUARD_FORCE_BUILD=force: running build script without approval checks"
+        );
+    } else {
+        let invocation = invocation::discover()?;
+        let policy_workspace = invocation
+            .policy_workspace
+            .as_ref()
+            .unwrap_or(&invocation.workspace);
+        let paths = RunnerPaths::from_env(policy_workspace.workspace_root.as_std_path())?;
+        let manifest = std::env::var_os("CARGO_MANIFEST_PATH")
+            .ok_or_else(|| eyre::eyre!("could not read CARGO_MANIFEST_PATH"))?;
+        if !workspace::contains_manifest(policy_workspace, Path::new(&manifest))? {
+            check_approval(&config::load_runner_approvals(&paths)?)?;
+        }
+        command.env(
             invocation::POLICY_PID,
             invocation
                 .policy_owner
                 .unwrap_or_else(std::process::id)
                 .to_string(),
-        )
+        );
+    }
+    let status = command
         .status()
         .with_context(|| format!("could not run build script {}", binary.to_string_lossy()))?;
 

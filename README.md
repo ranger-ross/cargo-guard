@@ -64,6 +64,14 @@ foo = "0.9.12"
 
 It is recommended to use `cargo guard review` to automate this process.
 
+### Force an unapproved build
+
+To temporarily allow all build scripts without checking approvals:
+
+```sh
+CARGO_GUARD_FORCE_BUILD=force cargo build
+```
+
 ## Approval Syntax
 
 ```toml
