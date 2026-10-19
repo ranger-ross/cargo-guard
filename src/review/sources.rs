@@ -1,6 +1,6 @@
 use std::{
     fs,
-    path::{Component, Path, PathBuf},
+    path::PathBuf,
     process::Stdio,
     sync::{
         Arc,
@@ -13,13 +13,9 @@ use std::{
 
 use cargo_metadata::{Metadata, MetadataCommand, Package};
 use eyre::{Context, ContextCompat};
-use sha2::{Digest, Sha256};
 
 use super::ReviewSession;
-use crate::{
-    config::ApprovedVersion,
-    fingerprint::{self, ParsedFingerprint},
-};
+use crate::config::ApprovedVersion;
 
 #[derive(Debug)]
 pub struct PackageSources {
@@ -38,8 +34,6 @@ pub enum Baseline {
     NewPackage,
     Blanket,
     CurrentVersion,
-    CurrentFingerprint(Arc<[ScriptSource]>),
-    Fingerprint,
     Loading(semver::Version),
     Ready(PackageSources),
     Unavailable {
@@ -61,11 +55,6 @@ impl Baseline {
             }
             None => Self::NewPackage,
             Some(ApprovedVersion::Blanket(_)) => Self::Blanket,
-            Some(ApprovedVersion::Fingerprint(fingerprint)) => {
-                ParsedFingerprint::parse(fingerprint)
-                    .map(|parsed| Self::Loading(parsed.version))
-                    .unwrap_or(Self::Fingerprint)
-            }
             Some(ApprovedVersion::SemVer(version)) if version == &session.package.version => {
                 Self::CurrentVersion
             }
@@ -76,12 +65,8 @@ impl Baseline {
     pub fn message(&self) -> String {
         match self {
             Self::NewPackage => "Baseline: none (new approval)".into(),
-            Self::Blanket => "Baseline: all versions and fingerprints are manually approved".into(),
+            Self::Blanket => "Baseline: all versions are manually approved".into(),
             Self::CurrentVersion => "Baseline: current version is already approved".into(),
-            Self::CurrentFingerprint(_) => "Baseline: current build-script fingerprints are already approved".into(),
-            Self::Fingerprint => {
-                "Baseline unavailable: invalid fingerprint version hint. Approve a fresh fingerprint".into()
-            }
             Self::Loading(version) => format!("Baseline: loading approved v{version}…"),
             Self::Ready(sources) => format!(
                 "Baseline: approved v{} loaded ({} build scripts)",
@@ -106,9 +91,6 @@ impl BaselineLoader {
         let Baseline::Loading(version) = Baseline::for_session(session) else {
             return Ok(None);
         };
-        // Keep every matching saved fingerprint to authenticate historical
-        // sources, including all build scripts and compiled feature variants.
-        let approvals = session.config.config().approved.get(&session.package.name);
         let request = SourceRequest {
             name: session.package.name.clone(),
             version: version.clone(),
@@ -118,29 +100,6 @@ impl BaselineLoader {
                 .as_ref()
                 .map(|source| source.repr.clone()),
             workspace_root: session.workspace_root.clone(),
-            fingerprints: match session
-                .package
-                .approval
-                .as_ref()
-                .and_then(|approval| approval.for_review(&session.package.version))
-            {
-                Some(ApprovedVersion::Fingerprint(_)) => Some(
-                    approvals
-                        .into_iter()
-                        .flat_map(ApprovedVersion::entries)
-                        .filter_map(|approval| match approval {
-                            ApprovedVersion::Fingerprint(value)
-                                if ParsedFingerprint::parse(value)
-                                    .is_some_and(|parsed| parsed.version == version) =>
-                            {
-                                Some(value.clone())
-                            }
-                            _ => None,
-                        })
-                        .collect(),
-                ),
-                _ => None,
-            },
         };
         let (sender, receiver) = mpsc::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -149,8 +108,6 @@ impl BaselineLoader {
         let worker = thread::Builder::new()
             .name("approved-sources".into())
             .spawn(move || {
-                // Current-artifact verification belongs to the queue worker;
-                // this independently cancellable worker only retrieves history.
                 if worker_cancelled.load(Ordering::Relaxed) {
                     return;
                 }
@@ -199,9 +156,6 @@ struct SourceRequest {
     version: semver::Version,
     source: Option<String>,
     workspace_root: PathBuf,
-    // None preserves ordinary version-based approvals. Some requires every
-    // historical script to match a saved fingerprint before exposing sources.
-    fingerprints: Option<Vec<String>>,
 }
 
 /// Load source text without compiling the package or executing build scripts.
@@ -250,276 +204,7 @@ fn load_sources(request: &SourceRequest, cancelled: &AtomicBool) -> eyre::Result
                     == request.source.as_deref()
         })
         .context("Cargo did not return the approved version from its original registry")?;
-    let sources = read_package_sources(package)?;
-    if let Some(approvals) = &request.fingerprints {
-        let mut command = MetadataCommand::new();
-        command
-            .manifest_path(request.workspace_root.join("Cargo.toml"))
-            .current_dir(&request.workspace_root)
-            .no_deps()
-            .other_options(vec!["--offline".into()]);
-        let workspace = execute_metadata(&command, cancelled)
-            .context("could not locate existing compiled inputs for fingerprint verification")?;
-        let mut artifacts = Vec::new();
-        if let Some(directory) = &workspace.build_directory {
-            super::fingerprint::collect(directory.as_std_path(), &mut artifacts)?;
-        }
-        if workspace.build_directory.as_ref() != Some(&workspace.target_directory) {
-            super::fingerprint::collect(workspace.target_directory.as_std_path(), &mut artifacts)?;
-        }
-        let root = package
-            .manifest_path
-            .parent()
-            .context("baseline manifest has no parent")?;
-        let targets = package
-            .targets
-            .iter()
-            .filter(|target| target.is_custom_build())
-            .map(|target| {
-                Ok((
-                    target.name.clone(),
-                    target.src_path.strip_prefix(root)?.into(),
-                ))
-            })
-            .collect::<eyre::Result<Vec<(String, PathBuf)>>>()?;
-        verify_fingerprint_baseline(
-            package.manifest_path.as_std_path(),
-            &sources,
-            &targets,
-            approvals,
-            &request.workspace_root,
-            &artifacts,
-            cancelled,
-        )?;
-    }
-    Ok(sources)
-}
-
-/// Existing dep-info supplies candidate input sets, never authorization. Only
-/// the saved pair of hashes can authenticate a remapped historical package.
-fn verify_fingerprint_baseline(
-    manifest_path: &Path,
-    sources: &PackageSources,
-    targets: &[(String, PathBuf)],
-    approvals: &[String],
-    workspace_root: &Path,
-    artifacts: &[PathBuf],
-    cancelled: &AtomicBool,
-) -> eyre::Result<()> {
-    let version = &sources.version;
-    eyre::ensure!(
-        sources.scripts.len() == targets.len(),
-        "baseline source snapshots do not match the build targets"
-    );
-    let approvals: Vec<_> = approvals
-        .iter()
-        .filter(|value| {
-            ParsedFingerprint::parse(value).is_some_and(|parsed| parsed.version == *version)
-        })
-        .collect();
-    eyre::ensure!(
-        !approvals.is_empty(),
-        "no saved fingerprints for the requested version hint"
-    );
-    eyre::ensure!(
-        !targets.is_empty(),
-        "version hint points to a package without build scripts"
-    );
-    let mut matched_approvals = vec![false; approvals.len()];
-    let version_string = version.to_string();
-    let root = manifest_path
-        .parent()
-        .context("baseline manifest has no parent")?
-        .canonicalize()?;
-    for (name, script) in targets {
-        eyre::ensure!(
-            script
-                .components()
-                .all(|component| matches!(component, Component::Normal(_))),
-            "baseline script path is not package-relative"
-        );
-        let source = sources
-            .scripts
-            .iter()
-            .find(|source| source.path == *script)
-            .context("baseline target has no source snapshot")?;
-        let mut snapshot_hash = String::with_capacity(64);
-        fingerprint::append_hex(
-            &mut snapshot_hash,
-            &Sha256::digest(source.contents.as_bytes()),
-        );
-        let mut verified = false;
-        let mut reason =
-            "no matching compiled dep-info. Build the current package first".to_owned();
-        for artifact in artifacts {
-            eyre::ensure!(
-                !cancelled.load(Ordering::Relaxed),
-                "baseline loading cancelled"
-            );
-            if !super::fingerprint::matches_target(artifact, name) {
-                continue;
-            }
-            let candidate = (|| -> eyre::Result<()> {
-                let compiled = fs::metadata(artifact)?.modified()?;
-                let contents = fs::read_to_string(artifact)?;
-                let inputs = fingerprint::parse_dep_info(&contents)?
-                    .into_iter()
-                    .map(|path| workspace_root.join(path))
-                    .collect::<Vec<_>>();
-                eyre::ensure!(
-                    inputs
-                        .iter()
-                        .all(|path| !path.components().any(|part| part == Component::ParentDir)),
-                    "compiled input contains an unmappable parent path"
-                );
-                // A record may reference the current release or a historical
-                // registry directory that Cargo has since removed. Infer its
-                // root from the complete relative entry path, not its basename.
-                let mut failure =
-                    "compiled dep-info does not track the requested entry path".to_owned();
-                for entry in inputs.iter().filter(|path| path.ends_with(script)) {
-                    let candidate_root = entry
-                        .ancestors()
-                        .nth(script.components().count())
-                        .context("compiled entry path has no package root")?;
-                    let mapped = match remap_inputs(&inputs, candidate_root, &root, compiled) {
-                        Ok(mapped) => mapped,
-                        Err(error) => {
-                            failure = format!("{error:#}");
-                            continue;
-                        }
-                    };
-                    let fingerprint = match fingerprint::from_dep_info(
-                        manifest_path,
-                        &mapped,
-                        Some(&root),
-                        &version_string,
-                    ) {
-                        Ok(fingerprint) => fingerprint,
-                        Err(error) => {
-                            failure = format!("{error:#}");
-                            continue;
-                        }
-                    };
-                    eyre::ensure!(
-                        ParsedFingerprint::parse(&fingerprint)
-                            .is_some_and(|parsed| parsed.script_hash == snapshot_hash),
-                        "baseline source snapshot does not match the verified script hash"
-                    );
-                    eyre::ensure!(
-                        fs::read_to_string(artifact)? == contents,
-                        "compiled dep-info changed during baseline verification"
-                    );
-                    let mut matches = false;
-                    for (index, saved) in approvals.iter().enumerate() {
-                        if fingerprint::fingerprints_match(saved, &fingerprint) {
-                            matched_approvals[index] = true;
-                            matches = true;
-                        }
-                    }
-                    if matches {
-                        return Ok(());
-                    }
-                    failure =
-                        "saved fingerprint does not match retrieved sources and build dependencies"
-                            .to_owned();
-                }
-                eyre::bail!("{failure}")
-            })();
-            match candidate {
-                Ok(()) => {
-                    verified = true;
-                }
-                Err(error) => reason = format!("{error:#}"),
-            }
-        }
-        eyre::ensure!(
-            verified,
-            "untrusted version hint v{version}: could not verify {}: {reason}",
-            script.display()
-        );
-    }
-    eyre::ensure!(
-        matched_approvals.iter().all(|matched| *matched),
-        "untrusted version hint v{version}: could not verify all saved fingerprints"
-    );
-    Ok(())
-}
-
-fn remap_inputs(
-    inputs: &[PathBuf],
-    candidate_root: &Path,
-    baseline_root: &Path,
-    compiled: std::time::SystemTime,
-) -> eyre::Result<String> {
-    let mut dep_info = String::from("verified-baseline:");
-    let original_root = candidate_root
-        .try_exists()?
-        .then(|| candidate_root.canonicalize())
-        .transpose()?;
-    let manifest = candidate_root.join("Cargo.toml");
-    if manifest.try_exists()? {
-        eyre::ensure!(
-            fs::metadata(manifest)?.modified()? <= compiled,
-            "package manifest is newer than compiled dep-info"
-        );
-    }
-    for input in inputs {
-        let relative = input
-            .strip_prefix(candidate_root)
-            .context("compiled input is external to the package")?;
-        eyre::ensure!(
-            !relative.as_os_str().is_empty()
-                && relative
-                    .components()
-                    .all(|part| matches!(part, Component::Normal(_))),
-            "compiled input cannot be mapped into the baseline package"
-        );
-        // When original files still exist, reject stale compilation records.
-        // Deleted historical package roots are fine: only retrieved files are
-        // hashed, and missing retrieved inputs always fail below.
-        if let Some(original_root) = &original_root {
-            eyre::ensure!(
-                input
-                    .canonicalize()
-                    .with_context(|| format!("missing original tracked input {}", input.display()))?
-                    .starts_with(original_root),
-                "compiled input resolves outside the package"
-            );
-            eyre::ensure!(
-                fs::metadata(input)?.modified()? <= compiled,
-                "compiled dep-info is stale"
-            );
-        }
-        let mapped = baseline_root
-            .join(relative)
-            .canonicalize()
-            .with_context(|| format!("missing baseline tracked input {}", relative.display()))?;
-        eyre::ensure!(
-            mapped.starts_with(baseline_root),
-            "baseline input resolves outside the package"
-        );
-        let path = relative
-            .to_str()
-            .context("compiled input path is not UTF-8")?;
-        eyre::ensure!(
-            !path.contains(['\n', '\r']),
-            "compiled input path contains a newline"
-        );
-        dep_info.push(' ');
-        for character in path.chars() {
-            match character {
-                '$' => dep_info.push_str("$$"),
-                '\\' | ' ' | '\t' | '#' | ':' => {
-                    dep_info.push('\\');
-                    dep_info.push(character);
-                }
-                _ => dep_info.push(character),
-            }
-        }
-    }
-    dep_info.push('\n');
-    Ok(dep_info)
+    read_package_sources(package)
 }
 
 fn registry_index(source: Option<&str>) -> eyre::Result<&str> {
@@ -683,8 +368,6 @@ mod tests {
         app.session.package.approval =
             Some(ApprovedVersion::SemVer(app.session.package.version.clone()));
         assert!(BaselineLoader::start(&app.session).unwrap().is_none());
-        app.session.package.approval = Some(ApprovedVersion::Fingerprint("hash".into()));
-        assert!(BaselineLoader::start(&app.session).unwrap().is_none());
         app.session.package.approval = Some(ApprovedVersion::SemVer("0.0.1".parse().unwrap()));
         let loader = BaselineLoader::start(&app.session).unwrap().unwrap();
         let result = loader
@@ -711,7 +394,6 @@ mod tests {
             version: "1.0.0".parse().unwrap(),
             source: Some("sparse+http://127.0.0.1:9/cargo-guard-test-index/".into()),
             workspace_root: root.path().to_path_buf(),
-            fingerprints: None,
         };
         let error = load_sources(&request, &AtomicBool::new(false)).unwrap_err();
         let message = format!("{error:#}");
@@ -730,7 +412,6 @@ mod tests {
             version: "1.2.3".parse().unwrap(),
             source: None,
             workspace_root: PathBuf::new(),
-            fingerprints: None,
         };
         let manifest: toml::Value = toml::from_str(&baseline_manifest(&request)).unwrap();
         assert!(manifest.get("workspace").is_some());
@@ -790,300 +471,6 @@ mod tests {
         package.targets.retain(|target| !target.is_custom_build());
         assert!(read_package_sources(&package).unwrap().scripts.is_empty());
         assert!(!root.path().join("target").exists());
-    }
-
-    struct VerifiedFixture {
-        directory: tempfile::TempDir,
-        manifest: PathBuf,
-        version: semver::Version,
-        targets: Vec<(String, PathBuf)>,
-        approvals: Vec<String>,
-        artifacts: Vec<PathBuf>,
-    }
-
-    impl VerifiedFixture {
-        fn new() -> Self {
-            let directory = tempfile::tempdir().unwrap();
-            let baseline = directory.path().join("baseline");
-            fs::create_dir_all(baseline.join("scripts")).unwrap();
-            let manifest = baseline.join("Cargo.toml");
-            fs::write(
-                &manifest,
-                "[package]\nname='example'\nversion='1.0.0'\nbuild=['scripts/first.rs','scripts/second.rs']\n[build-dependencies]\ncc='1'\n",
-            ).unwrap();
-            fs::write(
-                baseline.join("scripts/first.rs"),
-                "compile_error!(\"never execute\");",
-            )
-            .unwrap();
-            fs::write(
-                baseline.join("scripts/second.rs"),
-                "compile_error!(\"also never execute\");",
-            )
-            .unwrap();
-            fs::write(baseline.join("helper file.rs"), "// approved helper").unwrap();
-            let targets = vec![
-                (
-                    "build-script-first".to_owned(),
-                    PathBuf::from("scripts/first.rs"),
-                ),
-                (
-                    "build-script-second".to_owned(),
-                    PathBuf::from("scripts/second.rs"),
-                ),
-            ];
-            let mut approvals = Vec::new();
-            let mut artifacts = Vec::new();
-            // The historical source tree is deliberately absent. Its dep-info
-            // still describes usable package-relative inputs.
-            let historical = directory.path().join("example-0.9.0");
-            for (name, entry) in &targets {
-                let dep_info = format!("binary: {} helper\\ file.rs\n", entry.display());
-                approvals.push(
-                    fingerprint::from_dep_info(&manifest, &dep_info, Some(&baseline), "1.0.0")
-                        .unwrap(),
-                );
-                let artifact = directory
-                    .path()
-                    .join(format!("{}-abcd.d", name.replace('-', "_")));
-                fs::write(
-                    &artifact,
-                    format!(
-                        "binary: {} {}/helper\\ file.rs\n",
-                        historical.join(entry).display(),
-                        historical.display(),
-                    ),
-                )
-                .unwrap();
-                artifacts.push(artifact);
-            }
-            Self {
-                directory,
-                manifest,
-                version: "1.0.0".parse().unwrap(),
-                targets,
-                approvals,
-                artifacts,
-            }
-        }
-
-        fn sources(&self) -> eyre::Result<PackageSources> {
-            Ok(PackageSources {
-                version: self.version.clone(),
-                scripts: self
-                    .targets
-                    .iter()
-                    .map(|(_, path)| {
-                        Ok(ScriptSource {
-                            path: path.clone(),
-                            contents: fs::read_to_string(
-                                self.manifest.parent().unwrap().join(path),
-                            )?,
-                        })
-                    })
-                    .collect::<eyre::Result<Vec<_>>>()?,
-            })
-        }
-
-        fn verify(&self) -> eyre::Result<()> {
-            verify_fingerprint_baseline(
-                &self.manifest,
-                &self.sources()?,
-                &self.targets,
-                &self.approvals,
-                self.directory.path(),
-                &self.artifacts,
-                &AtomicBool::new(false),
-            )
-        }
-    }
-
-    #[test]
-    fn fingerprint_baseline_verifies_all_scripts_from_historical_or_current_inputs() {
-        let mut fixture = VerifiedFixture::new();
-        fixture.verify().unwrap();
-        // Current compiled paths are useful too; only retrieved baseline bytes
-        // are hashed, not current source contents.
-        let current = fixture.directory.path().join("current");
-        fs::create_dir_all(current.join("scripts")).unwrap();
-        fs::write(
-            current.join("scripts/first.rs"),
-            "// current release changed",
-        )
-        .unwrap();
-        fs::write(current.join("helper file.rs"), "// current helper changed").unwrap();
-        fs::write(
-            &fixture.artifacts[0],
-            "binary: current/scripts/first.rs current/helper\\ file.rs\n",
-        )
-        .unwrap();
-        fixture.verify().unwrap();
-        fixture.approvals.pop();
-        assert!(
-            fixture
-                .verify()
-                .unwrap_err()
-                .to_string()
-                .contains("second.rs")
-        );
-        assert!(!fixture.directory.path().join("target").exists());
-    }
-
-    #[test]
-    fn fingerprint_baseline_rejects_forged_hints_and_either_hash_mismatch() {
-        let mut fixture = VerifiedFixture::new();
-        let saved = fixture.approvals.clone();
-        fixture.version = "9.9.9".parse().unwrap();
-        assert!(fixture.verify().is_err());
-        fixture.approvals = saved
-            .iter()
-            .map(|value| value.replace("#1.0.0", "#9.9.9"))
-            .collect();
-        // A rewritten hint can only be accepted when the retrieved source
-        // contents really match both hashes. Here the hinted release differs.
-        fs::write(
-            fixture.manifest.parent().unwrap().join("scripts/first.rs"),
-            "// forged release",
-        )
-        .unwrap();
-        assert!(fixture.verify().is_err());
-        fixture.version = "1.0.0".parse().unwrap();
-        fixture.approvals = saved.clone();
-        fs::write(
-            fixture.manifest.parent().unwrap().join("scripts/first.rs"),
-            "compile_error!(\"never execute\");",
-        )
-        .unwrap();
-        for index in [0, 65] {
-            let replacement = if &saved[0][index..index + 1] == "0" {
-                "1"
-            } else {
-                "0"
-            };
-            fixture.approvals[0].replace_range(index..index + 1, replacement);
-            assert!(fixture.verify().is_err());
-            fixture.approvals = saved.clone();
-        }
-    }
-
-    #[test]
-    fn fingerprint_baseline_rejects_changed_helpers_dependencies_and_missing_inputs() {
-        let fixture = VerifiedFixture::new();
-        let helper = fixture.manifest.parent().unwrap().join("helper file.rs");
-        fs::write(&helper, "// modified helper").unwrap();
-        assert!(fixture.verify().is_err());
-        fs::remove_file(&helper).unwrap();
-        assert!(fixture.verify().is_err());
-        fs::write(&helper, "// approved helper").unwrap();
-        fs::write(&fixture.manifest,
-            "[package]\nname='example'\nversion='1.0.0'\nbuild=['scripts/first.rs','scripts/second.rs']\n[build-dependencies]\ncc='2'\n",
-        ).unwrap();
-        assert!(fixture.verify().is_err());
-    }
-
-    #[test]
-    fn fingerprint_baseline_rejects_absent_stale_external_or_wrong_target_records() {
-        let mut fixture = VerifiedFixture::new();
-        let artifacts = fixture.artifacts.clone();
-        fixture.artifacts.clear();
-        assert!(
-            fixture
-                .verify()
-                .unwrap_err()
-                .to_string()
-                .contains("no matching compiled")
-        );
-        fixture.artifacts = artifacts;
-        fs::write(
-            &fixture.artifacts[0],
-            "binary: baseline/scripts/first.rs baseline/helper\\ file.rs\n",
-        )
-        .unwrap();
-        fs::File::options()
-            .write(true)
-            .open(&fixture.artifacts[0])
-            .unwrap()
-            .set_times(
-                fs::FileTimes::new()
-                    .set_modified(std::time::SystemTime::now() - Duration::from_secs(60)),
-            )
-            .unwrap();
-        assert!(fixture.verify().is_err());
-        fs::write(
-            &fixture.artifacts[0],
-            "binary: baseline/scripts/first.rs outside.rs\n",
-        )
-        .unwrap();
-        assert!(fixture.verify().is_err());
-        fs::write(
-            &fixture.artifacts[0],
-            "binary: baseline/scripts/first.rs baseline/helper\\ file.rs\n",
-        )
-        .unwrap();
-        fixture.targets[0].0 = "different-target".into();
-        assert!(fixture.verify().is_err());
-        fixture.targets[0].0 = "build-script-first".into();
-        fixture.targets[0].1 = "different/first.rs".into();
-        assert!(fixture.verify().is_err());
-    }
-
-    #[test]
-    fn fingerprint_baseline_rejects_removed_scripts_and_unverified_source_snapshots() {
-        let mut fixture = VerifiedFixture::new();
-        let mut sources = fixture.sources().unwrap();
-        sources.scripts[0].contents = "// not the verified bytes".into();
-        let error = verify_fingerprint_baseline(
-            &fixture.manifest,
-            &sources,
-            &fixture.targets,
-            &fixture.approvals,
-            fixture.directory.path(),
-            &fixture.artifacts,
-            &AtomicBool::new(false),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("snapshot"));
-        fixture.targets.pop();
-        assert!(fixture.verify().is_err());
-    }
-
-    #[test]
-    fn fingerprint_baseline_requires_artifacts_for_every_saved_feature_variant() {
-        let mut fixture = VerifiedFixture::new();
-        let baseline = fixture.manifest.parent().unwrap();
-        fs::write(baseline.join("feature.rs"), "// feature input").unwrap();
-        fixture.approvals.push(
-            fingerprint::from_dep_info(
-                &fixture.manifest,
-                "binary: scripts/first.rs helper\\ file.rs feature.rs\n",
-                Some(baseline),
-                "1.0.0",
-            )
-            .unwrap(),
-        );
-        assert!(fixture.verify().is_err());
-        let artifact = fixture.directory.path().join("build_script_first-ffff.d");
-        fs::write(&artifact,
-            "binary: example-0.9.0/scripts/first.rs example-0.9.0/helper\\ file.rs example-0.9.0/feature.rs\n",
-        ).unwrap();
-        fixture.artifacts.push(artifact);
-        fixture.verify().unwrap();
-    }
-
-    #[test]
-    fn valid_fingerprint_hint_loads_but_never_immediately_trusts_current_version() {
-        let (_root, mut app) = super::super::app::tests::fixture(&["fn main() {}"]);
-        let value = format!(
-            "{}+{}#{}",
-            "a".repeat(64),
-            "b".repeat(16),
-            app.session.package.version
-        );
-        app.session.package.approval = Some(ApprovedVersion::Fingerprint(value));
-        assert!(matches!(
-            Baseline::for_session(&app.session),
-            Baseline::Loading(version) if version == app.session.package.version
-        ));
     }
 
     #[test]

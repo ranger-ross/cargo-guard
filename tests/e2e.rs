@@ -1,5 +1,4 @@
 use std::{
-    fmt::Write as _,
     fs,
     io::{Read, Write as _},
     path::{Path, PathBuf},
@@ -8,8 +7,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-
-use sha2::{Digest, Sha256};
 
 const TOOLCHAIN: &str = "nightly";
 
@@ -229,128 +226,9 @@ fn global_blanket_approval_yields_to_workspace_policy() {
 }
 
 #[test]
-fn fingerprint_approval_checks_both_hashes_but_ignores_version_hints() {
-    let fixture = Fixture::new("[approved]\nguarded-dep = 'legacy-hash'\n");
-    let root = fixture.temp.path().join("workspace");
-    let script_path = root.join("dep/build.rs");
-    let script = format!(
-        "{}\nconst _: &str = include_str!(\"helper.txt\");\n",
-        fs::read_to_string(&script_path).unwrap()
-    );
-    fs::write(&script_path, &script).unwrap();
-    write(&root, "dep/helper.txt", "original");
-
-    let rejected = fixture.build();
-    let original = rejected_fingerprint(&rejected);
-    assert!(!fixture.marker().exists());
-    let (hashes, hint) = original.split_once('#').unwrap();
-    let (script_hash, inputs_hash) = hashes.split_once('+').unwrap();
-    assert_eq!(hint, "1.0.0");
-    let mut audited_hash = String::with_capacity(64);
-    for byte in Sha256::digest(script.as_bytes()) {
-        write!(&mut audited_hash, "{byte:02x}").unwrap();
-    }
-    assert_eq!(script_hash, audited_hash);
-
-    write(
-        &root,
-        "approved-builds.toml",
-        &format!("[approved]\nguarded-dep = '{hashes}#9.0.0+untrusted'\n"),
-    );
-    let approved = fixture.build();
-    assert!(
-        approved.status.success(),
-        "{}",
-        String::from_utf8_lossy(&approved.stderr)
-    );
-    assert_eq!(fs::read(fixture.marker()).unwrap(), b"executed\n");
-    fs::remove_file(fixture.marker()).unwrap();
-
-    write(&root, "dep/helper.txt", "changed");
-    let helper_changed = rejected_fingerprint(&fixture.build());
-    let (helper_hashes, _) = helper_changed.split_once('#').unwrap();
-    let (same_script_hash, changed_inputs_hash) = helper_hashes.split_once('+').unwrap();
-    assert_eq!(same_script_hash, script_hash);
-    assert_ne!(changed_inputs_hash, inputs_hash);
-    assert!(!fixture.marker().exists());
-
-    fs::write(&script_path, format!("// changed entry point\n{script}")).unwrap();
-    let script_changed = rejected_fingerprint(&fixture.build());
-    let (script_hashes, _) = script_changed.split_once('#').unwrap();
-    let (changed_script_hash, same_inputs_hash) = script_hashes.split_once('+').unwrap();
-    assert_ne!(changed_script_hash, script_hash);
-    assert_eq!(same_inputs_hash, changed_inputs_hash);
-    assert!(!fixture.marker().exists());
-}
-
-#[test]
-fn fingerprint_approval_survives_a_real_package_version_change() {
-    let fixture = Fixture::new("[approved]\nguarded-dep = 'legacy-hash'\n");
-    let root = fixture.temp.path().join("workspace");
-    write(
-        &root,
-        "dep/build.rs",
-        r#"fn main() {
-    std::fs::write(
-        std::env::var_os("CARGO_GUARD_E2E_MARKER").expect("missing marker path"),
-        format!("{}:{}\n", env!("CARGO_PKG_VERSION"), include_str!("helper.txt")),
-    )
-    .expect("could not write execution marker");
-}
-"#,
-    );
-    write(&root, "dep/helper.txt", "reviewed");
-
-    let rejected = fixture.build();
-    assert_rejected(&rejected, &fixture.marker(), "guarded-dep v1.0.0");
-    let fingerprint = rejected_fingerprint(&rejected);
-    let policy = format!("[approved]\nguarded-dep = '{fingerprint}'\n");
-    write(&root, "approved-builds.toml", &policy);
-
-    assert_success(&fixture.build());
-    assert_eq!(fs::read(fixture.marker()).unwrap(), b"1.0.0:reviewed\n");
-    fs::remove_file(fixture.marker()).unwrap();
-
-    let manifest = fs::read_to_string(root.join("dep/Cargo.toml")).unwrap();
-    write(
-        &root,
-        "dep/Cargo.toml",
-        &manifest.replace("version = \"1.0.0\"", "version = \"2.0.0\""),
-    );
-    assert_success(&fixture.build());
-    assert_eq!(fs::read(fixture.marker()).unwrap(), b"2.0.0:reviewed\n");
-    assert_eq!(
-        fs::read_to_string(root.join("approved-builds.toml")).unwrap(),
-        policy
-    );
-    fs::remove_file(fixture.marker()).unwrap();
-
-    write(&root, "dep/helper.txt", "unreviewed");
-    assert_rejected(&fixture.build(), &fixture.marker(), "guarded-dep v2.0.0");
-    assert_eq!(
-        fs::read_to_string(root.join("approved-builds.toml")).unwrap(),
-        policy
-    );
-}
-
-#[test]
-fn review_generated_fingerprint_approval_authorizes_a_real_build() {
+fn review_approval_pins_the_version_for_a_real_build() {
     let fixture = Fixture::new("[approved]\n");
     let root = fixture.temp.path().join("workspace");
-    write(
-        &root,
-        "dep/build.rs",
-        r#"fn main() {
-    std::fs::write(
-        std::env::var_os("CARGO_GUARD_E2E_MARKER").expect("missing marker path"),
-        include_str!("helper.txt"),
-    )
-    .expect("could not write execution marker");
-}
-"#,
-    );
-    write(&root, "dep/helper.txt", "reviewed contents\n");
-
     assert_rejected(&fixture.build(), &fixture.marker(), "guarded-dep v1.0.0");
     let mut review = fixture.command("workspace", &fixture.marker());
     review.args([
@@ -366,14 +244,19 @@ fn review_generated_fingerprint_approval_authorizes_a_real_build() {
 
     let policy_path = root.join("approved-builds.toml");
     let saved = fs::read_to_string(&policy_path).unwrap();
+    assert!(saved.contains("guarded-dep = \"1.0.0\""), "{saved}");
 
     assert_success(&fixture.build());
-    assert_eq!(fs::read(fixture.marker()).unwrap(), b"reviewed contents\n");
+    assert_eq!(fs::read(fixture.marker()).unwrap(), b"executed\n");
     fs::remove_file(fixture.marker()).unwrap();
 
-    write(&root, "dep/helper.txt", "unreviewed contents\n");
-    let changed = fixture.build();
-    assert_rejected(&changed, &fixture.marker(), "guarded-dep v1.0.0");
+    let manifest = fs::read_to_string(root.join("dep/Cargo.toml")).unwrap();
+    write(
+        &root,
+        "dep/Cargo.toml",
+        &manifest.replace("version = \"1.0.0\"", "version = \"1.0.1\""),
+    );
+    assert_rejected(&fixture.build(), &fixture.marker(), "guarded-dep v1.0.1");
     assert_eq!(fs::read_to_string(&policy_path).unwrap(), saved);
 }
 
@@ -435,70 +318,6 @@ fn global_build_autoapproves_workspace_member_scripts() {
     assert_success(&fixture.build_workspace("workspace"));
     assert_eq!(fs::read(member_marker).unwrap(), b"executed\n");
     assert!(!root.join("approved-builds.toml").exists());
-}
-
-#[test]
-fn global_fingerprint_is_shared_but_workspace_policy_remains_authoritative() {
-    let fixture = Fixture::global();
-    fixture.approve_global("[approved]\nguarded-dep = 'legacy-hash'\n");
-    let rejected = fixture.build_workspace("workspace");
-    assert_rejected(
-        &rejected,
-        &fixture.workspace_marker("workspace"),
-        "guarded-dep v1.0.0",
-    );
-    let fingerprint = rejected_fingerprint(&rejected);
-    fixture.approve_global(&format!("[approved]\nguarded-dep = '{fingerprint}'\n"));
-
-    for workspace in ["workspace", "workspace-b"] {
-        assert_success(&fixture.build_workspace(workspace));
-        assert_eq!(
-            fs::read(fixture.workspace_marker(workspace)).unwrap(),
-            b"executed\n"
-        );
-        assert!(
-            !fixture
-                .temp
-                .path()
-                .join(workspace)
-                .join("approved-builds.toml")
-                .exists()
-        );
-    }
-
-    let second_root = fixture.temp.path().join("workspace-b");
-    fs::remove_file(fixture.workspace_marker("workspace-b")).unwrap();
-    write(&second_root, "dep/helper.txt", "changed");
-    let changed = fixture.build_workspace("workspace-b");
-    assert_rejected(
-        &changed,
-        &fixture.workspace_marker("workspace-b"),
-        "guarded-dep v1.0.0",
-    );
-    assert_ne!(rejected_fingerprint(&changed), fingerprint);
-
-    // The first workspace still matches the global fingerprint. Force Cargo to
-    // invoke its runner again after installing an authoritative empty policy.
-    let first_root = fixture.temp.path().join("workspace");
-    write(&first_root, "approved-builds.toml", "[approved]\n");
-    fs::remove_file(fixture.workspace_marker("workspace")).unwrap();
-    fixture.clean_dependency("workspace");
-    let authoritative = fixture.build_workspace("workspace");
-    assert_rejected(
-        &authoritative,
-        &fixture.workspace_marker("workspace"),
-        "guarded-dep v1.0.0",
-    );
-    let stderr = String::from_utf8_lossy(&authoritative.stderr);
-    assert!(stderr.contains("no approval entry"), "{stderr}");
-    assert!(
-        stderr.contains(first_root.join("approved-builds.toml").to_str().unwrap()),
-        "{stderr}"
-    );
-    assert_eq!(
-        fs::read_to_string(fixture.global_path()).unwrap(),
-        format!("[approved]\nguarded-dep = '{fingerprint}'\n")
-    );
 }
 
 #[test]
@@ -882,7 +701,6 @@ fn nested_cargo_keeps_outer_workspace_policy_authoritative() {
 fn version_list_approvals_authorize_only_matching_dependency_versions() {
     for (approvals, allowed) in [
         ("['0.9.0', '1.0.0']", true),
-        ("['wrong-fingerprint', '1.0.0']", true),
         ("[]", false),
         ("['0.9.0', '0.8.0']", false),
     ] {
@@ -976,18 +794,6 @@ fn invalid_global_path_is_rejected_even_with_workspace_approvals() {
         );
         assert!(!fixture.marker().exists(), "{output:?}");
     }
-}
-
-fn rejected_fingerprint(output: &Output) -> String {
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    stderr
-        .lines()
-        .find_map(|line| {
-            line.split_once("Current fingerprint: ")
-                .map(|(_, fingerprint)| fingerprint.trim().to_owned())
-        })
-        .unwrap_or_else(|| panic!("missing fingerprint in build rejection:\n{stderr}"))
 }
 
 struct Fixture {
@@ -1217,7 +1023,7 @@ fn approve_review(command: &Command) {
         loop {
             if let Some(status) = child.try_wait()? {
                 eyre::ensure!(status.success(), "review exited with {status}");
-                eyre::ensure!(accepted, "review exited before accepting a fingerprint");
+                eyre::ensure!(accepted, "review exited before approving");
                 return Ok(());
             }
             eyre::ensure!(Instant::now() < deadline, "review timed out");
@@ -1236,7 +1042,7 @@ fn approve_review(command: &Command) {
                     }
                     if !accepted
                         && last_screen.contains("guarded-dep v1.0.0")
-                        && last_screen.contains("a accept")
+                        && last_screen.contains("a approve")
                     {
                         writer.write_all(b"a")?;
                         writer.flush()?;

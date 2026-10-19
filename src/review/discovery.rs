@@ -175,7 +175,6 @@ fn dependency_is_active(
 pub struct ReviewQueue {
     pub packages: Vec<ReviewPackage>,
     pub config: ConfigFile,
-    pub build_directory: PathBuf,
     pub workspace_root: PathBuf,
     pub policy_notes: Vec<String>,
     pub global_target: Option<ApprovalTarget>,
@@ -216,12 +215,6 @@ impl ReviewQueue {
                     config::review_target(metadata.workspace_root.as_std_path(), true, Some(path))
                 })
                 .transpose()?,
-            build_directory: metadata
-                .build_directory
-                .as_ref()
-                .unwrap_or(&metadata.target_directory)
-                .clone()
-                .into_std_path_buf(),
         })
     }
 }

@@ -64,11 +64,7 @@ pub fn render_queue(frame: &mut Frame, state: &mut QueueState) {
             let (marker, color) = match entry.status() {
                 "approved" | "already approved" | "approved globally" => ("✓", Color::Green),
                 "rejected" => ("×", Color::Red),
-                "load error" | "baseline unavailable" | "verification unavailable" => {
-                    ("!", Color::Yellow)
-                }
-                "fingerprint changed" => ("?", Color::Yellow),
-                "checking" => ("~", Color::DarkGray),
+                "load error" | "baseline unavailable" => ("!", Color::Yellow),
                 "skipped" => ("–", Color::DarkGray),
                 _ => ("·", Color::DarkGray),
             };
@@ -165,11 +161,6 @@ fn update_diagnostic(app: &mut App) {
         app.notice.as_ref().map(|notice| notice.message.clone())
     } else if let Some(reason) = &app.decision_blocked {
         Some(reason.clone())
-    } else if !app.verification_pending
-        && !app.is_current_fingerprint_approved()
-        && app.verification_message.is_some()
-    {
-        app.verification_message.clone()
     } else if let Baseline::Unavailable { version, reason } = &app.baseline {
         Some(format!(
             "Could not load approved v{version} sources.\n\n{reason}"
@@ -342,13 +333,7 @@ fn render_area(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     }
     render_footer(frame, app, footer);
-    if let Some(dialog) = &mut app.pin_dialog {
-        dialog.render(
-            frame,
-            &app.session.package.name,
-            &app.session.package.version,
-        );
-    } else if app.show_help {
+    if app.show_help {
         render_help(frame, app);
     }
 }
@@ -358,19 +343,13 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         Layout::horizontal([Constraint::Min(0), Constraint::Length(16)]).areas(area);
     let mut keys = Vec::new();
     if app.can_decide() {
-        keys.push(("a", "accept"));
+        keys.push(("a", "approve"));
         keys.push(("r", "reject"));
     }
     if app.queue_mode {
         keys.push(("s", "skip"));
     }
-    if app.selection.is_active()
-        || app.diagnostic.selection.is_active()
-        || app
-            .pin_dialog
-            .as_ref()
-            .is_some_and(|dialog| dialog.diagnostic.selection.is_active())
-    {
+    if app.selection.is_active() || app.diagnostic.selection.is_active() {
         keys.push(("y", "copy"));
         keys.push(("Esc", "clear"));
     }
@@ -418,7 +397,7 @@ fn render_help(frame: &mut Frame, app: &mut App) {
             "s                Skip to the next pending package",
         ));
         lines.push(Line::styled(
-            "✓ approved  × rejected  ~ checking  ? changed  ! unresolved  – skipped",
+            "✓ approved  × rejected  ! unresolved  – skipped",
             muted(),
         ));
     }
@@ -426,11 +405,9 @@ fn render_help(frame: &mut Frame, app: &mut App) {
     if app.can_decide() {
         let after = if app.queue_mode { "advance" } else { "exit" };
         lines.push(Line::from(format!(
-            "a  Accept build-script fingerprints and {after}",
+            "a  Approve v{} and {after}",
+            app.session.package.version
         )));
-        lines.push(Line::from(
-            "If fingerprinting is unavailable, choose to pin the version or cancel.",
-        ));
         lines.push(Line::from(format!(
             "r  Reject and {after}; keep existing approvals"
         )));
@@ -439,10 +416,6 @@ fn render_help(frame: &mut Frame, app: &mut App) {
     } else if app.is_current_version_approved() {
         lines.push(Line::from(
             "This version is already approved; viewing only.",
-        ));
-    } else if app.is_current_fingerprint_approved() {
-        lines.push(Line::from(
-            "Current fingerprints are already approved; viewing only.",
         ));
     }
     if app.globally_approved {
@@ -537,20 +510,11 @@ fn heading(app: &App) -> Line<'static> {
     } else {
         ("Reviewing", Color::Green)
     };
-    let supplemental_only = app.globally_approved
-        && !app.is_blanket_approved()
-        && !app.is_current_version_approved()
-        && !app.is_current_fingerprint_approved();
-    let baseline_version = if supplemental_only {
-        None
-    } else {
-        match (&package.approval, &app.baseline) {
-            (Some(ApprovedVersion::SemVer(version)), _) => Some(version),
-            (Some(ApprovedVersion::Fingerprint(_)), Baseline::Ready(sources)) => {
-                Some(&sources.version)
-            }
-            _ => None,
-        }
+    let supplemental_only =
+        app.globally_approved && !app.is_blanket_approved() && !app.is_current_version_approved();
+    let baseline_version = match &package.approval {
+        Some(ApprovedVersion::SemVer(version)) if !supplemental_only => Some(version),
+        _ => None,
     };
     let version = match baseline_version {
         Some(old) if old != &package.version => {
@@ -564,8 +528,7 @@ fn heading(app: &App) -> Line<'static> {
     } else {
         match &package.approval {
             None => " (new)",
-            Some(ApprovedVersion::Blanket(_)) => " (all versions and fingerprints)",
-            Some(ApprovedVersion::Fingerprint(_)) => " (fingerprint)",
+            Some(ApprovedVersion::Blanket(_)) => " (all versions)",
             _ => "",
         }
     };
@@ -576,15 +539,6 @@ fn heading(app: &App) -> Line<'static> {
 fn baseline_note(app: &App) -> Option<Line<'static>> {
     if app.decision_blocked.is_some() {
         return None;
-    }
-    if app.is_current_fingerprint_approved() {
-        return None;
-    }
-    if let Some(message) = &app.verification_message {
-        if !app.verification_pending {
-            return None;
-        }
-        return Some(status_line("Checking", message.clone(), Color::DarkGray));
     }
     match &app.baseline {
         Baseline::Loading(version) => Some(status_line(
@@ -601,8 +555,7 @@ fn baseline_note(app: &App) -> Option<Line<'static>> {
         {
             Some(status_line(
                 "Unchanged",
-                "build script entry points; current inputs still need approval or verification"
-                    .into(),
+                "build script entry points match the approved version".into(),
                 Color::Green,
             ))
         }
@@ -795,7 +748,7 @@ mod tests {
     }
 
     #[test]
-    fn blanket_approval_displays_its_scope_without_version_or_fingerprint_checks() {
+    fn blanket_approval_displays_its_scope_without_version_checks() {
         let (_root, mut app) = fixture(&["fn main() {}\n"]);
         app.session.package.approval = Some(ApprovedVersion::Blanket(
             crate::config::BlanketApproval::Approved,
@@ -805,9 +758,8 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         terminal.draw(|frame| render(frame, &mut app)).unwrap();
         let text = screen(&terminal);
-        assert!(text.contains("Approved example v0.1.0 (all versions and fingerprints)"));
+        assert!(text.contains("Approved example v0.1.0 (all versions)"));
         assert!(!text.contains("Fetching"));
-        assert!(!text.contains("Checking"));
         assert!(!text.contains("[a]"));
         assert!(!text.contains("[r]"));
     }
