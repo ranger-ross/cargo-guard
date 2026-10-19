@@ -111,4 +111,4 @@ capture everything.
 ## Limitations
 
 * Requires nightly Rust to use `host.runner`
-
+* The fingerprint format is currently not guaranteed to be stable across versions while the project is still young
