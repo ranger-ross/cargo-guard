@@ -16,7 +16,13 @@ use crossterm::{
 };
 use eyre::Context;
 
-use super::{app::Notice, discovery::ReviewQueue, input::Action, queue::QueueState, ui};
+use super::{
+    app::{App, Notice},
+    discovery::ReviewQueue,
+    input::Action,
+    queue::QueueState,
+    ui,
+};
 
 pub fn run(queue: ReviewQueue) -> eyre::Result<()> {
     run_review(queue, false)
@@ -45,6 +51,7 @@ fn run_review(queue: ReviewQueue, queue_mode: bool) -> eyre::Result<()> {
         "interactive review requires a terminal on stdin and stdout"
     );
     let mut state = QueueState::new(queue);
+    let (browser_sender, browser_results) = mpsc::channel::<BrowserResult>();
     set_mode(&mut state, queue_mode);
     {
         // Initialize without ratatui's restoring panic hook: unwinding must
@@ -62,6 +69,14 @@ fn run_review(queue: ReviewQueue, queue_mode: bool) -> eyre::Result<()> {
         let mut dirty = true;
         'review: loop {
             dirty |= state.poll();
+            for result in browser_results.try_iter() {
+                if let Some(app) = &mut state.app
+                    && app.session.package.id == result.package
+                {
+                    app.notice = Some(result.notice);
+                    dirty = true;
+                }
+            }
             set_mode(&mut state, queue_mode);
             while let Some(event) = events.poll()? {
                 match event {
@@ -69,7 +84,7 @@ fn run_review(queue: ReviewQueue, queue_mode: bool) -> eyre::Result<()> {
                     Event::Mouse(mouse) => {
                         let (changed, action) = state.handle_mouse(mouse);
                         dirty |= changed;
-                        if apply_action(&mut state, action) {
+                        if apply_action(&mut state, action, &browser_sender) {
                             break 'review;
                         }
                         set_mode(&mut state, queue_mode);
@@ -77,7 +92,7 @@ fn run_review(queue: ReviewQueue, queue_mode: bool) -> eyre::Result<()> {
                     Event::Key(key) => {
                         dirty = true;
                         let action = state.handle_key(key);
-                        if apply_action(&mut state, action) {
+                        if apply_action(&mut state, action, &browser_sender) {
                             break 'review;
                         }
                         set_mode(&mut state, queue_mode);
@@ -110,7 +125,11 @@ fn run_review(queue: ReviewQueue, queue_mode: bool) -> eyre::Result<()> {
     Ok(())
 }
 
-fn apply_action(state: &mut QueueState, action: Action) -> bool {
+fn apply_action(
+    state: &mut QueueState,
+    action: Action,
+    browser_sender: &mpsc::Sender<BrowserResult>,
+) -> bool {
     match action {
         Action::Quit => return true,
         Action::NextPackage => state.navigate(false),
@@ -124,6 +143,11 @@ fn apply_action(state: &mut QueueState, action: Action) -> bool {
                 }
             }
         },
+        Action::OpenBrowser => {
+            if let Some(app) = &mut state.app {
+                open_browser(app, browser_sender);
+            }
+        }
         Action::CopySelection => {
             if let Some(text) = state.selected_text()
                 && !text.is_empty()
@@ -150,6 +174,45 @@ fn apply_action(state: &mut QueueState, action: Action) -> bool {
         Action::Continue => {}
     }
     false
+}
+
+struct BrowserResult {
+    package: cargo_metadata::PackageId,
+    notice: Notice,
+}
+
+fn open_browser(app: &mut App, sender: &mpsc::Sender<BrowserResult>) {
+    let result = (|| -> eyre::Result<()> {
+        let url = app.browser_url()?;
+        let package = app.session.package.id.clone();
+        let sender = sender.clone();
+        let owner = thread::current();
+        // Launch helpers can block. They must not own the review terminal.
+        thread::Builder::new()
+            .name("review-browser".into())
+            .spawn(move || {
+                // open::that redirects all three standard streams to null.
+                let result = open::that(&url);
+                let notice = match result {
+                    Ok(()) => Notice {
+                        message: format!("Browser launch requested: {url}"),
+                        is_error: false,
+                    },
+                    Err(error) => Notice {
+                        message: format!("Could not open browser: {error}. URL: {url}"),
+                        is_error: true,
+                    },
+                };
+                let _ = sender.send(BrowserResult { package, notice });
+                owner.unpark();
+            })
+            .context("could not start browser launcher")?;
+        Ok(())
+    })();
+    app.notice = result.err().map(|error| Notice {
+        message: format!("Could not open browser: {error:#}"),
+        is_error: true,
+    });
 }
 
 fn set_mode(state: &mut QueueState, queue_mode: bool) {

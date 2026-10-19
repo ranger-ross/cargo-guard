@@ -14,6 +14,7 @@ pub enum Action {
     PreviousPackage,
     Skip,
     CopySelection,
+    OpenBrowser,
 }
 
 pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
@@ -49,6 +50,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Action {
         }
         KeyCode::Char('y') if key.kind == KeyEventKind::Press && key.modifiers.is_empty() => {
             return Action::CopySelection;
+        }
+        KeyCode::Char('o') if key.kind == KeyEventKind::Press && key.modifiers.is_empty() => {
+            return Action::OpenBrowser;
         }
         KeyCode::Esc if app.selection.clear() => {}
         KeyCode::Esc if app.diagnostic.selection.clear() => {}
@@ -161,6 +165,39 @@ mod tests {
                 Action::Continue
             );
         }
+        assert!(!app.session.config.path().exists());
+    }
+
+    #[test]
+    fn browser_action_requires_a_press_outside_help_even_when_read_only() {
+        let (_root, mut app) = fixture(&["fn main() {}"]);
+        let key = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE);
+        app.session.package.approval = Some(crate::config::ApprovedVersion::SemVer(
+            app.session.package.version.clone(),
+        ));
+        assert!(!app.can_decide());
+        assert_eq!(handle_key(&mut app, key), Action::OpenBrowser);
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            assert_eq!(
+                handle_key(&mut app, KeyEvent { kind, ..key }),
+                Action::Continue
+            );
+        }
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SHIFT,
+        ] {
+            assert_eq!(
+                handle_key(&mut app, KeyEvent { modifiers, ..key }),
+                Action::Continue
+            );
+        }
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+        );
+        assert_eq!(handle_key(&mut app, key), Action::Continue);
         assert!(!app.session.config.path().exists());
     }
 

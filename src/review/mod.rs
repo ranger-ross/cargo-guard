@@ -9,6 +9,7 @@ use crate::{
 };
 
 mod app;
+mod browser;
 mod diagnostic;
 mod diff;
 mod discovery;
@@ -33,6 +34,7 @@ pub struct ReviewPackage {
     pub name: String,
     pub version: semver::Version,
     pub source: Option<Source>,
+    pub browser_source: browser::BrowserSource,
     pub manifest_path: PathBuf,
     pub approval: Option<ApprovedVersion>,
     pub scripts: Vec<BuildScript>,
@@ -190,6 +192,7 @@ impl ReviewPackage {
             name: package.name.to_string(),
             version: package.version.clone(),
             source: package.source.clone(),
+            browser_source: browser::BrowserSource::from_package(package),
             manifest_path: package.manifest_path.clone().into_std_path_buf(),
             approval,
             scripts,
@@ -430,6 +433,7 @@ mod tests {
         let app = state.app.as_mut().unwrap();
         app.set_baseline(Baseline::Ready(PackageSources {
             version: "1.0.0".parse().unwrap(),
+            browser_source: Default::default(),
             scripts: vec![ScriptSource {
                 path: "build.rs".into(),
                 contents: fs::read_to_string(root.path().join("deps/default/build.rs")).unwrap(),

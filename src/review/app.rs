@@ -68,6 +68,19 @@ impl App {
         &self.files[self.selected]
     }
 
+    pub fn browser_url(&self) -> eyre::Result<String> {
+        let file = self.file();
+        let source = if file.status == FileStatus::Removed {
+            let Baseline::Ready(baseline) = &self.baseline else {
+                eyre::bail!("browser source unavailable: removed script has no approved baseline");
+            };
+            &baseline.browser_source
+        } else {
+            &self.session.package.browser_source
+        };
+        source.url(&file.path)
+    }
+
     /// Refresh the edit snapshot without discarding an unchanged baseline.
     pub fn refresh(&mut self, session: ReviewSession) -> eyre::Result<()> {
         self.globally_approved = false;
@@ -418,6 +431,7 @@ pub(super) mod tests {
                 name: "example".into(),
                 version: semver::Version::new(0, 1, 0),
                 source: None,
+                browser_source: Default::default(),
                 manifest_path: PathBuf::from(root.path()).join("Cargo.toml"),
                 approval: None,
                 scripts,
@@ -425,6 +439,107 @@ pub(super) mod tests {
             config: ConfigFile::for_workspace(root.path()).unwrap(),
         };
         (root, App::new(session).unwrap())
+    }
+
+    fn registry_browser_source(version: &str) -> super::super::browser::BrowserSource {
+        let package: cargo_metadata::Package = serde_json::from_value(serde_json::json!({
+            "name": "example",
+            "version": version,
+            "id": format!("registry+https://github.com/rust-lang/crates.io-index#example@{version}"),
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "manifest_path": "/nonexistent/cargo-guard-browser-fixture/Cargo.toml",
+            "dependencies": [],
+            "targets": [],
+            "features": {},
+            "authors": [],
+            "edition": "2021",
+            "metadata": null
+        }))
+        .unwrap();
+        super::super::browser::BrowserSource::from_package(&package)
+    }
+
+    #[test]
+    fn browser_url_routes_selected_scripts_without_changing_review_state() {
+        use crate::review::sources::PackageSources;
+
+        let (_root, mut app) = fixture(&["new\n", "same\n", "added\n"]);
+        app.session.package.browser_source = registry_browser_source("0.1.0");
+        app.set_baseline(Baseline::CurrentVersion).unwrap();
+        app.selected = 2;
+        assert_eq!(app.file().status, FileStatus::Current);
+        assert_eq!(
+            app.browser_url().unwrap(),
+            "https://docs.rs/crate/example/0.1.0/source/script2.rs"
+        );
+        app.set_baseline(Baseline::Ready(PackageSources {
+            version: "0.0.1".parse().unwrap(),
+            browser_source: registry_browser_source("0.0.1"),
+            scripts: vec![
+                ScriptSource {
+                    path: "script0.rs".into(),
+                    contents: "old\n".into(),
+                },
+                ScriptSource {
+                    path: "script1.rs".into(),
+                    contents: "same\n".into(),
+                },
+                ScriptSource {
+                    path: "removed.rs".into(),
+                    contents: "removed\n".into(),
+                },
+            ],
+        }))
+        .unwrap();
+        let approval = ApprovedVersion::SemVer("0.1.0".parse().unwrap());
+        app.session.package.approval = Some(approval.clone());
+        app.decision_blocked = Some("read-only review".into());
+        assert!(!app.can_decide());
+        let saved_policy = fs::read(app.session.config.path()).ok();
+        for (path, status, version) in [
+            ("script0.rs", FileStatus::Modified, "0.1.0"),
+            ("script1.rs", FileStatus::Unchanged, "0.1.0"),
+            ("script2.rs", FileStatus::Added, "0.1.0"),
+            ("removed.rs", FileStatus::Removed, "0.0.1"),
+        ] {
+            app.selected = app
+                .files
+                .iter()
+                .position(|file| file.path == std::path::Path::new(path))
+                .unwrap();
+            let selected = app.selected;
+            assert_eq!(app.file().status, status);
+            assert_eq!(
+                app.browser_url().unwrap(),
+                format!("https://docs.rs/crate/example/{version}/source/{path}")
+            );
+            assert_eq!(app.selected, selected);
+            assert_eq!(app.session.package.approval, Some(approval.clone()));
+            assert_eq!(app.decision, None);
+            assert_eq!(fs::read(app.session.config.path()).ok(), saved_policy);
+        }
+
+        let Baseline::Ready(baseline) = &mut app.baseline else {
+            unreachable!();
+        };
+        baseline.browser_source = Default::default();
+        assert!(app.browser_url().is_err());
+        app.baseline = Baseline::NewPackage;
+        assert!(
+            app.browser_url()
+                .unwrap_err()
+                .to_string()
+                .contains("approved baseline")
+        );
+    }
+
+    #[test]
+    fn browser_url_reports_unavailable_current_source() {
+        let (_root, app) = fixture(&["fn main() {}\n"]);
+        assert!(app.browser_url().is_err());
+        assert_eq!(app.selected, 0);
+        assert!(app.session.package.approval.is_none());
+        assert_eq!(app.decision, None);
     }
 
     #[test]
@@ -676,6 +791,7 @@ pub(super) mod tests {
         let (_root, mut app) = fixture(&["a\nB\nc\nd\nE\n"]);
         app.set_baseline(Baseline::Ready(PackageSources {
             version: "0.0.1".parse().unwrap(),
+            browser_source: Default::default(),
             scripts: vec![ScriptSource {
                 path: "script0.rs".into(),
                 contents: "a\nb\nc\nd\ne\n".into(),
