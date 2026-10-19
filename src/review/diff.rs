@@ -255,6 +255,7 @@ mod tests {
         ];
         let baseline = Baseline::Ready(PackageSources {
             version: "1.0.0".parse().unwrap(),
+            browser_source: Default::default(),
             scripts: vec![
                 source("old.rs", "fn main() {}\n"),
                 source("same.rs", "same\n"),

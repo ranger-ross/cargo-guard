@@ -349,6 +349,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     if app.queue_mode {
         keys.push(("s", "skip"));
     }
+    keys.push(("o", "open"));
     if app.selection.is_active() || app.diagnostic.selection.is_active() {
         keys.push(("y", "copy"));
         keys.push(("Esc", "clear"));
@@ -386,6 +387,7 @@ fn render_help(frame: &mut Frame, app: &mut App) {
         Line::from("Home / End       First / last page (also g / G)"),
         Line::from("[ / ]            Previous / next change"),
         Line::from("Tab / Shift+Tab  Next / previous file"),
+        Line::from("o                Open selected script in the browser"),
         Line::from("y / Esc          Copy selection / clear selection"),
         Line::from("Drag / y         Select and copy source or diagnostic text"),
     ];
@@ -432,6 +434,10 @@ fn render_help(frame: &mut Frame, app: &mut App) {
         Line::from(
             "Approvals apply by package name across sources; this view shows entry points only.",
         ),
+        Line::from(
+            "Browser links use the current version, or the approved version for removed files.",
+        ),
+        Line::from("Remote source is not verified against the local files being reviewed."),
         Line::from("? / Esc close help · q / Ctrl+C quit; saved decisions are kept"),
         Line::default(),
         Line::styled(app.approval_status(), muted()),
@@ -717,6 +723,7 @@ mod tests {
         let (_root, mut app) = fixture(&["fn main() {\n    let new = 2;\n}\n"]);
         app.set_baseline(Baseline::Ready(PackageSources {
             version: "0.0.1".parse().unwrap(),
+            browser_source: Default::default(),
             scripts: vec![ScriptSource {
                 path: "script0.rs".into(),
                 contents: "fn main() {\n    let old = 1;\n}\n".into(),

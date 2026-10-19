@@ -14,12 +14,13 @@ use std::{
 use cargo_metadata::{Metadata, MetadataCommand, Package};
 use eyre::{Context, ContextCompat};
 
-use super::ReviewSession;
+use super::{ReviewSession, browser::BrowserSource};
 use crate::config::ApprovedVersion;
 
 #[derive(Debug)]
 pub struct PackageSources {
     pub version: semver::Version,
+    pub browser_source: BrowserSource,
     pub scripts: Vec<ScriptSource>,
 }
 
@@ -254,6 +255,7 @@ fn read_package_sources(package: &Package) -> eyre::Result<PackageSources> {
     // An old package may legitimately have had no build scripts at all.
     Ok(PackageSources {
         version: package.version.clone(),
+        browser_source: BrowserSource::from_package(package),
         scripts,
     })
 }

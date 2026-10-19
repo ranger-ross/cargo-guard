@@ -838,6 +838,7 @@ mod tests {
         app.session.package.approval = Some(ApprovedVersion::SemVer(version.clone()));
         app.set_baseline(Baseline::Ready(PackageSources {
             version,
+            browser_source: Default::default(),
             scripts: vec![],
         }))
         .unwrap();
