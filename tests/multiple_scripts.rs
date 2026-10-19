@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeSet,
     fs,
     path::Path,
     process::{Command, Output},
@@ -19,19 +18,9 @@ fn build(root: &Path) -> Output {
         .unwrap()
 }
 
-fn hashes(output: &Output) -> BTreeSet<String> {
-    String::from_utf8_lossy(&output.stderr)
-        .lines()
-        .filter_map(|line| {
-            line.split_once("Current fingerprint: ")
-                .map(|(_, hash)| hash.trim().to_owned())
-        })
-        .collect()
-}
-
 #[test]
 #[ignore = "requires nightly Cargo multiple-build-scripts and host runner support"]
-fn real_multiple_scripts_have_independent_fingerprints() {
+fn real_multiple_scripts_share_one_version_approval() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     write(
@@ -61,83 +50,28 @@ fn real_multiple_scripts_have_independent_fingerprints() {
             "[unstable]\nhost-config=true\ntarget-applies-to-host=true\n[host]\nrunner={binary}\n"
         ),
     );
-    let mut approved = BTreeSet::from(["not-approved".to_owned()]);
-    for _ in 0..3 {
-        write(
-            root,
-            "approved-builds.toml",
-            &format!(
-                "[approved]\nmulti={:?}\n",
-                approved.iter().collect::<Vec<_>>()
-            ),
-        );
-        let output = build(root);
-        if output.status.success() {
-            break;
-        }
-        let found = hashes(&output);
-        assert!(
-            !found.is_empty(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        approved.extend(found);
-    }
-    assert_eq!(approved.len(), 3);
-    assert!(
-        Command::new("cargo")
-            .arg("clean")
-            .current_dir(root)
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
+
+    write(root, "approved-builds.toml", "[approved]\nmulti='0.9.0'\n");
     let output = build(root);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
     assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+        stderr.contains("build script for multi v1.0.0 is not approved"),
+        "{stderr}"
     );
     for name in ["first ran", "second ran"] {
-        assert!(String::from_utf8_lossy(&output.stderr).contains(name));
+        assert!(!stderr.contains(name), "{stderr}");
     }
-
-    write(
-        root,
-        "dep/first.rs",
-        "fn main() { println!(\"cargo::warning=first changed\"); }",
-    );
-    assert!(
-        Command::new("cargo")
-            .arg("clean")
-            .current_dir(root)
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
-    let output = build(root);
-    assert!(!output.status.success());
-    let changed = hashes(&output);
-    assert_eq!(
-        changed.len(),
-        1,
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(changed.is_disjoint(&approved));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("second ran"));
 
     write(
         root,
         "approved-builds.toml",
-        "[approved]\nmulti=['0.9.0','1.0.0','wrong-hash']\n",
+        "[approved]\nmulti=['0.9.0','1.0.0']\n",
     );
     let output = build(root);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    for name in ["first ran", "second ran"] {
+        assert!(stderr.contains(name), "{stderr}");
+    }
 }

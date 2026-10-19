@@ -1,7 +1,6 @@
 use std::{
     collections::VecDeque,
     path::PathBuf,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -17,10 +16,8 @@ use super::{
     app::{App, Decision},
     diagnostic::Diagnostic,
     discovery::ReviewQueue,
-    fingerprint::Verification,
     input::{self, Action},
     sources::{Baseline, BaselineLoader},
-    verification::{self, Scope, Verifier},
 };
 use crate::config::{ApprovalTarget, ApprovedVersion, edit::ConfigFile};
 
@@ -45,7 +42,6 @@ pub struct QueueState {
     pub package_rows: Rect,
     pub package_start: usize,
     package_pointer: Option<Position>,
-    verifier: Result<Verifier, String>,
     last_refresh: Instant,
 }
 
@@ -67,13 +63,7 @@ impl QueueState {
                     skipped: false,
                     error: None,
                     baseline_unavailable: false,
-                    verification: None,
-                    generation: 0,
-                    checking: false,
                     global_approvals: None,
-                    global_verification: None,
-                    global_generation: 0,
-                    global_checking: false,
                 }
             })
             .collect();
@@ -84,8 +74,6 @@ impl QueueState {
             .max()
             .unwrap_or(24)
             .clamp(24, 36) as u16;
-        let verifier = Verifier::start(queue.workspace_root.clone(), queue.build_directory)
-            .map_err(|error| format!("{error:#}"));
         let mut state = Self {
             entries,
             selected,
@@ -104,13 +92,11 @@ impl QueueState {
             package_rows: Rect::default(),
             package_start: 0,
             package_pointer: None,
-            verifier,
             last_refresh: Instant::now(),
         };
         if !state.entries.is_empty() {
             state.open(selected);
         }
-        state.schedule_all();
         state
     }
 
@@ -120,41 +106,14 @@ impl QueueState {
         if self.last_refresh.elapsed() >= RECHECK_INTERVAL {
             self.last_refresh = Instant::now();
             self.refresh_global_approvals();
-            match ConfigFile::open(self.approval_target.clone()) {
-                Ok(config) => {
-                    let generation = self
-                        .entries
-                        .get(self.selected)
-                        .map(|entry| entry.generation);
-                    self.sync_approvals(&config);
-                    if generation
-                        != self
-                            .entries
-                            .get(self.selected)
-                            .map(|entry| entry.generation)
-                    {
-                        self.open(self.selected);
-                    }
-                }
-                Err(error) => {
-                    for entry in &mut self.entries {
-                        if entry.needs_verification() {
-                            entry.invalidate();
-                            entry.verification = Some(Verification::Unavailable(format!(
-                                "could not read approvals: {error:#}"
-                            )));
-                        }
-                    }
-                    self.update_current();
-                    return true;
-                }
+            // An unreadable file keeps the last snapshot. Saving reports the error.
+            if let Ok(config) = ConfigFile::open(self.approval_target.clone())
+                && self.sync_approvals(&config)
+            {
+                self.open(self.selected);
             }
             self.update_current();
             dirty = true;
-            self.schedule_all();
-        }
-        while let Some(result) = self.verifier.as_ref().ok().and_then(Verifier::poll) {
-            dirty |= self.apply_result(result);
         }
         if let Some(baseline) = self.loader.as_ref().and_then(BaselineLoader::poll) {
             self.entries[self.selected].baseline_unavailable =
@@ -172,248 +131,75 @@ impl QueueState {
         dirty
     }
 
-    fn schedule_all(&mut self) {
-        for index in 0..self.entries.len() {
-            self.schedule(index);
-        }
-        if let Ok(verifier) = &self.verifier {
-            verifier.prioritize(self.selected);
-        }
-    }
-
-    fn schedule(&mut self, index: usize) {
-        self.schedule_scope(index, Scope::Selected);
-        self.schedule_scope(index, Scope::Global);
-    }
-
-    fn schedule_scope(&mut self, index: usize, scope: Scope) {
-        let entry = &mut self.entries[index];
-        let (checking, needed, generation, approvals) = match scope {
-            Scope::Selected => (
-                entry.checking,
-                entry.needs_verification(),
-                entry.generation,
-                &entry.approvals,
-            ),
-            Scope::Global => (
-                entry.global_checking,
-                entry.needs_global_verification(),
-                entry.global_generation,
-                &entry.global_approvals,
-            ),
-        };
-        if checking || !needed {
-            return;
-        }
-        let request = verification::Request {
-            index,
-            scope,
-            generation,
-            package: entry.package.clone(),
-            approvals: approvals.clone().expect("saved fingerprint approval"),
-        };
-        let result = match &self.verifier {
-            Ok(verifier) => verifier
-                .verify(request)
-                .map_err(|error| format!("{error:#}")),
-            Err(error) => Err(error.clone()),
-        };
-        match result {
-            Ok(()) => match scope {
-                Scope::Selected => entry.checking = true,
-                Scope::Global => entry.global_checking = true,
-            },
-            Err(error) => {
-                let verification = match scope {
-                    Scope::Selected => &mut entry.verification,
-                    Scope::Global => &mut entry.global_verification,
-                };
-                *verification = Some(Verification::Unavailable(error));
-                if index == self.selected {
-                    self.update_current();
-                }
-            }
-        }
-    }
-
-    fn apply_result(&mut self, result: verification::Result) -> bool {
-        let entry = &mut self.entries[result.index];
-        if result.scope == Scope::Global {
-            if result.generation != entry.global_generation
-                || result.package_id != entry.package.id
-                || !entry.needs_global_verification()
-            {
-                return false;
-            }
-            entry.global_checking = false;
-            let changed = entry.global_verification.as_ref() != Some(&result.verification);
-            entry.global_verification = Some(result.verification);
-            if result.index == self.selected {
-                self.update_current();
-            }
-            return changed;
-        }
-        if result.generation != entry.generation
-            || result.package_id != entry.package.id
-            || !entry.needs_verification()
-        {
-            return false;
-        }
-        entry.checking = false;
-        if entry.verification.as_ref() == Some(&result.verification) {
-            return false;
-        }
-        if !matches!(result.verification, Verification::Verified(_))
-            && entry.decision == Some(Decision::ApproveFingerprint)
-        {
-            entry.decision = None;
-        }
-        entry.verification = Some(result.verification);
-        if result.index == self.selected {
-            self.update_current();
-        }
-        true
-    }
-
-    fn refresh_global_approvals(&mut self) -> bool {
+    fn refresh_global_approvals(&mut self) {
         // This store is informational: unreadable or malformed content clears
         // its indicators but must never prevent editing workspace approvals.
         let config = self
             .global_target
             .as_ref()
             .and_then(|target| ConfigFile::open(target.clone()).ok());
-        let mut changed = false;
         for entry in &mut self.entries {
-            let approvals = config
+            entry.global_approvals = config
                 .as_ref()
-                .and_then(|config| config.config().approved.get(&entry.package.name));
-            if entry.global_approvals.as_ref() != approvals {
-                entry.invalidate_global();
-                entry.global_approvals = approvals.cloned();
-                changed = true;
-            }
+                .and_then(|config| config.config().approved.get(&entry.package.name))
+                .cloned();
         }
-        changed
     }
 
+    /// Returns true when the selected package's approvals changed.
     fn sync_approvals(&mut self, config: &ConfigFile) -> bool {
-        let mut changed = false;
-        for entry in &mut self.entries {
+        let mut selected_changed = false;
+        for (index, entry) in self.entries.iter_mut().enumerate() {
             let approvals = config.config().approved.get(&entry.package.name);
-            if entry.approvals.as_ref() != approvals {
-                entry.invalidate();
-                entry.approvals = approvals.cloned();
-                entry.package.approval =
-                    approvals.and_then(|approval| approval.for_review(&entry.package.version));
-                if entry
-                    .package
-                    .approval
-                    .as_ref()
-                    .is_some_and(ApprovedVersion::is_blanket)
-                    || (entry.decision == Some(Decision::PinVersion)
-                        && !approvals.is_some_and(|approval| {
-                            approval.allows_version(&entry.package.version)
-                        }))
-                {
-                    entry.decision = None;
-                }
-                changed = true;
+            if entry.approvals.as_ref() == approvals {
+                continue;
             }
+            entry.baseline_unavailable = false;
+            entry.approvals = approvals.cloned();
+            entry.package.approval =
+                approvals.and_then(|approval| approval.for_review(&entry.package.version));
+            if approvals.is_some_and(ApprovedVersion::is_blanket)
+                || (entry.decision == Some(Decision::Approve)
+                    && !approvals
+                        .is_some_and(|approval| approval.allows_version(&entry.package.version)))
+            {
+                entry.decision = None;
+            }
+            selected_changed |= index == self.selected;
         }
-        changed
+        selected_changed
     }
 
     fn update_current(&mut self) {
-        let Some(mut app) = self.app.take() else {
+        let Some(app) = &mut self.app else {
             return;
         };
         let entry = &mut self.entries[self.selected];
-        let result = app
-            .refresh_sources()
-            .and_then(|_| Self::present_verification(entry, &mut app));
-        match result {
-            Ok(()) => {
-                self.app = Some(app);
-                if self.entries[self.selected].already_approved() {
-                    self.retire_loader();
-                }
-                self.start_baseline();
-                let entry = &self.entries[self.selected];
-                if (entry.needs_verification() && entry.verification.is_none())
-                    || (entry.needs_global_verification() && entry.global_verification.is_none())
-                {
-                    self.schedule(self.selected);
-                }
-            }
-            Err(error) => {
-                entry.invalidate_global();
-                entry.error = Some(format!("could not refresh sources: {error:#}"));
-            }
+        if let Err(error) = app.refresh_sources() {
+            entry.error = Some(format!("could not refresh sources: {error:#}"));
+            self.app = None;
+            return;
         }
+        Self::present(entry, app);
+        if entry.already_approved() {
+            self.retire_loader();
+        }
+        self.start_baseline();
     }
 
-    fn present_verification(entry: &mut Entry, app: &mut App) -> eyre::Result<()> {
-        if let Some(Verification::Verified(sources)) = &entry.verification
-            && sources != &app.sources()
-        {
-            entry.invalidate();
-        }
-        if let Some(Verification::Verified(sources)) = &entry.global_verification
-            && sources != &app.sources()
-        {
-            entry.invalidate_global();
-        }
+    fn present(entry: &Entry, app: &mut App) {
         app.globally_approved = entry.globally_approved();
         app.decision = entry.decision;
-        app.verification_pending = entry.needs_verification() && entry.verification.is_none();
-        match &entry.verification {
-            Some(Verification::Verified(sources)) => {
-                app.set_baseline(Baseline::CurrentFingerprint(Arc::clone(sources)))?;
-                app.verification_message = None;
-            }
-            result => {
-                if app.is_current_fingerprint_approved() {
-                    app.decision = None;
-                    app.set_baseline(Baseline::for_session(&app.session))?;
-                }
-                app.verification_message = if entry.needs_verification() {
-                    Some(match result {
-                        Some(Verification::Mismatch) => {
-                            "Current build-script inputs differ from saved fingerprint approvals"
-                                .into()
-                        }
-                        Some(Verification::Unavailable(reason)) => {
-                            format!("Cannot verify current fingerprints: {reason}")
-                        }
-                        None => "Checking current fingerprints against saved approvals".into(),
-                        Some(Verification::Verified(_)) => unreachable!(),
-                    })
-                } else {
-                    None
-                };
-            }
-        }
-        if !app.can_decide() {
-            app.pin_dialog = None;
-        }
-        Ok(())
     }
 
     fn start_baseline(&mut self) {
-        let entry = &self.entries[self.selected];
-        if self.loader.is_some()
-            || (entry.needs_verification()
-                && matches!(entry.verification, None | Some(Verification::Verified(_))))
-        {
+        if self.loader.is_some() {
             return;
         }
         if let Some(app) = &self.app
             && !matches!(
                 app.baseline,
-                Baseline::Ready(_)
-                    | Baseline::Blanket
-                    | Baseline::CurrentVersion
-                    | Baseline::CurrentFingerprint(_)
+                Baseline::Ready(_) | Baseline::Blanket | Baseline::CurrentVersion
             )
         {
             match BaselineLoader::start(&app.session) {
@@ -444,21 +230,14 @@ impl QueueState {
             .as_mut()
             .ok_or_else(|| eyre::eyre!("current package sources could not be loaded"))?;
         eyre::ensure!(app.can_decide(), "this package is read-only");
-        if !app.decide(decision)? {
-            return Ok(false);
-        }
+        app.decide(decision)?;
         let decision = app.decision;
-        let verified = (decision == Some(Decision::ApproveFingerprint)).then(|| app.sources());
         let config = ConfigFile::open(self.approval_target.clone())?;
         self.sync_approvals(&config);
         let entry = &mut self.entries[self.selected];
-        entry.generation += 1;
-        entry.checking = false;
         entry.decision = decision;
-        entry.verification = verified.map(Verification::Verified);
         entry.skipped = false;
         self.retire_loader();
-        self.schedule_all();
         Ok(self.advance())
     }
 
@@ -499,9 +278,6 @@ impl QueueState {
     }
 
     pub fn handle_mouse(&mut self, event: MouseEvent) -> (bool, Action) {
-        if let Some(dialog) = self.app.as_mut().and_then(|app| app.pin_dialog.as_mut()) {
-            return dialog.handle_mouse(event);
-        }
         let previous_hover = self.hovered_package();
         self.package_pointer = (!event.modifiers.contains(KeyModifiers::SHIFT)
             && !matches!(event.kind, MouseEventKind::Drag(_)))
@@ -530,10 +306,7 @@ impl QueueState {
 
     pub fn hovered_package(&self) -> Option<usize> {
         if (self.app.is_none() && self.show_failure_help)
-            || self
-                .app
-                .as_ref()
-                .is_some_and(|app| app.show_help || app.pin_dialog.is_some())
+            || self.app.as_ref().is_some_and(|app| app.show_help)
         {
             return None;
         }
@@ -547,9 +320,6 @@ impl QueueState {
 
     pub fn selected_text(&self) -> Option<String> {
         if let Some(app) = &self.app {
-            if let Some(dialog) = &app.pin_dialog {
-                return dialog.diagnostic.selected_text();
-            }
             app.diagnostic
                 .selected_text()
                 .or_else(|| app.selection.text(&app.file().rows))
@@ -562,15 +332,11 @@ impl QueueState {
         let mut summary = Summary::default();
         for entry in &self.entries {
             match entry.decision {
-                Some(Decision::PinVersion | Decision::ApproveFingerprint) => summary.approved += 1,
+                Some(Decision::Approve) => summary.approved += 1,
                 Some(Decision::Reject) => summary.rejected += 1,
                 None if entry.error.is_some() => summary.unresolved += 1,
                 None if entry.already_approved() => summary.already_approved += 1,
-                None if entry.baseline_unavailable
-                    || matches!(entry.verification, Some(Verification::Unavailable(_))) =>
-                {
-                    summary.unresolved += 1
-                }
+                None if entry.baseline_unavailable => summary.unresolved += 1,
                 None => summary.skipped += 1,
             }
         }
@@ -595,15 +361,8 @@ impl QueueState {
             Ok(app) => {
                 self.app = Some(app);
                 self.start_baseline();
-                self.schedule(selected);
-                if let Ok(verifier) = &self.verifier {
-                    verifier.prioritize(selected);
-                }
             }
-            Err(error) => {
-                self.entries[selected].invalidate_global();
-                self.entries[selected].error = Some(format!("{error:#}"));
-            }
+            Err(error) => self.entries[selected].error = Some(format!("{error:#}")),
         }
     }
 
@@ -632,7 +391,7 @@ impl QueueState {
             App::new(session)?
         };
         app.queue_mode = true;
-        Self::present_verification(&mut self.entries[self.selected], &mut app)?;
+        Self::present(&self.entries[self.selected], &mut app);
         Ok(app)
     }
 
@@ -667,23 +426,14 @@ pub struct Entry {
     pub error: Option<String>,
     pub baseline_unavailable: bool,
     approvals: Option<ApprovedVersion>,
-    verification: Option<Verification>,
-    generation: u64,
-    checking: bool,
     global_approvals: Option<ApprovedVersion>,
-    global_verification: Option<Verification>,
-    global_generation: u64,
-    global_checking: bool,
 }
 
 impl Entry {
     pub fn status(&self) -> &str {
         if self.error.is_some() {
             "load error"
-        } else if matches!(
-            self.decision,
-            Some(Decision::PinVersion | Decision::ApproveFingerprint)
-        ) {
+        } else if self.decision == Some(Decision::Approve) {
             "approved"
         } else if self.decision == Some(Decision::Reject) {
             "rejected"
@@ -691,12 +441,6 @@ impl Entry {
             "already approved"
         } else if self.globally_approved() {
             "approved globally"
-        } else if matches!(self.verification, Some(Verification::Unavailable(_))) {
-            "verification unavailable"
-        } else if matches!(self.verification, Some(Verification::Mismatch)) {
-            "fingerprint changed"
-        } else if self.needs_verification() {
-            "checking"
         } else if self.skipped {
             "skipped"
         } else if self.baseline_unavailable {
@@ -710,55 +454,12 @@ impl Entry {
         self.global_approvals
             .as_ref()
             .is_some_and(|approval| approval.allows_version(&self.package.version))
-            || matches!(self.global_verification, Some(Verification::Verified(_)))
-    }
-
-    fn needs_global_verification(&self) -> bool {
-        self.global_approvals.as_ref().is_some_and(|approval| {
-            !approval.allows_version(&self.package.version)
-                && approval
-                    .entries()
-                    .iter()
-                    .any(|entry| matches!(entry, ApprovedVersion::Fingerprint(_)))
-        })
-    }
-
-    fn invalidate_global(&mut self) {
-        self.global_generation += 1;
-        self.global_checking = false;
-        self.global_verification = None;
     }
 
     fn already_approved(&self) -> bool {
-        matches!(self.verification, Some(Verification::Verified(_)))
-            || self
-                .approvals
-                .as_ref()
-                .is_some_and(|approval| approval.allows_version(&self.package.version))
-    }
-
-    fn needs_verification(&self) -> bool {
-        self.decision != Some(Decision::Reject)
-            && !self
-                .approvals
-                .as_ref()
-                .is_some_and(|approval| approval.allows_version(&self.package.version))
-            && self.approvals.as_ref().is_some_and(|approval| {
-                approval
-                    .entries()
-                    .iter()
-                    .any(|entry| matches!(entry, ApprovedVersion::Fingerprint(_)))
-            })
-    }
-
-    fn invalidate(&mut self) {
-        self.generation += 1;
-        self.checking = false;
-        self.verification = None;
-        self.baseline_unavailable = false;
-        if self.decision == Some(Decision::ApproveFingerprint) {
-            self.decision = None;
-        }
+        self.approvals
+            .as_ref()
+            .is_some_and(|approval| approval.allows_version(&self.package.version))
     }
 
     fn actionable(&self) -> bool {
@@ -797,51 +498,6 @@ mod tests {
         (root, QueueState::new(queue))
     }
 
-    #[test]
-    fn failed_fingerprint_does_not_advance_or_record_approval() {
-        let (root, mut state) = fixture();
-        let selected = state.selected;
-        assert!(!state.decide(Decision::ApproveFingerprint).unwrap());
-        assert_eq!(state.selected, selected);
-        assert!(state.app.as_ref().unwrap().pin_dialog.is_some());
-        assert_eq!(state.entries[selected].decision, None);
-        assert_eq!(state.summary().approved, 0);
-        assert!(!root.path().join("approved-builds.toml").exists());
-    }
-
-    fn fingerprint_fixture() -> (tempfile::TempDir, QueueState, PathBuf) {
-        let (root, state) = fixture();
-        let script = &state.app.as_ref().unwrap().session.package.scripts[0];
-        let helper = script.path.with_file_name("helper.rs");
-        fs::write(&helper, "const INPUT: u8 = 1;\n").unwrap();
-        let artifact = root.path().join(format!(
-            "target/debug/build/custom-script/out/{}.d",
-            script.name.replace('-', "_")
-        ));
-        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
-        fs::write(
-            &artifact,
-            format!("binary: {} {}\n", script.path.display(), helper.display()),
-        )
-        .unwrap();
-        (root, state, artifact)
-    }
-
-    #[track_caller]
-    fn wait_for(state: &mut QueueState, ready: impl Fn(&QueueState) -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !ready(state) {
-            state.poll();
-            assert!(
-                Instant::now() < deadline,
-                "verification timed out: checking={}, verification={:?}",
-                state.entries[0].checking,
-                state.entries[0].verification,
-            );
-            std::thread::park_timeout(Duration::from_millis(5));
-        }
-    }
-
     fn reopen(state: &QueueState) -> QueueState {
         QueueState::new(ReviewQueue {
             packages: state
@@ -851,28 +507,29 @@ mod tests {
                 .collect(),
             config: ConfigFile::open(state.approval_target.clone()).unwrap(),
             global_target: state.global_target.clone(),
-            build_directory: state.workspace_root.join("target"),
             workspace_root: state.workspace_root.clone(),
             policy_notes: state.policy_notes.clone(),
         })
     }
 
-    fn with_global_approvals(state: &mut QueueState, approvals: &[ApprovedVersion]) -> PathBuf {
+    fn with_global_approvals(state: &mut QueueState, versions: &[semver::Version]) -> PathBuf {
         let target = ApprovalTarget {
             path: state.workspace_root.join("global-approvals.toml"),
             scope: crate::config::ApprovalScope::Global,
         };
-        ConfigFile::open(target.clone())
-            .unwrap()
-            .add_approvals(&state.entries[0].package.name, approvals)
-            .unwrap();
+        let mut config = ConfigFile::open(target.clone()).unwrap();
+        for version in versions {
+            config
+                .add_version(&state.entries[0].package.name, version)
+                .unwrap();
+        }
         let path = target.path.clone();
         state.global_target = Some(target);
         path
     }
 
     #[test]
-    fn blanket_approvals_cover_every_queued_version_without_verification() {
+    fn blanket_approvals_cover_every_queued_version() {
         let (root, state) = fixture();
         let policy = "# Manual approval\n[approved]\nduplicate = 'approved'\n";
         fs::write(&state.approval_target.path, policy).unwrap();
@@ -890,20 +547,12 @@ mod tests {
             let entry = &state.entries[index];
             assert!(entry.already_approved());
             assert!(!entry.actionable());
-            assert!(!entry.needs_verification());
-            assert!(!entry.checking);
-            assert!(entry.verification.is_none());
             assert_eq!(entry.status(), "already approved");
             assert!(state.loader.is_none());
             let app = state.app.as_ref().unwrap();
             assert!(matches!(app.baseline, Baseline::Blanket));
             assert!(!app.can_decide());
-            assert!(app.verification_message.is_none());
-            for decision in [
-                Decision::ApproveFingerprint,
-                Decision::PinVersion,
-                Decision::Reject,
-            ] {
+            for decision in [Decision::Approve, Decision::Reject] {
                 assert!(state.decide(decision).is_err());
             }
             assert_eq!(
@@ -962,9 +611,6 @@ mod tests {
         state.global_target = Some(target.clone());
         let mut state = reopen(&state);
         assert!(state.entries[0].globally_approved());
-        assert!(!state.entries[0].needs_global_verification());
-        assert!(!state.entries[0].global_checking);
-        assert!(state.entries[0].global_verification.is_none());
         assert!(state.entries[0].actionable());
         assert_eq!(state.entries[0].status(), "approved globally");
         assert_eq!(
@@ -972,7 +618,7 @@ mod tests {
             Some(crate::config::ApprovalScope::Global)
         );
         assert!(state.app.as_ref().unwrap().can_decide());
-        state.decide(Decision::PinVersion).unwrap();
+        state.decide(Decision::Approve).unwrap();
         assert_eq!(fs::read_to_string(&target.path).unwrap(), policy);
         let workspace_policy = fs::read(&state.approval_target.path).unwrap();
 
@@ -982,7 +628,6 @@ mod tests {
         let mut state = reopen(&state);
         state.open(0);
         assert!(state.entries[0].already_approved());
-        assert!(!state.entries[0].needs_verification());
         assert!(matches!(
             state.app.as_ref().unwrap().baseline,
             Baseline::Blanket
@@ -991,31 +636,18 @@ mod tests {
             state.app.as_ref().unwrap().displayed_approval_scope(),
             Some(crate::config::ApprovalScope::Global)
         );
-        for decision in [
-            Decision::ApproveFingerprint,
-            Decision::PinVersion,
-            Decision::Reject,
-        ] {
+        for decision in [Decision::Approve, Decision::Reject] {
             assert!(state.decide(decision).is_err());
         }
         assert_eq!(fs::read_to_string(&target.path).unwrap(), policy);
         assert_eq!(fs::read(&workspace_path).unwrap(), workspace_policy);
     }
 
-    fn global_fingerprint_fixture() -> (tempfile::TempDir, QueueState, PathBuf) {
-        let (root, mut state, artifact) = fingerprint_fixture();
-        let approvals =
-            super::super::fingerprint::approvals(&state.app.as_ref().unwrap().session).unwrap();
-        with_global_approvals(&mut state, &approvals);
-        let reopened = reopen(&state);
-        (root, reopened, artifact)
-    }
-
     #[test]
     fn global_version_is_informational_and_local_saves_remain_isolated() {
         let (root, mut state) = fixture();
         let version = state.entries[0].package.version.clone();
-        let global = with_global_approvals(&mut state, &[ApprovedVersion::SemVer(version.clone())]);
+        let global = with_global_approvals(&mut state, std::slice::from_ref(&version));
         let global_contents = fs::read_to_string(&global).unwrap();
         let mut state = reopen(&state);
         assert!(state.entries[0].globally_approved());
@@ -1026,7 +658,7 @@ mod tests {
         assert_eq!(state.app.as_ref().unwrap().session.package.approval, None);
         assert_eq!(state.summary().already_approved, 0);
         assert!(!root.path().join("approved-builds.toml").exists());
-        state.decide(Decision::PinVersion).unwrap();
+        state.decide(Decision::Approve).unwrap();
         state.open(0);
         assert!(state.entries[0].globally_approved());
         assert!(state.entries[0].already_approved());
@@ -1043,7 +675,7 @@ mod tests {
     fn removed_or_invalid_global_documents_clear_status_without_blocking_local_review() {
         let (_root, mut state) = fixture();
         let version = state.entries[0].package.version.clone();
-        let global = with_global_approvals(&mut state, &[ApprovedVersion::SemVer(version)]);
+        let global = with_global_approvals(&mut state, &[version]);
         let contents = fs::read_to_string(&global).unwrap();
         let mut state = reopen(&state);
         assert!(state.entries[0].globally_approved());
@@ -1060,104 +692,9 @@ mod tests {
         state.poll();
         assert!(!state.app.as_ref().unwrap().globally_approved);
         assert!(state.entries[0].actionable());
-        state.decide(Decision::PinVersion).unwrap();
+        state.decide(Decision::Approve).unwrap();
         assert!(state.entries[0].already_approved());
         assert_eq!(fs::read_to_string(&global).unwrap(), "not valid [toml");
-    }
-
-    #[test]
-    fn global_fingerprints_require_verification_and_detect_changed_helpers() {
-        let (_root, mut state, artifact) = global_fingerprint_fixture();
-        assert!(!state.entries[0].globally_approved());
-        wait_for(&mut state, |state| state.entries[0].globally_approved());
-        assert!(state.app.as_ref().unwrap().globally_approved);
-        assert!(state.entries[0].actionable());
-        assert!(state.app.as_ref().unwrap().can_decide());
-        assert!(
-            !state
-                .app
-                .as_ref()
-                .unwrap()
-                .is_current_fingerprint_approved()
-        );
-        assert_eq!(state.summary().already_approved, 0);
-        let script = &state.entries[0].package.scripts[0];
-        fs::write(
-            script.path.with_file_name("helper.rs"),
-            "const INPUT: u8 = 2;\n",
-        )
-        .unwrap();
-        let dep_info = fs::read_to_string(&artifact).unwrap();
-        fs::write(&artifact, dep_info).unwrap();
-        state.last_refresh -= RECHECK_INTERVAL;
-        wait_for(&mut state, |state| {
-            matches!(
-                state.entries[0].global_verification,
-                Some(Verification::Mismatch)
-            )
-        });
-        assert!(!state.app.as_ref().unwrap().globally_approved);
-        assert!(state.entries[0].actionable());
-    }
-
-    #[test]
-    fn global_fingerprint_status_recovers_after_artifacts_reappear() {
-        let (_root, mut state, artifact) = global_fingerprint_fixture();
-        wait_for(&mut state, |state| state.entries[0].globally_approved());
-        let dep_info = fs::read_to_string(&artifact).unwrap();
-        fs::remove_file(&artifact).unwrap();
-        state.last_refresh -= RECHECK_INTERVAL;
-        wait_for(&mut state, |state| {
-            matches!(
-                state.entries[0].global_verification,
-                Some(Verification::Unavailable(_))
-            )
-        });
-        assert!(!state.app.as_ref().unwrap().globally_approved);
-        assert_eq!(state.summary().unresolved, 0);
-        fs::write(&artifact, dep_info).unwrap();
-        state.last_refresh -= RECHECK_INTERVAL;
-        wait_for(&mut state, |state| state.entries[0].globally_approved());
-        assert!(state.app.as_ref().unwrap().globally_approved);
-    }
-
-    #[test]
-    fn late_global_results_cannot_reuse_removed_approvals_or_changed_sources() {
-        let (_root, mut state, _artifact) = global_fingerprint_fixture();
-        let result = completed_result(&state);
-        assert!(matches!(result.verification, Verification::Verified(_)));
-        let path = state.global_target.as_ref().unwrap().path.clone();
-        let contents = fs::read_to_string(&path).unwrap();
-        fs::remove_file(&path).unwrap();
-        state.open(0);
-        assert!(!state.apply_result(result));
-        assert!(!state.app.as_ref().unwrap().globally_approved);
-        fs::write(&path, contents).unwrap();
-        state.open(0);
-        let result = completed_result(&state);
-        fs::write(
-            &state.entries[0].package.scripts[0].path,
-            "fn changed() {}\n",
-        )
-        .unwrap();
-        state.apply_result(result);
-        assert!(!state.entries[0].globally_approved());
-        assert!(!state.app.as_ref().unwrap().globally_approved);
-        assert!(state.app.as_ref().unwrap().can_decide());
-    }
-
-    #[test]
-    fn selected_and_global_fingerprints_use_independent_verification_jobs() {
-        let (_root, mut state, _artifact) = saved_fingerprint_fixture();
-        let approval = state.entries[0].approvals.clone().unwrap();
-        with_global_approvals(&mut state, &[approval]);
-        let mut state = reopen(&state);
-        wait_for(&mut state, |state| {
-            state.entries[0].already_approved() && state.entries[0].globally_approved()
-        });
-        assert_eq!(state.entries[0].status(), "already approved");
-        assert!(state.app.as_ref().unwrap().globally_approved);
-        assert!(!state.app.as_ref().unwrap().can_decide());
     }
 
     #[test]
@@ -1165,8 +702,7 @@ mod tests {
         let (root, metadata) = super::super::tests::fixture();
         let external = tempfile::tempdir().unwrap();
         let global = external.path().join("approvals.toml");
-        let old = format!("{}+{}#1.0.0", "0".repeat(64), "0".repeat(16));
-        fs::write(&global, format!("[approved]\ncustom-script='{old}'\n")).unwrap();
+        fs::write(&global, "[approved]\ncustom-script='1.0.0'\n").unwrap();
         let options = crate::args::ReviewOptions {
             global: true,
             ..Default::default()
@@ -1180,13 +716,6 @@ mod tests {
             .position(|entry| entry.package.name == "custom-script")
             .unwrap();
         state.open(index);
-        let script = state.entries[index].package.scripts[0].clone();
-        let artifact = root.path().join(format!(
-            "target/debug/build/custom-script/out/{}.d",
-            script.name.replace('-', "_")
-        ));
-        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
-        fs::write(&artifact, format!("binary: {}\n", script.path.display())).unwrap();
         state.navigate(false);
         state.navigate(true);
         assert_eq!(state.selected, index);
@@ -1199,16 +728,16 @@ mod tests {
             state.app.as_ref().unwrap().session.config.target().scope,
             crate::config::ApprovalScope::Global
         );
-        state.decide(Decision::ApproveFingerprint).unwrap();
-        assert_eq!(
-            state.entries[index].decision,
-            Some(Decision::ApproveFingerprint)
-        );
+        state.decide(Decision::Approve).unwrap();
+        assert_eq!(state.entries[index].decision, Some(Decision::Approve));
         let saved = fs::read_to_string(&global).unwrap();
-        assert!(saved.contains(&old));
         let config = ConfigFile::open(state.approval_target.clone()).unwrap();
-        assert!(
-            matches!(&config.config().approved["custom-script"], ApprovedVersion::Multiple(values) if values.len() == 2)
+        assert_eq!(
+            config.config().approved["custom-script"],
+            ApprovedVersion::Multiple(vec![
+                semver::Version::new(1, 0, 0),
+                semver::Version::new(2, 0, 0)
+            ])
         );
         assert!(!root.path().join("approved-builds.toml").exists());
         let mut reopened = reopen(&state);
@@ -1228,7 +757,7 @@ mod tests {
             .unwrap();
         reopened.open(next);
         fs::write(&global, format!("{saved}\n# concurrent edit\n")).unwrap();
-        assert!(reopened.decide(Decision::PinVersion).is_err());
+        assert!(reopened.decide(Decision::Approve).is_err());
         assert_eq!(reopened.selected, next);
         assert_eq!(reopened.entries[next].decision, None);
         assert_eq!(reopened.app.as_ref().unwrap().decision, None);
@@ -1236,24 +765,6 @@ mod tests {
             fs::read_to_string(&global).unwrap(),
             format!("{saved}\n# concurrent edit\n")
         );
-    }
-
-    fn saved_fingerprint_fixture() -> (tempfile::TempDir, QueueState, PathBuf) {
-        let (root, mut state, artifact) = fingerprint_fixture();
-        state.decide(Decision::ApproveFingerprint).unwrap();
-        let reopened = reopen(&state);
-        (root, reopened, artifact)
-    }
-
-    fn completed_result(state: &QueueState) -> verification::Result {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(result) = state.verifier.as_ref().unwrap().poll() {
-                return result;
-            }
-            assert!(Instant::now() < deadline, "verification timed out");
-            std::thread::park_timeout(Duration::from_millis(5));
-        }
     }
 
     #[test]
@@ -1322,7 +833,7 @@ mod tests {
         let version = "1.0.0".parse::<semver::Version>().unwrap();
         app.session
             .config
-            .set_approval("custom-script", ApprovedVersion::SemVer(version.clone()))
+            .add_version("custom-script", &version)
             .unwrap();
         app.session.package.approval = Some(ApprovedVersion::SemVer(version.clone()));
         app.set_baseline(Baseline::Ready(PackageSources {
@@ -1340,179 +851,13 @@ mod tests {
     }
 
     #[test]
-    fn saved_approvals_verify_offscreen_and_remain_stable_during_navigation() {
-        let (_root, mut state, _artifact) = saved_fingerprint_fixture();
-        state.navigate(false);
-        wait_for(&mut state, |state| state.entries[0].already_approved());
-        assert_eq!(state.selected, 1);
-        assert!(!state.entries[1].already_approved());
-        assert!(state.app.as_ref().unwrap().can_decide());
-        for _ in 0..20 {
-            state.navigate(true);
-            assert!(state.entries[0].already_approved());
-            assert!(!state.app.as_ref().unwrap().can_decide());
-            assert!(!state.app.as_ref().unwrap().verification_pending);
-            state.navigate(false);
-            assert!(state.entries[0].already_approved());
-            state.poll();
-        }
-        assert_eq!(state.summary().already_approved, 1);
-        assert_eq!(state.summary().approved, 0);
-    }
-
-    #[test]
-    fn startup_verifies_packages_that_are_never_selected() {
-        let (_root, mut saved, _artifact) = fingerprint_fixture();
-        saved.decide(Decision::ApproveFingerprint).unwrap();
-        let mut packages: Vec<_> = saved
-            .entries
-            .iter()
-            .map(|entry| entry.package.clone())
-            .collect();
-        packages.swap(0, 1);
-        let mut state = QueueState::new(ReviewQueue {
-            packages,
-            config: ConfigFile::open(saved.approval_target.clone()).unwrap(),
-            global_target: saved.global_target.clone(),
-            build_directory: saved.workspace_root.join("target"),
-            workspace_root: saved.workspace_root.clone(),
-            policy_notes: saved.policy_notes.clone(),
-        });
-        wait_for(&mut state, |state| state.entries[1].already_approved());
-        assert_eq!(state.selected, 0);
-        assert!(!state.entries[0].already_approved());
-        assert_eq!(state.summary().already_approved, 1);
-    }
-
-    #[test]
-    fn current_verification_prevents_unneeded_history_loading() {
-        let (_root, mut state, _artifact) = saved_fingerprint_fixture();
-        wait_for(&mut state, |state| state.entries[0].already_approved());
-        assert!(matches!(
-            state.app.as_ref().unwrap().baseline,
-            Baseline::CurrentFingerprint(_)
-        ));
-        assert!(state.loader.is_none());
-        assert!(!state.app.as_ref().unwrap().can_decide());
-        assert_eq!(state.app.as_ref().unwrap().decision, None);
-    }
-
-    #[test]
-    fn background_rechecks_invalidate_changed_helpers_without_navigation() {
-        let (_root, mut state, artifact) = saved_fingerprint_fixture();
-        wait_for(&mut state, |state| state.entries[0].already_approved());
-        let script = state.entries[0].package.scripts[0].path.clone();
-        let displayed = state.app.as_ref().unwrap().sources();
-        fs::write(script.with_file_name("helper.rs"), "const INPUT: u8 = 2;\n").unwrap();
-        let dep_info = fs::read_to_string(&artifact).unwrap();
-        fs::write(&artifact, dep_info).unwrap();
-        state.last_refresh -= RECHECK_INTERVAL;
-        wait_for(&mut state, |state| {
-            matches!(state.entries[0].verification, Some(Verification::Mismatch))
-        });
-        assert_eq!(state.app.as_ref().unwrap().sources(), displayed);
-        assert!(!state.entries[0].already_approved());
-        assert!(state.entries[0].actionable());
-        assert!(state.app.as_ref().unwrap().can_decide());
-        assert_eq!(state.summary().already_approved, 0);
-    }
-
-    #[test]
-    fn changed_displayed_sources_cannot_reuse_a_cached_approval() {
-        let (_root, mut state, _artifact) = saved_fingerprint_fixture();
-        wait_for(&mut state, |state| state.entries[0].already_approved());
-        state.navigate(false);
-        fs::write(
-            &state.entries[0].package.scripts[0].path,
-            "fn changed() {}\n",
-        )
-        .unwrap();
-        state.navigate(true);
-        assert!(!state.entries[0].already_approved());
-        assert!(state.app.as_ref().unwrap().can_decide());
-        assert_eq!(
-            state.app.as_ref().unwrap().sources()[0].contents,
-            "fn changed() {}\n"
-        );
-    }
-
-    #[test]
-    fn results_from_replaced_approval_snapshots_are_discarded() {
-        let (_root, mut state, _artifact) = saved_fingerprint_fixture();
-        let result = completed_result(&state);
-        assert!(matches!(result.verification, Verification::Verified(_)));
-        let mut config = ConfigFile::open(state.approval_target.clone()).unwrap();
-        config
-            .set_approval(
-                &state.entries[0].package.name,
-                ApprovedVersion::Fingerprint(format!("{:064x}+{:016x}#2.0.0", 1, 2)),
-            )
-            .unwrap();
-        state.open(0);
-        assert!(!state.apply_result(result));
-        assert!(!state.entries[0].already_approved());
-        wait_for(&mut state, |state| {
-            matches!(state.entries[0].verification, Some(Verification::Mismatch))
-        });
-        assert!(state.app.as_ref().unwrap().can_decide());
-    }
-
-    #[test]
-    fn late_verification_cannot_overwrite_a_newer_rejection() {
-        let (_root, mut state, _artifact) = saved_fingerprint_fixture();
-        let result = completed_result(&state);
-        state.decide(Decision::Reject).unwrap();
-        assert!(!state.apply_result(result));
-        assert_eq!(state.entries[0].decision, Some(Decision::Reject));
-        assert!(!state.entries[0].already_approved());
-        assert_eq!(state.summary().rejected, 1);
-    }
-
-    #[test]
-    fn late_verification_cannot_authorize_newly_displayed_sources() {
-        let (_root, mut state, _artifact) = saved_fingerprint_fixture();
-        let result = completed_result(&state);
-        fs::write(
-            &state.entries[0].package.scripts[0].path,
-            "fn changed() {}\n",
-        )
-        .unwrap();
-        state.apply_result(result);
-        assert!(!state.entries[0].already_approved());
-        assert!(state.app.as_ref().unwrap().can_decide());
-        assert!(state.app.as_ref().unwrap().verification_pending);
-    }
-
-    #[test]
-    fn missing_artifacts_are_unresolved_and_recover_after_rebuilding() {
-        let (_root, mut state, artifact) = saved_fingerprint_fixture();
-        wait_for(&mut state, |state| state.entries[0].already_approved());
-        let dep_info = fs::read_to_string(&artifact).unwrap();
-        fs::remove_file(&artifact).unwrap();
-        state.last_refresh -= RECHECK_INTERVAL;
-        wait_for(&mut state, |state| {
-            matches!(
-                state.entries[0].verification,
-                Some(Verification::Unavailable(_))
-            )
-        });
-        assert_eq!(state.summary().unresolved, 1);
-        assert!(state.app.as_ref().unwrap().can_decide());
-        fs::write(&artifact, dep_info).unwrap();
-        state.last_refresh -= RECHECK_INTERVAL;
-        wait_for(&mut state, |state| state.entries[0].already_approved());
-        assert!(!state.app.as_ref().unwrap().can_decide());
-        assert_eq!(state.summary().unresolved, 0);
-    }
-
-    #[test]
     fn cached_view_keeps_save_conflict_detection() {
         let (root, mut state) = fixture();
         state.navigate(false);
         state.navigate(true);
         let external = "[approved]\nother='1.0.0'\n";
         fs::write(root.path().join("approved-builds.toml"), external).unwrap();
-        assert!(state.decide(Decision::PinVersion).is_err());
+        assert!(state.decide(Decision::Approve).is_err());
         assert_eq!(
             fs::read_to_string(root.path().join("approved-builds.toml")).unwrap(),
             external
@@ -1520,42 +865,19 @@ mod tests {
     }
 
     #[test]
-    fn offscreen_approval_changes_invalidate_the_complete_snapshot() {
-        let (_root, mut saved, _artifact) = fingerprint_fixture();
-        saved.decide(Decision::ApproveFingerprint).unwrap();
-        let Some(ApprovedVersion::Fingerprint(fingerprint)) = &saved.entries[0].approvals else {
-            panic!("expected a saved fingerprint");
-        };
-        let hashes = fingerprint.split_once('#').unwrap().0;
-        fs::write(
-            &saved.approval_target.path,
-            format!("[approved]\ncustom-script=['{hashes}#9.8.7','1.0.0']\n"),
-        )
-        .unwrap();
-        let mut state = reopen(&saved);
-        let representative = state.entries[0].package.approval.clone();
-        wait_for(&mut state, |state| state.entries[0].already_approved());
-        state.navigate(false);
-        fs::write(
-            &state.approval_target.path,
-            "[approved]\ncustom-script='1.0.0'\n",
-        )
-        .unwrap();
+    fn offscreen_approval_removal_clears_the_saved_decision() {
+        let (_root, mut state) = fixture();
+        let index = state.selected;
+        assert!(!state.decide(Decision::Approve).unwrap());
+        assert_ne!(state.selected, index);
+        assert_eq!(state.entries[index].status(), "approved");
+        fs::write(&state.approval_target.path, "[approved]\n").unwrap();
         state.last_refresh -= RECHECK_INTERVAL;
         assert!(state.poll());
-        assert_eq!(state.selected, 1);
-        assert_eq!(state.entries[0].package.approval, representative);
-        assert!(!state.entries[0].already_approved());
-        assert_eq!(state.summary().already_approved, 0);
-        state.navigate(true);
-        assert!(
-            !state
-                .app
-                .as_ref()
-                .unwrap()
-                .is_current_fingerprint_approved()
-        );
-        assert!(state.app.as_ref().unwrap().can_decide());
+        assert_ne!(state.selected, index);
+        assert_eq!(state.entries[index].decision, None);
+        assert!(state.entries[index].actionable());
+        assert_eq!(state.summary().approved, 0);
     }
 
     #[test]
@@ -1617,7 +939,7 @@ mod tests {
     #[test]
     fn partial_completion_survives_reopening_the_queue() {
         let (root, mut state) = fixture();
-        state.decide(Decision::PinVersion).unwrap();
+        state.decide(Decision::Approve).unwrap();
         assert_eq!(
             state.summary(),
             Summary {
@@ -1650,11 +972,11 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_entries_are_actionable_and_version_approvals_are_read_only() {
+    fn version_approvals_are_read_only_and_other_packages_are_actionable() {
         let (root, metadata) = super::super::tests::fixture();
         fs::write(
             root.path().join("approved-builds.toml"),
-            "[approved]\ncustom-script='2.0.0'\ndefault-script='fingerprint'\nduplicate=['1.0.0','2.0.0']\n",
+            "[approved]\ncustom-script='2.0.0'\nduplicate=['1.0.0','2.0.0']\n",
         )
         .unwrap();
         let mut state = QueueState::new(
@@ -1679,12 +1001,12 @@ mod tests {
     fn decisions_advance_and_preserve_previous_saves() {
         let (root, mut state) = fixture();
         assert_eq!(state.entries[state.selected].package.name, "custom-script");
-        assert!(!state.decide(Decision::PinVersion).unwrap());
+        assert!(!state.decide(Decision::Approve).unwrap());
         assert_eq!(state.entries[state.selected].package.name, "default-script");
-        assert!(!state.decide(Decision::PinVersion).unwrap());
+        assert!(!state.decide(Decision::Approve).unwrap());
         assert_eq!(state.entries[state.selected].package.name, "duplicate");
-        assert!(!state.decide(Decision::PinVersion).unwrap());
-        assert!(state.decide(Decision::PinVersion).unwrap());
+        assert!(!state.decide(Decision::Approve).unwrap());
+        assert!(state.decide(Decision::Approve).unwrap());
         let saved =
             crate::config::load_config_from(&root.path().join("approved-builds.toml")).unwrap();
         assert_eq!(saved.approved.len(), 3);
@@ -1718,13 +1040,13 @@ mod tests {
     #[test]
     fn approved_packages_are_read_only_but_other_versions_are_actionable() {
         let (_root, mut state) = fixture();
-        state.decide(Decision::PinVersion).unwrap();
+        state.decide(Decision::Approve).unwrap();
         state.navigate(true);
         assert!(!state.app.as_ref().unwrap().can_decide());
         state.navigate(true);
         assert_eq!(state.entries[state.selected].package.name, "duplicate");
         assert!(state.app.as_ref().unwrap().can_decide());
-        assert!(state.decide(Decision::PinVersion).is_ok());
+        assert!(state.decide(Decision::Approve).is_ok());
     }
 
     #[test]
@@ -1733,7 +1055,7 @@ mod tests {
         let external = "[approved]\nother='1.0.0'\n";
         fs::write(root.path().join("approved-builds.toml"), external).unwrap();
         let index = state.selected;
-        assert!(state.decide(Decision::PinVersion).is_err());
+        assert!(state.decide(Decision::Approve).is_err());
         assert_eq!(state.selected, index);
         assert_eq!(state.entries[index].decision, None);
         assert_eq!(

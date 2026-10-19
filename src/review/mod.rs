@@ -12,16 +12,13 @@ mod app;
 mod diagnostic;
 mod diff;
 mod discovery;
-mod fingerprint;
 mod highlight;
 mod input;
-mod pin_dialog;
 mod queue;
 mod selection;
 mod sources;
 mod tui;
 mod ui;
-mod verification;
 
 pub struct ReviewSession {
     pub package: ReviewPackage,
@@ -90,12 +87,6 @@ pub fn run(package: Option<&str>, options: &ReviewOptions) -> eyre::Result<()> {
             workspace_root: session.workspace_root,
             policy_notes: session.policy_notes,
             global_target,
-            build_directory: metadata
-                .build_directory
-                .as_ref()
-                .unwrap_or(&metadata.target_directory)
-                .clone()
-                .into_std_path_buf(),
         })
     } else {
         let mut queue =
@@ -397,12 +388,6 @@ mod tests {
                 workspace_root: session.workspace_root,
                 policy_notes: session.policy_notes,
                 global_target: None,
-                build_directory: metadata
-                    .build_directory
-                    .as_ref()
-                    .unwrap_or(&metadata.target_directory)
-                    .clone()
-                    .into_std_path_buf(),
             });
             state.app.as_mut().unwrap().queue_mode = false;
             state
@@ -419,16 +404,9 @@ mod tests {
         }
         assert_eq!(
             state.handle_key(key('a')),
-            Action::Decide(Decision::ApproveFingerprint)
+            Action::Decide(Decision::Approve)
         );
-        assert!(!state.decide(Decision::ApproveFingerprint).unwrap());
-        assert!(state.app.as_ref().unwrap().pin_dialog.is_some());
-        assert!(!config_path.exists());
-        assert_eq!(
-            state.handle_key(key('p')),
-            Action::Decide(Decision::PinVersion)
-        );
-        assert!(state.decide(Decision::PinVersion).unwrap());
+        assert!(state.decide(Decision::Approve).unwrap());
         let saved = fs::read(&config_path).unwrap();
         let mut reopened = open(&metadata);
         assert!(reopened.app.as_ref().unwrap().is_current_version_approved());
@@ -465,8 +443,7 @@ mod tests {
         assert_eq!(fs::read(&config_path).unwrap(), saved);
 
         let mut state = open(&upgraded);
-        assert!(!state.decide(Decision::ApproveFingerprint).unwrap());
-        assert!(state.decide(Decision::PinVersion).unwrap());
+        assert!(state.decide(Decision::Approve).unwrap());
         let reopened = ReviewSession::from_metadata(
             &upgraded,
             "default-script",

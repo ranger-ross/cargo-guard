@@ -63,27 +63,13 @@ impl ConfigFile {
         &self.config
     }
 
-    pub fn set_approval(&mut self, package: &str, approval: ApprovedVersion) -> eyre::Result<()> {
-        self.add_approvals(package, &[approval])
-    }
-
-    /// Workspace scalar fingerprints are replaced. Global additions retain history.
-    pub fn add_approvals(
-        &mut self,
-        package: &str,
-        approvals: &[ApprovedVersion],
-    ) -> eyre::Result<()> {
-        eyre::ensure!(
-            !approvals.iter().any(ApprovedVersion::is_blanket),
-            "blanket approvals must be added manually"
-        );
-        if self
-            .config
-            .approved
-            .get(package)
-            .is_some_and(ApprovedVersion::is_blanket)
-        {
-            return Ok(());
+    /// Appends a version, keeping existing entries. Blanket approvals are left unchanged.
+    pub fn add_version(&mut self, package: &str, version: &semver::Version) -> eyre::Result<()> {
+        match self.config.approved.get(package) {
+            Some(approval) if approval.is_blanket() => return Ok(()),
+            Some(ApprovedVersion::SemVer(old)) if old == version => return Ok(()),
+            Some(ApprovedVersion::Multiple(old)) if old.contains(version) => return Ok(()),
+            _ => {}
         }
         let mut document = self.document.clone();
         let table = document
@@ -91,56 +77,30 @@ impl ConfigFile {
             .or_insert(Item::Table(Table::new()))
             .as_table_like_mut()
             .context("approved must be a TOML table")?;
-        let replace_fingerprint = self.target.scope == ApprovalScope::Workspace
-            && matches!(
-                self.config.approved.get(package),
-                Some(ApprovedVersion::Fingerprint(_))
-            )
-            && approvals
-                .iter()
-                .all(|approval| matches!(approval, ApprovedVersion::Fingerprint(_)));
-        for (index, approval) in approvals.iter().enumerate() {
-            let new = match approval {
-                ApprovedVersion::SemVer(version) => version.to_string(),
-                ApprovedVersion::Fingerprint(fingerprint) => fingerprint.clone(),
-                ApprovedVersion::Blanket(_) => {
-                    eyre::bail!("blanket approvals must be added manually")
+        let new = version.to_string();
+        let mut value = if let Some(old) = table.get(package).and_then(Item::as_value) {
+            let mut array = match old {
+                Value::Array(array) => array.clone(),
+                _ => {
+                    let mut array = toml_edit::Array::new();
+                    array.push(old.as_str().context("approval must be a string or array")?);
+                    array
                 }
-                ApprovedVersion::Multiple(_) => eyre::bail!("add one approval at a time"),
             };
-            let mut value = if replace_fingerprint && index == 0 {
-                Value::from(new)
-            } else if let Some(old) = table.get(package).and_then(Item::as_value) {
-                let mut array = match old {
-                    Value::Array(array) => array.clone(),
-                    _ => {
-                        let mut array = toml_edit::Array::new();
-                        array.push(old.as_str().context("approval must be a string or array")?);
-                        array
-                    }
-                };
-                if array.iter().any(|value| {
-                    value.as_str().is_some_and(|old| {
-                        old == new || crate::fingerprint::fingerprints_match(old, &new)
-                    })
-                }) {
-                    continue;
-                }
-                array.push(new);
-                Value::Array(array)
-            } else {
-                Value::from(new)
-            };
-            // Replacing a value should retain its spacing and trailing comment.
-            if let Some(item) = table.get_mut(package) {
-                if let Some(old) = item.as_value() {
-                    *value.decor_mut() = old.decor().clone();
-                }
-                // Keep the existing key too: leading comments belong to its decor.
-                *item = Item::Value(value);
-            } else {
-                table.insert(package, Item::Value(value));
+            array.push(new);
+            Value::Array(array)
+        } else {
+            Value::from(new)
+        };
+        // Replacing a value should retain its spacing and trailing comment.
+        if let Some(item) = table.get_mut(package) {
+            if let Some(old) = item.as_value() {
+                *value.decor_mut() = old.decor().clone();
             }
+            // Keep the existing key too: leading comments belong to its decor.
+            *item = Item::Value(value);
+        } else {
+            table.insert(package, Item::Value(value));
         }
         self.save(document)
     }
@@ -279,12 +239,8 @@ fn parse_config(document: &DocumentMut, path: &Path) -> eyre::Result<Config> {
 mod tests {
     use super::*;
 
-    fn version(value: &str) -> ApprovedVersion {
-        ApprovedVersion::SemVer(value.parse().unwrap())
-    }
-
-    fn fingerprint(value: u64) -> String {
-        format!("{value:064x}+{:016x}#1.0.0", 0)
+    fn version(value: &str) -> semver::Version {
+        value.parse().unwrap()
     }
 
     #[test]
@@ -294,144 +250,40 @@ mod tests {
         let original = "[approved]\nexample = 'approved' # trusted\n";
         fs::write(&path, original).unwrap();
         let mut file = ConfigFile::for_workspace(root.path()).unwrap();
-        file.set_approval("example", version("2.0.0")).unwrap();
-        file.set_approval("example", ApprovedVersion::Fingerprint(fingerprint(1)))
-            .unwrap();
-        file.remove_version("example", &"2.0.0".parse().unwrap())
-            .unwrap();
+        file.add_version("example", &version("2.0.0")).unwrap();
+        file.remove_version("example", &version("2.0.0")).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
-        let blanket = file.config.approved["example"].clone();
-        assert!(file.set_approval("other", blanket).is_err());
-        assert!(!file.config.approved.contains_key("other"));
-        file.set_approval("other", version("1.0.0")).unwrap();
+        file.add_version("other", &version("1.0.0")).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
         assert!(saved.contains("example = 'approved' # trusted"));
         assert!(file.config.approved["example"].is_blanket());
     }
 
     #[test]
-    fn scalar_fingerprints_replace_but_explicit_arrays_append() {
-        for (original, hashes, expected) in [
-            ("'old-hash'", vec!["new-hash"], "\"new-hash\""),
-            (
-                "['old-hash']",
-                vec!["new-hash"],
-                "['old-hash', \"new-hash\"]",
-            ),
-            (
-                "'old-hash'",
-                vec!["first", "second"],
-                "[\"first\", \"second\"]",
-            ),
-        ] {
-            let root = tempfile::tempdir().unwrap();
-            let path = config_path(root.path());
-            fs::write(
-                &path,
-                format!("[approved]\n# explanation\nexample = {original} # retained\n"),
-            )
-            .unwrap();
-            let mut file = ConfigFile::open(ApprovalTarget {
-                path: path.clone(),
-                scope: ApprovalScope::Workspace,
-            })
-            .unwrap();
-            let approvals: Vec<_> = hashes
-                .into_iter()
-                .map(|hash| ApprovedVersion::Fingerprint(hash.into()))
-                .collect();
-            file.add_approvals("example", &approvals).unwrap();
-            assert_eq!(
-                fs::read_to_string(&path).unwrap(),
-                format!("[approved]\n# explanation\nexample = {expected} # retained\n")
-            );
-        }
-    }
-
-    #[test]
     fn appends_without_duplicates_and_removes_only_selected_version() {
         let root = tempfile::tempdir().unwrap();
         let path = config_path(root.path());
-        let hash = fingerprint(1);
-        fs::write(&path, format!("[approved]\nexample = [\n  '{hash}', # script one\n  '1.0.0', # old version\n] # package\n")).unwrap();
-        let mut file = ConfigFile::open(ApprovalTarget {
-            path: path.clone(),
-            scope: ApprovalScope::Workspace,
-        })
-        .unwrap();
-        file.set_approval("example", version("2.0.0")).unwrap();
-        let saved = fs::read_to_string(&path).unwrap();
-        assert!(saved.contains("# script one"));
-        assert!(saved.contains("# old version"));
-        assert!(saved.contains("# package"));
-        file.set_approval("example", version("2.0.0")).unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), saved);
-        file.remove_version("example", &"2.0.0".parse().unwrap())
-            .unwrap();
-        assert!(file.config.approved["example"].allows_version(&"1.0.0".parse().unwrap()));
-        assert!(file.config.approved["example"].allows_fingerprint(&hash));
-        assert!(!file.config.approved["example"].allows_version(&"2.0.0".parse().unwrap()));
-    }
-
-    #[test]
-    fn fingerprint_batches_are_saved_together_and_conflicts_save_nothing() {
-        let root = tempfile::tempdir().unwrap();
-        let path = config_path(root.path());
-        fs::write(&path, "[approved]\nexample='1.0.0' # retained\n").unwrap();
-        let mut file = ConfigFile::open(ApprovalTarget {
-            path: path.clone(),
-            scope: ApprovalScope::Workspace,
-        })
-        .unwrap();
-        let batch = [
-            ApprovedVersion::Fingerprint(fingerprint(1)),
-            ApprovedVersion::Fingerprint(fingerprint(2)),
-        ];
-        file.add_approvals("example", &batch).unwrap();
-        let saved = fs::read_to_string(&path).unwrap();
-        assert!(saved.contains("# retained"));
-        assert!(file.config.approved["example"].allows_fingerprint(&fingerprint(1)));
-        assert!(file.config.approved["example"].allows_fingerprint(&fingerprint(2)));
-        assert!(file.config.approved["example"].allows_version(&"1.0.0".parse().unwrap()));
-        let before = file.config.approved.clone();
-        fs::write(&path, "[approved]\nexternal='2.0.0'\n").unwrap();
-        assert!(
-            file.add_approvals(
-                "example",
-                &[
-                    ApprovedVersion::Fingerprint(fingerprint(3)),
-                    ApprovedVersion::Fingerprint(fingerprint(4))
-                ]
-            )
-            .is_err()
-        );
-        assert_eq!(file.config.approved, before);
-        assert_eq!(
-            fs::read_to_string(&path).unwrap(),
-            "[approved]\nexternal='2.0.0'\n"
-        );
-    }
-
-    #[test]
-    fn fingerprint_lists_do_not_duplicate_hashes_with_new_version_hints() {
-        let root = tempfile::tempdir().unwrap();
-        let path = config_path(root.path());
-        let hash = fingerprint(1);
-        fs::write(&path, format!("[approved]\nexample=['{hash}']\n")).unwrap();
-        let mut file = ConfigFile::open(ApprovalTarget {
-            path: path.clone(),
-            scope: ApprovalScope::Workspace,
-        })
-        .unwrap();
-        file.set_approval(
-            "example",
-            ApprovedVersion::Fingerprint(hash.replace("#1.0.0", "#2.0.0")),
+        fs::write(
+            &path,
+            "[approved]\nexample = [\n  '0.9.0', # first\n  '1.0.0', # old version\n] # package\n",
         )
         .unwrap();
-        assert_eq!(
-            file.config.approved["example"],
-            ApprovedVersion::Multiple(vec![ApprovedVersion::Fingerprint(hash)])
-        );
+        let mut file = ConfigFile::open(ApprovalTarget {
+            path: path.clone(),
+            scope: ApprovalScope::Workspace,
+        })
+        .unwrap();
+        file.add_version("example", &version("2.0.0")).unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("# first"));
+        assert!(saved.contains("# old version"));
+        assert!(saved.contains("# package"));
+        file.add_version("example", &version("2.0.0")).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), saved);
+        file.remove_version("example", &version("2.0.0")).unwrap();
+        assert!(file.config.approved["example"].allows_version(&version("0.9.0")));
+        assert!(file.config.approved["example"].allows_version(&version("1.0.0")));
+        assert!(!file.config.approved["example"].allows_version(&version("2.0.0")));
     }
 
     #[test]
@@ -443,9 +295,9 @@ mod tests {
         file.remove_approval("absent").unwrap();
         assert!(!file.path().exists());
 
-        file.set_approval("example", version("1.0.0")).unwrap();
-        file.set_approval("another", version("2.0.0")).unwrap();
-        file.set_approval("example", version("1.1.0")).unwrap();
+        file.add_version("example", &version("1.0.0")).unwrap();
+        file.add_version("another", &version("2.0.0")).unwrap();
+        file.add_version("example", &version("1.1.0")).unwrap();
         let loaded = super::super::load_config_from(file.path()).unwrap();
         assert!(loaded.approved["example"].allows_version(&"1.0.0".parse().unwrap()));
         assert!(loaded.approved["example"].allows_version(&"1.1.0".parse().unwrap()));
@@ -479,12 +331,12 @@ mod tests {
             scope: ApprovalScope::Workspace,
         })
         .unwrap();
-        file.set_approval("example", version("1.1.0")).unwrap();
+        file.add_version("example", &version("1.1.0")).unwrap();
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             original.replace("'1.0.0'", "[\"1.0.0\", \"1.1.0\"]")
         );
-        file.set_approval("new-package", version("3.0.0")).unwrap();
+        file.add_version("new-package", &version("3.0.0")).unwrap();
         file.remove_approval("example").unwrap();
         let saved = fs::read_to_string(&path).unwrap();
         assert!(saved.contains("other = '2.0.0' # unchanged"));
@@ -507,9 +359,9 @@ mod tests {
             scope: ApprovalScope::Workspace,
         })
         .unwrap();
-        first.set_approval("example", version("2.0.0")).unwrap();
+        first.add_version("example", &version("2.0.0")).unwrap();
         let saved = fs::read_to_string(&path).unwrap();
-        assert!(second.set_approval("example", version("3.0.0")).is_err());
+        assert!(second.add_version("example", &version("3.0.0")).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), saved);
         assert!(
             matches!(&second.config().approved["example"], ApprovedVersion::SemVer(v) if v.to_string() == "1.0.0")
@@ -523,7 +375,7 @@ mod tests {
         let mut file = ConfigFile::for_workspace(root.path()).unwrap();
         let external = "# Created elsewhere\n[approved]\n";
         fs::write(file.path(), external).unwrap();
-        assert!(file.set_approval("example", version("1.0.0")).is_err());
+        assert!(file.add_version("example", &version("1.0.0")).is_err());
         assert_eq!(fs::read_to_string(file.path()).unwrap(), external);
         assert!(file.config().approved.is_empty());
     }
@@ -549,7 +401,7 @@ mod tests {
             scope: ApprovalScope::Workspace,
         })
         .unwrap();
-        file.set_approval("example", version("2.0.0")).unwrap();
+        file.add_version("example", &version("2.0.0")).unwrap();
         file.remove_approval("example").unwrap();
         assert!(fs::read_to_string(&path).unwrap().contains("# inline"));
         assert!(
@@ -570,7 +422,7 @@ mod tests {
             scope: ApprovalScope::Workspace,
         })
         .unwrap();
-        file.set_approval("example", version("1.0.0")).unwrap();
+        file.add_version("example", &version("1.0.0")).unwrap();
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
@@ -589,9 +441,7 @@ mod tests {
         };
         let mut first = ConfigFile::open(target.clone()).unwrap();
         assert!(!path.parent().unwrap().exists());
-        first
-            .set_approval("example", ApprovedVersion::Fingerprint(fingerprint(1)))
-            .unwrap();
+        first.add_version("example", &version("1.0.0")).unwrap();
         let mut stale = ConfigFile::open(target.clone()).unwrap();
         let before = fs::read_to_string(&path).unwrap();
         let lock = fs::OpenOptions::new()
@@ -600,36 +450,23 @@ mod tests {
             .open(path.with_file_name("approvals.toml.lock"))
             .unwrap();
         lock.try_lock().unwrap();
-        assert!(
-            first
-                .set_approval("example", ApprovedVersion::Fingerprint(fingerprint(2)))
-                .is_err()
-        );
+        assert!(first.add_version("example", &version("2.0.0")).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), before);
         assert_eq!(first.original.as_deref(), Some(before.as_str()));
-        assert!(!first.config.approved["example"].allows_fingerprint(&fingerprint(2)));
+        assert!(!first.config.approved["example"].allows_version(&version("2.0.0")));
         drop(lock);
-        first
-            .set_approval("example", ApprovedVersion::Fingerprint(fingerprint(2)))
-            .unwrap();
-        assert!(first.config.approved["example"].allows_fingerprint(&fingerprint(1)));
+        first.add_version("example", &version("2.0.0")).unwrap();
+        assert!(first.config.approved["example"].allows_version(&version("1.0.0")));
         let saved = fs::read_to_string(&path).unwrap();
-        assert!(stale.set_approval("example", version("2.0.0")).is_err());
+        assert!(stale.add_version("example", &version("3.0.0")).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), saved);
         let mut reopened = ConfigFile::open(first.target().clone()).unwrap();
         assert_eq!(reopened.target().scope, ApprovalScope::Global);
-        reopened.set_approval("example", version("2.0.0")).unwrap();
-        reopened
-            .set_approval(
-                "example",
-                ApprovedVersion::Fingerprint(fingerprint(1).replace("#1.0.0", "#9.0.0")),
-            )
-            .unwrap();
-        let entries = &reopened.config.approved["example"];
-        assert_eq!(entries.entries().len(), 3);
-        assert!(entries.allows_fingerprint(&fingerprint(1)));
-        assert!(entries.allows_fingerprint(&fingerprint(2)));
-        assert!(entries.allows_version(&"2.0.0".parse().unwrap()));
+        reopened.add_version("example", &version("3.0.0")).unwrap();
+        assert_eq!(
+            reopened.config.approved["example"],
+            ApprovedVersion::Multiple(vec![version("1.0.0"), version("2.0.0"), version("3.0.0")])
+        );
     }
 
     #[cfg(unix)]
@@ -642,7 +479,7 @@ mod tests {
         let alias = root_path.join("alias");
         std::os::unix::fs::symlink(&real, &alias).unwrap();
         let path = real.join("approvals.toml");
-        fs::write(&path, format!("# keep\n[approved]\nexample='{}' # reviewed\nother='3.0.0'\n[settings]\nenabled=true\n", fingerprint(1))).unwrap();
+        fs::write(&path, "# keep\n[approved]\nexample='1.0.0' # reviewed\nother='3.0.0'\n[settings]\nenabled=true\n").unwrap();
         let link = root_path.join("linked.toml");
         std::os::unix::fs::symlink(&path, &link).unwrap();
         let mut file = ConfigFile::open(ApprovalTarget {
@@ -650,8 +487,7 @@ mod tests {
             scope: ApprovalScope::Global,
         })
         .unwrap();
-        file.set_approval("example", ApprovedVersion::Fingerprint(fingerprint(2)))
-            .unwrap();
+        file.add_version("example", &version("2.0.0")).unwrap();
         assert!(
             fs::symlink_metadata(&link)
                 .unwrap()
@@ -667,7 +503,7 @@ mod tests {
             scope: ApprovalScope::Global,
         })
         .unwrap();
-        missing.set_approval("example", version("1.0.0")).unwrap();
+        missing.add_version("example", &version("1.0.0")).unwrap();
         assert_eq!(missing.path(), real.join("new.toml"));
         fs::remove_file(&path).unwrap();
         assert!(

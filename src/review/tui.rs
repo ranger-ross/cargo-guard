@@ -116,11 +116,6 @@ fn apply_action(state: &mut QueueState, action: Action) -> bool {
         Action::NextPackage => state.navigate(false),
         Action::PreviousPackage => state.navigate(true),
         Action::Skip => return state.skip(),
-        Action::CancelPin => {
-            if let Some(app) = &mut state.app {
-                app.pin_dialog = None;
-            }
-        }
         Action::Decide(decision) => match state.decide(decision) {
             Ok(exit) => return exit,
             Err(error) => {
@@ -181,7 +176,7 @@ impl TerminalEvents {
                 while !worker_cancelled.load(Ordering::Relaxed) {
                     // Only cancellation uses this bounded poll timeout. Input
                     // is delivered as soon as available, independently of UI
-                    // maintenance and background verification completion.
+                    // maintenance and background baseline loading.
                     let result = match event::poll(Duration::from_millis(100))
                         .context("could not poll terminal events")
                     {
