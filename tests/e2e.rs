@@ -1,6 +1,7 @@
 use std::{
     fs,
     io::{Read, Write as _},
+    num::NonZeroU16,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::mpsc,
@@ -1013,8 +1014,12 @@ fn approve_review(command: &Command) {
             }
         }
     });
-    let mut terminal =
-        vt100::Parser::new_with_callbacks(size.rows, size.cols, 0, TerminalResponses::default());
+    let mut terminal = vt100::Parser::new_with_callbacks(
+        NonZeroU16::new(size.rows).unwrap(),
+        NonZeroU16::new(size.cols).unwrap(),
+        0,
+        TerminalResponses::default(),
+    );
     let mut accepted = false;
     let mut last_screen = String::new();
     let mut read_error = None;
