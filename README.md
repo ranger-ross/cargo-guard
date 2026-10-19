@@ -119,4 +119,6 @@ Long term, Cargo itself should probably handle this in a first class way. (see [
 ## Limitations
 
 * Requires nightly Rust to use `host.runner`
+* Does not handle proc-macros
 * The fingerprint format is currently not guaranteed to be stable across versions while the project is still young
+
