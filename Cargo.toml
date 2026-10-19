@@ -34,4 +34,4 @@ sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 
 [dev-dependencies]
 portable-pty = "0.9.0"
-vt100 = "0.17.0"
+vt100 = "0.18.0"
