@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/ranger-ross/cargo-guard/compare/v0.2.0...v0.3.0) - 2026-10-19
+
+### Added
+
+- Added open in browser shortcut
+- Added CARGO_GUARD_FORCE_BUILD=force to force a build if needed
+
+### Fixed
+
+- Prefer appending when approving in global mode
+
+### Other
+
+- Add nightly warning to README
+- *(deps)* update rust crate vt100 to v0.18.1
+
 ## [0.2.0](https://github.com/ranger-ross/cargo-guard/compare/v0.1.1...v0.2.0) - 2026-10-19
 
 ### Fixed
