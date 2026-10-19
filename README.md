@@ -7,6 +7,11 @@
 Cargo build script allowlist.
 Just `cargo build`, no wrappers needed.
 
+> [!WARNING]  
+> cargo-guard requires nightly Cargo features and requires a nightly toolchain.
+> 
+> Stable toolchains will ignore cargo-guard completely.
+
 ## Setup
 
 ### 1. Install Cargo Guard
