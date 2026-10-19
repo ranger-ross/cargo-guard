@@ -63,14 +63,23 @@ impl ConfigFile {
         &self.config
     }
 
-    /// Appends a version, keeping existing entries. Blanket approvals are left unchanged.
-    pub fn add_version(&mut self, package: &str, version: &semver::Version) -> eyre::Result<()> {
-        match self.config.approved.get(package) {
+    /// Replaces workspace scalar approvals absent from the selected graph.
+    /// Global approvals and existing arrays append. Blanket approvals are unchanged.
+    pub fn add_version(
+        &mut self,
+        package: &str,
+        version: &semver::Version,
+        graph_versions: &[semver::Version],
+    ) -> eyre::Result<()> {
+        let replace_scalar = match self.config.approved.get(package) {
             Some(approval) if approval.is_blanket() => return Ok(()),
             Some(ApprovedVersion::SemVer(old)) if old == version => return Ok(()),
             Some(ApprovedVersion::Multiple(old)) if old.contains(version) => return Ok(()),
-            _ => {}
-        }
+            Some(ApprovedVersion::SemVer(old)) => {
+                self.target.scope == ApprovalScope::Workspace && !graph_versions.contains(old)
+            }
+            _ => false,
+        };
         let mut document = self.document.clone();
         let table = document
             .entry("approved")
@@ -78,7 +87,9 @@ impl ConfigFile {
             .as_table_like_mut()
             .context("approved must be a TOML table")?;
         let new = version.to_string();
-        let mut value = if let Some(old) = table.get(package).and_then(Item::as_value) {
+        let mut value = if replace_scalar {
+            Value::from(new)
+        } else if let Some(old) = table.get(package).and_then(Item::as_value) {
             let mut array = match old {
                 Value::Array(array) => array.clone(),
                 _ => {
@@ -244,16 +255,101 @@ mod tests {
     }
 
     #[test]
+    fn workspace_replaces_scalar_absent_from_graph_in_either_approval_order() {
+        for (old, new) in [("1.0.0", "2.0.0"), ("2.0.0", "1.0.0")] {
+            let root = tempfile::tempdir().unwrap();
+            let path = config_path(root.path());
+            let original = format!(
+                "# Workspace approvals\n[approved]\n# Keep this explanation\nexample  = '{old}' # reviewed\nother = '3.0.0'\n"
+            );
+            fs::write(&path, &original).unwrap();
+            let mut file = ConfigFile::for_workspace(root.path()).unwrap();
+            let graph_versions = [version(new)];
+
+            file.add_version("example", &version(new), &graph_versions)
+                .unwrap();
+
+            assert_eq!(
+                file.config.approved["example"],
+                ApprovedVersion::SemVer(version(new))
+            );
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                original.replace(&format!("'{old}'"), &format!("\"{new}\""))
+            );
+            assert_eq!(
+                super::super::load_config_from(&path).unwrap().approved["example"],
+                ApprovedVersion::SemVer(version(new))
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_retains_scalar_present_in_graph_in_either_approval_order() {
+        let graph_versions = [version("1.0.0"), version("2.0.0")];
+        for (first, second) in [("1.0.0", "2.0.0"), ("2.0.0", "1.0.0")] {
+            let root = tempfile::tempdir().unwrap();
+            let mut file = ConfigFile::for_workspace(root.path()).unwrap();
+            file.add_version("example", &version(first), &graph_versions)
+                .unwrap();
+            assert_eq!(
+                file.config.approved["example"],
+                ApprovedVersion::SemVer(version(first))
+            );
+
+            file.add_version("example", &version(second), &graph_versions)
+                .unwrap();
+
+            let expected = ApprovedVersion::Multiple(vec![version(first), version(second)]);
+            assert_eq!(file.config.approved["example"], expected);
+            assert_eq!(
+                super::super::load_config_from(file.path())
+                    .unwrap()
+                    .approved["example"],
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_scalar_approval_is_a_noop_even_when_absent_from_graph() {
+        for scope in [ApprovalScope::Workspace, ApprovalScope::Global] {
+            let root = tempfile::tempdir().unwrap();
+            let path = config_path(root.path());
+            let original = "[approved]\nexample = '1.0.0' # reviewed\n";
+            fs::write(&path, original).unwrap();
+            let mut file = ConfigFile::open(ApprovalTarget {
+                path: path.clone(),
+                scope,
+            })
+            .unwrap();
+            let external = format!("# External edit\n{original}");
+            fs::write(&path, &external).unwrap();
+
+            file.add_version("example", &version("1.0.0"), &[]).unwrap();
+
+            assert_eq!(fs::read_to_string(&path).unwrap(), external);
+            assert_eq!(file.original.as_deref(), Some(original));
+            assert_eq!(
+                file.config.approved["example"],
+                ApprovedVersion::SemVer(version("1.0.0"))
+            );
+        }
+    }
+
+    #[test]
     fn review_preserves_manual_blanket_approvals_without_creating_them() {
         let root = tempfile::tempdir().unwrap();
         let path = config_path(root.path());
         let original = "[approved]\nexample = 'approved' # trusted\n";
         fs::write(&path, original).unwrap();
         let mut file = ConfigFile::for_workspace(root.path()).unwrap();
-        file.add_version("example", &version("2.0.0")).unwrap();
+        file.add_version("example", &version("2.0.0"), &[version("2.0.0")])
+            .unwrap();
         file.remove_version("example", &version("2.0.0")).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
-        file.add_version("other", &version("1.0.0")).unwrap();
+        file.add_version("other", &version("1.0.0"), &[version("1.0.0")])
+            .unwrap();
         let saved = fs::read_to_string(&path).unwrap();
         assert!(saved.contains("example = 'approved' # trusted"));
         assert!(file.config.approved["example"].is_blanket());
@@ -273,12 +369,18 @@ mod tests {
             scope: ApprovalScope::Workspace,
         })
         .unwrap();
-        file.add_version("example", &version("2.0.0")).unwrap();
+        file.add_version("example", &version("2.0.0"), &[version("2.0.0")])
+            .unwrap();
+        assert_eq!(
+            file.config.approved["example"],
+            ApprovedVersion::Multiple(vec![version("0.9.0"), version("1.0.0"), version("2.0.0")])
+        );
         let saved = fs::read_to_string(&path).unwrap();
         assert!(saved.contains("# first"));
         assert!(saved.contains("# old version"));
         assert!(saved.contains("# package"));
-        file.add_version("example", &version("2.0.0")).unwrap();
+        file.add_version("example", &version("2.0.0"), &[version("2.0.0")])
+            .unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), saved);
         file.remove_version("example", &version("2.0.0")).unwrap();
         assert!(file.config.approved["example"].allows_version(&version("0.9.0")));
@@ -295,9 +397,13 @@ mod tests {
         file.remove_approval("absent").unwrap();
         assert!(!file.path().exists());
 
-        file.add_version("example", &version("1.0.0")).unwrap();
-        file.add_version("another", &version("2.0.0")).unwrap();
-        file.add_version("example", &version("1.1.0")).unwrap();
+        let graph_versions = [version("1.0.0"), version("1.1.0")];
+        file.add_version("example", &version("1.0.0"), &graph_versions)
+            .unwrap();
+        file.add_version("another", &version("2.0.0"), &[version("2.0.0")])
+            .unwrap();
+        file.add_version("example", &version("1.1.0"), &graph_versions)
+            .unwrap();
         let loaded = super::super::load_config_from(file.path()).unwrap();
         assert!(loaded.approved["example"].allows_version(&"1.0.0".parse().unwrap()));
         assert!(loaded.approved["example"].allows_version(&"1.1.0".parse().unwrap()));
@@ -331,12 +437,18 @@ mod tests {
             scope: ApprovalScope::Workspace,
         })
         .unwrap();
-        file.add_version("example", &version("1.1.0")).unwrap();
+        file.add_version(
+            "example",
+            &version("1.1.0"),
+            &[version("1.0.0"), version("1.1.0")],
+        )
+        .unwrap();
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             original.replace("'1.0.0'", "[\"1.0.0\", \"1.1.0\"]")
         );
-        file.add_version("new-package", &version("3.0.0")).unwrap();
+        file.add_version("new-package", &version("3.0.0"), &[version("3.0.0")])
+            .unwrap();
         file.remove_approval("example").unwrap();
         let saved = fs::read_to_string(&path).unwrap();
         assert!(saved.contains("other = '2.0.0' # unchanged"));
@@ -359,9 +471,15 @@ mod tests {
             scope: ApprovalScope::Workspace,
         })
         .unwrap();
-        first.add_version("example", &version("2.0.0")).unwrap();
+        first
+            .add_version("example", &version("2.0.0"), &[version("2.0.0")])
+            .unwrap();
         let saved = fs::read_to_string(&path).unwrap();
-        assert!(second.add_version("example", &version("3.0.0")).is_err());
+        assert!(
+            second
+                .add_version("example", &version("3.0.0"), &[version("3.0.0")])
+                .is_err()
+        );
         assert_eq!(fs::read_to_string(&path).unwrap(), saved);
         assert!(
             matches!(&second.config().approved["example"], ApprovedVersion::SemVer(v) if v.to_string() == "1.0.0")
@@ -375,7 +493,10 @@ mod tests {
         let mut file = ConfigFile::for_workspace(root.path()).unwrap();
         let external = "# Created elsewhere\n[approved]\n";
         fs::write(file.path(), external).unwrap();
-        assert!(file.add_version("example", &version("1.0.0")).is_err());
+        assert!(
+            file.add_version("example", &version("1.0.0"), &[version("1.0.0")])
+                .is_err()
+        );
         assert_eq!(fs::read_to_string(file.path()).unwrap(), external);
         assert!(file.config().approved.is_empty());
     }
@@ -401,7 +522,8 @@ mod tests {
             scope: ApprovalScope::Workspace,
         })
         .unwrap();
-        file.add_version("example", &version("2.0.0")).unwrap();
+        file.add_version("example", &version("2.0.0"), &[version("2.0.0")])
+            .unwrap();
         file.remove_approval("example").unwrap();
         assert!(fs::read_to_string(&path).unwrap().contains("# inline"));
         assert!(
@@ -422,7 +544,8 @@ mod tests {
             scope: ApprovalScope::Workspace,
         })
         .unwrap();
-        file.add_version("example", &version("1.0.0")).unwrap();
+        file.add_version("example", &version("1.0.0"), &[version("1.0.0")])
+            .unwrap();
         assert!(
             fs::read_to_string(&path)
                 .unwrap()
@@ -441,7 +564,9 @@ mod tests {
         };
         let mut first = ConfigFile::open(target.clone()).unwrap();
         assert!(!path.parent().unwrap().exists());
-        first.add_version("example", &version("1.0.0")).unwrap();
+        first
+            .add_version("example", &version("1.0.0"), &[version("1.0.0")])
+            .unwrap();
         let mut stale = ConfigFile::open(target.clone()).unwrap();
         let before = fs::read_to_string(&path).unwrap();
         let lock = fs::OpenOptions::new()
@@ -450,19 +575,31 @@ mod tests {
             .open(path.with_file_name("approvals.toml.lock"))
             .unwrap();
         lock.try_lock().unwrap();
-        assert!(first.add_version("example", &version("2.0.0")).is_err());
+        assert!(
+            first
+                .add_version("example", &version("2.0.0"), &[version("2.0.0")])
+                .is_err()
+        );
         assert_eq!(fs::read_to_string(&path).unwrap(), before);
         assert_eq!(first.original.as_deref(), Some(before.as_str()));
         assert!(!first.config.approved["example"].allows_version(&version("2.0.0")));
         drop(lock);
-        first.add_version("example", &version("2.0.0")).unwrap();
+        first
+            .add_version("example", &version("2.0.0"), &[version("2.0.0")])
+            .unwrap();
         assert!(first.config.approved["example"].allows_version(&version("1.0.0")));
         let saved = fs::read_to_string(&path).unwrap();
-        assert!(stale.add_version("example", &version("3.0.0")).is_err());
+        assert!(
+            stale
+                .add_version("example", &version("3.0.0"), &[version("3.0.0")])
+                .is_err()
+        );
         assert_eq!(fs::read_to_string(&path).unwrap(), saved);
         let mut reopened = ConfigFile::open(first.target().clone()).unwrap();
         assert_eq!(reopened.target().scope, ApprovalScope::Global);
-        reopened.add_version("example", &version("3.0.0")).unwrap();
+        reopened
+            .add_version("example", &version("3.0.0"), &[version("3.0.0")])
+            .unwrap();
         assert_eq!(
             reopened.config.approved["example"],
             ApprovedVersion::Multiple(vec![version("1.0.0"), version("2.0.0"), version("3.0.0")])
@@ -487,7 +624,8 @@ mod tests {
             scope: ApprovalScope::Global,
         })
         .unwrap();
-        file.add_version("example", &version("2.0.0")).unwrap();
+        file.add_version("example", &version("2.0.0"), &[version("2.0.0")])
+            .unwrap();
         assert!(
             fs::symlink_metadata(&link)
                 .unwrap()
@@ -503,7 +641,9 @@ mod tests {
             scope: ApprovalScope::Global,
         })
         .unwrap();
-        missing.add_version("example", &version("1.0.0")).unwrap();
+        missing
+            .add_version("example", &version("1.0.0"), &[version("1.0.0")])
+            .unwrap();
         assert_eq!(missing.path(), real.join("new.toml"));
         fs::remove_file(&path).unwrap();
         assert!(

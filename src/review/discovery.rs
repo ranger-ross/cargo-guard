@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use cargo_metadata::{CargoOpt, Metadata, MetadataCommand, Node, NodeDep, Package};
@@ -172,9 +173,23 @@ fn dependency_is_active(
     Ok(false)
 }
 
+pub type GraphVersions = Arc<BTreeMap<String, Vec<semver::Version>>>;
+
+pub fn graph_versions(packages: &[&Package]) -> GraphVersions {
+    let mut versions: BTreeMap<String, Vec<semver::Version>> = BTreeMap::new();
+    for package in packages {
+        versions
+            .entry(package.name.to_string())
+            .or_default()
+            .push(package.version.clone());
+    }
+    Arc::new(versions)
+}
+
 pub struct ReviewQueue {
     pub packages: Vec<ReviewPackage>,
     pub config: ConfigFile,
+    pub graph_versions: GraphVersions,
     pub workspace_root: PathBuf,
     pub policy_notes: Vec<String>,
     pub global_target: Option<ApprovalTarget>,
@@ -193,7 +208,9 @@ impl ReviewQueue {
             global_path,
         )?)?;
         let policy_notes = super::policy_notes(&workspace_root, config.target(), global_path)?;
-        let packages: Vec<_> = resolved_packages(metadata, options)?
+        let resolved = resolved_packages(metadata, options)?;
+        let graph_versions = graph_versions(&resolved);
+        let packages: Vec<_> = resolved
             .into_iter()
             .filter(|package| options.global || !crate::workspace::is_member(metadata, package))
             .filter(|package| {
@@ -207,6 +224,7 @@ impl ReviewQueue {
         Ok(Self {
             packages,
             config,
+            graph_versions,
             workspace_root,
             policy_notes,
             global_target: global_path

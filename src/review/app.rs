@@ -154,9 +154,15 @@ impl App {
         let package = &self.session.package;
         let message = match decision {
             Decision::Approve => {
+                let graph_versions = self
+                    .session
+                    .graph_versions
+                    .get(&package.name)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
                 self.session
                     .config
-                    .add_version(&package.name, &package.version)?;
+                    .add_version(&package.name, &package.version, graph_versions)?;
                 format!(
                     "Approved {} v{}; saved to {}",
                     package.name,
@@ -424,6 +430,9 @@ pub(super) mod tests {
         let session = ReviewSession {
             workspace_root: root.path().to_path_buf(),
             policy_notes: Vec::new(),
+            graph_versions: Arc::new(
+                [("example".into(), vec![semver::Version::new(0, 1, 0)])].into(),
+            ),
             package: ReviewPackage {
                 id: cargo_metadata::PackageId {
                     repr: "path+file:///example#0.1.0".into(),
@@ -683,7 +692,7 @@ pub(super) mod tests {
 
         app.session
             .config
-            .add_version("example", &"0.0.1".parse().unwrap())
+            .add_version("example", &"0.0.1".parse().unwrap(), &[])
             .unwrap();
         let mut app = App::new(app.session).unwrap();
         // Reconstruct the package's approval as discovery would do on startup.
@@ -706,7 +715,11 @@ pub(super) mod tests {
         for version in ["0.0.1", "0.0.2"] {
             app.session
                 .config
-                .add_version(&name, &version.parse().unwrap())
+                .add_version(
+                    &name,
+                    &version.parse().unwrap(),
+                    &[semver::Version::new(0, 0, 1)],
+                )
                 .unwrap();
         }
         app.session.package.approval =

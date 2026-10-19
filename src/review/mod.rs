@@ -24,6 +24,7 @@ mod ui;
 pub struct ReviewSession {
     pub package: ReviewPackage,
     pub config: ConfigFile,
+    pub graph_versions: discovery::GraphVersions,
     pub workspace_root: PathBuf,
     pub policy_notes: Vec<String>,
 }
@@ -86,6 +87,7 @@ pub fn run(package: Option<&str>, options: &ReviewOptions) -> eyre::Result<()> {
         tui::run(discovery::ReviewQueue {
             packages: vec![session.package],
             config: session.config,
+            graph_versions: session.graph_versions,
             workspace_root: session.workspace_root,
             policy_notes: session.policy_notes,
             global_target,
@@ -112,7 +114,9 @@ impl ReviewSession {
         global_path: Option<&Path>,
     ) -> eyre::Result<Self> {
         let (name, version) = package_selector(name)?;
-        let mut candidates: Vec<_> = discovery::resolved_packages(metadata, options)?
+        let resolved = discovery::resolved_packages(metadata, options)?;
+        let graph_versions = discovery::graph_versions(&resolved);
+        let mut candidates: Vec<_> = resolved
             .into_iter()
             .filter(|package| package.name.as_str() == name)
             .filter(|package| version.as_ref().is_none_or(|v| v == &package.version))
@@ -164,6 +168,7 @@ impl ReviewSession {
         Ok(Self {
             package,
             config,
+            graph_versions,
             workspace_root,
             policy_notes,
         })
@@ -263,6 +268,76 @@ mod tests {
     use std::{fs, path::Path};
 
     use super::*;
+
+    #[test]
+    fn targeted_approval_retains_only_active_scalar_versions() {
+        use super::app::{App, Decision};
+
+        for (dependency, options, retain_old) in [
+            (
+                "[dependencies.duplicate-one]\npackage='duplicate'\npath='deps/v1'\noptional=true\n",
+                ReviewOptions::default(),
+                false,
+            ),
+            (
+                "[dependencies.duplicate-one]\npackage='duplicate'\npath='deps/v1'\noptional=true\n",
+                ReviewOptions {
+                    features: vec!["duplicate-one".into()],
+                    ..Default::default()
+                },
+                true,
+            ),
+            (
+                "[target.'cfg(windows)'.dependencies.duplicate-one]\npackage='duplicate'\npath='deps/v1'\n",
+                ReviewOptions {
+                    target: Some("x86_64-unknown-linux-gnu".into()),
+                    ..Default::default()
+                },
+                false,
+            ),
+            (
+                "[target.'cfg(windows)'.dependencies.duplicate-one]\npackage='duplicate'\npath='deps/v1'\n",
+                ReviewOptions {
+                    target: Some("x86_64-pc-windows-gnu".into()),
+                    ..Default::default()
+                },
+                true,
+            ),
+        ] {
+            let (root, _) = fixture();
+            let manifest_path = root.path().join("Cargo.toml");
+            let manifest = fs::read_to_string(&manifest_path).unwrap().replace(
+                "duplicate-one = { package = \"duplicate\", path = \"deps/v1\" }",
+                "",
+            );
+            fs::write(&manifest_path, format!("{manifest}\n{dependency}")).unwrap();
+            // Graph membership also includes versions without build scripts.
+            fs::remove_file(root.path().join("deps/v1/build.rs")).unwrap();
+            write(
+                root.path(),
+                "approved-builds.toml",
+                "[approved]\nduplicate='1.0.0'\n",
+            );
+            let metadata = discovery::metadata_command(&options)
+                .manifest_path(&manifest_path)
+                .exec()
+                .unwrap();
+            let session =
+                ReviewSession::from_metadata(&metadata, "duplicate@2.0.0", &options, None).unwrap();
+            let mut app = App::new(session).unwrap();
+            app.decide(Decision::Approve).unwrap();
+            let saved = config::load_config_from(app.session.config.path()).unwrap();
+            let expected = if retain_old {
+                ApprovedVersion::Multiple(vec![
+                    semver::Version::new(1, 0, 0),
+                    semver::Version::new(2, 0, 0),
+                ])
+            } else {
+                ApprovedVersion::SemVer(semver::Version::new(2, 0, 0))
+            };
+            assert_eq!(saved.approved["duplicate"], expected, "{options:?}");
+        }
+    }
 
     #[test]
     fn version_selector_disambiguates_packages() {
@@ -388,6 +463,7 @@ mod tests {
             let mut state = QueueState::new(ReviewQueue {
                 packages: vec![session.package],
                 config: session.config,
+                graph_versions: session.graph_versions,
                 workspace_root: session.workspace_root,
                 policy_notes: session.policy_notes,
                 global_target: None,

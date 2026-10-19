@@ -15,7 +15,7 @@ use super::{
     ReviewPackage, ReviewSession,
     app::{App, Decision},
     diagnostic::Diagnostic,
-    discovery::ReviewQueue,
+    discovery::{GraphVersions, ReviewQueue},
     input::{self, Action},
     sources::{Baseline, BaselineLoader},
 };
@@ -33,6 +33,7 @@ pub struct QueueState {
     pub failure_help: Diagnostic,
     pub approval_target: ApprovalTarget,
     global_target: Option<ApprovalTarget>,
+    graph_versions: GraphVersions,
     pub workspace_root: PathBuf,
     pub policy_notes: Vec<String>,
     loader: Option<BaselineLoader>,
@@ -83,6 +84,7 @@ impl QueueState {
             app: None,
             approval_target,
             global_target: queue.global_target,
+            graph_versions: queue.graph_versions,
             workspace_root: queue.workspace_root,
             policy_notes: queue.policy_notes,
             loader: None,
@@ -376,6 +378,7 @@ impl QueueState {
         let session = ReviewSession {
             package: entry.package.clone(),
             config,
+            graph_versions: self.graph_versions.clone(),
             workspace_root: self.workspace_root.clone(),
             policy_notes: self.policy_notes.clone(),
         };
@@ -506,6 +509,7 @@ mod tests {
                 .map(|entry| entry.package.clone())
                 .collect(),
             config: ConfigFile::open(state.approval_target.clone()).unwrap(),
+            graph_versions: state.graph_versions.clone(),
             global_target: state.global_target.clone(),
             workspace_root: state.workspace_root.clone(),
             policy_notes: state.policy_notes.clone(),
@@ -520,7 +524,7 @@ mod tests {
         let mut config = ConfigFile::open(target.clone()).unwrap();
         for version in versions {
             config
-                .add_version(&state.entries[0].package.name, version)
+                .add_version(&state.entries[0].package.name, version, &[])
                 .unwrap();
         }
         let path = target.path.clone();
@@ -833,7 +837,7 @@ mod tests {
         let version = "1.0.0".parse::<semver::Version>().unwrap();
         app.session
             .config
-            .add_version("custom-script", &version)
+            .add_version("custom-script", &version, &[])
             .unwrap();
         app.session.package.approval = Some(ApprovedVersion::SemVer(version.clone()));
         app.set_baseline(Baseline::Ready(PackageSources {
@@ -1036,6 +1040,39 @@ mod tests {
                 ..Default::default()
             }
         );
+    }
+
+    #[test]
+    fn approving_both_versions_survives_navigation_and_reopening() {
+        for reverse in [false, true] {
+            let (_root, mut state) = fixture();
+            let mut indices: Vec<_> = state
+                .entries
+                .iter()
+                .enumerate()
+                .filter_map(|(index, entry)| (entry.package.name == "duplicate").then_some(index))
+                .collect();
+            if reverse {
+                indices.reverse();
+            }
+            for &index in &indices {
+                state.open(index);
+                state.decide(Decision::Approve).unwrap();
+            }
+            for &index in &indices {
+                state.open(index);
+                assert!(state.app.as_ref().unwrap().is_current_version_approved());
+                assert!(state.entries[index].already_approved());
+            }
+            let saved = crate::config::load_config_from(&state.approval_target.path).unwrap();
+            for version in [semver::Version::new(1, 0, 0), semver::Version::new(2, 0, 0)] {
+                assert!(saved.approved["duplicate"].allows_version(&version));
+            }
+            let reopened = reopen(&state);
+            for index in indices {
+                assert!(reopened.entries[index].already_approved());
+            }
+        }
     }
 
     #[test]

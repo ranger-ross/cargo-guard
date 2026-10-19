@@ -323,7 +323,7 @@ fn review_approval_pins_the_version_for_a_real_build() {
         "review",
         "guarded-dep@1.0.0",
     ]);
-    approve_review(&review);
+    approve_review(&review, "1.0.0");
     assert!(
         !fixture.marker().exists(),
         "review executed the build script"
@@ -345,6 +345,167 @@ fn review_approval_pins_the_version_for_a_real_build() {
     );
     assert_rejected(&fixture.build(), &fixture.marker(), "guarded-dep v1.0.1");
     assert_eq!(fs::read_to_string(&policy_path).unwrap(), saved);
+}
+
+#[test]
+fn targeted_reviews_preserve_both_resolved_versions() {
+    let fixture = Fixture::new("[approved]\n");
+    let root = fixture.temp.path().join("workspace");
+    write(
+        &root,
+        "Cargo.toml",
+        "[package]\nname='consumer'\nversion='0.1.0'\nedition='2024'\n\
+         [workspace]\nexclude=['dep', 'dep-v2']\n\
+         [dependencies]\nguarded-dep={path='dep'}\n\
+         guarded-dep-v2={package='guarded-dep',path='dep-v2'}\n",
+    );
+    write(
+        &root,
+        "dep-v2/Cargo.toml",
+        "[package]\nname='guarded-dep'\nversion='2.0.0'\nedition='2024'\n[workspace]\n",
+    );
+    write(&root, "dep-v2/src/lib.rs", "");
+    write(
+        &root,
+        "dep-v2/build.rs",
+        r#"fn main() {
+    let marker = std::path::PathBuf::from(
+        std::env::var_os("CARGO_GUARD_E2E_MARKER").unwrap(),
+    );
+    std::fs::write(marker.with_extension("v2"), b"executed v2\n").unwrap();
+}
+"#,
+    );
+    for version in ["1.0.0", "2.0.0"] {
+        let mut review = fixture.command("workspace", &fixture.marker());
+        review.args([
+            env!("CARGO_BIN_EXE_cargo-guard"),
+            "review",
+            &format!("guarded-dep@{version}"),
+        ]);
+        approve_review(&review, version);
+        assert!(!fixture.marker().exists());
+        assert!(!fixture.marker().with_extension("v2").exists());
+        let saved = fs::read_to_string(root.join("approved-builds.toml")).unwrap();
+        let policy: toml::Value = toml::from_str(&saved).unwrap();
+        if version == "1.0.0" {
+            assert_eq!(policy["approved"]["guarded-dep"].as_str(), Some("1.0.0"));
+            assert_rejected(
+                &fixture.build(),
+                &fixture.marker().with_extension("v2"),
+                "guarded-dep v2.0.0",
+            );
+            // Cargo may already have executed the authorized v1 script.
+            assert_success(&fixture.cargo(
+                "workspace",
+                &fixture.marker(),
+                &["clean", "-p", "guarded-dep@1.0.0", "--offline"],
+            ));
+            if fixture.marker().exists() {
+                fs::remove_file(fixture.marker()).unwrap();
+            }
+        } else {
+            assert_eq!(
+                policy["approved"]["guarded-dep"],
+                toml::Value::Array(vec!["1.0.0".into(), "2.0.0".into()])
+            );
+        }
+    }
+    assert_success(&fixture.build());
+    assert_eq!(fs::read(fixture.marker()).unwrap(), b"executed\n");
+    assert_eq!(
+        fs::read(fixture.marker().with_extension("v2")).unwrap(),
+        b"executed v2\n"
+    );
+}
+
+#[test]
+fn workspace_upgrade_replaces_scalar_but_preserves_existing_arrays() {
+    for (previous, expected) in [
+        ("'1.0.0'", toml::Value::String("2.0.0".into())),
+        (
+            "['0.9.0', '1.0.0']",
+            toml::Value::Array(vec!["0.9.0".into(), "1.0.0".into(), "2.0.0".into()]),
+        ),
+    ] {
+        let fixture = Fixture::new(&format!("[approved]\nguarded-dep={previous}\n"));
+        let root = fixture.temp.path().join("workspace");
+        assert_success(&fixture.build());
+        fs::remove_file(fixture.marker()).unwrap();
+        let manifest = fs::read_to_string(root.join("dep/Cargo.toml")).unwrap();
+        write(&root, "dep/Cargo.toml", &manifest.replace("1.0.0", "2.0.0"));
+        assert_rejected(&fixture.build(), &fixture.marker(), "guarded-dep v2.0.0");
+        let mut review = fixture.command("workspace", &fixture.marker());
+        review.args([
+            env!("CARGO_BIN_EXE_cargo-guard"),
+            "review",
+            "guarded-dep@2.0.0",
+        ]);
+        // Path dependencies have no downloadable baseline. The UI still permits
+        // approval of their displayed current sources when it is unavailable.
+        approve_review(&review, "2.0.0");
+        assert!(!fixture.marker().exists());
+        let saved = fs::read_to_string(root.join("approved-builds.toml")).unwrap();
+        let policy: toml::Value = toml::from_str(&saved).unwrap();
+        assert_eq!(policy["approved"]["guarded-dep"], expected);
+        assert_success(&fixture.build());
+        assert_eq!(fs::read(fixture.marker()).unwrap(), b"executed\n");
+    }
+}
+
+#[test]
+fn global_reviews_preserve_versions_from_separate_workspaces() {
+    let fixture = Fixture::global();
+    let second = fixture.temp.path().join("workspace-b");
+    let manifest = fs::read_to_string(second.join("dep/Cargo.toml")).unwrap();
+    write(
+        &second,
+        "dep/Cargo.toml",
+        &manifest.replace("1.0.0", "2.0.0"),
+    );
+    for (workspace, version) in [("workspace", "1.0.0"), ("workspace-b", "2.0.0")] {
+        let marker = fixture.workspace_marker(workspace);
+        assert_rejected(
+            &fixture.build_workspace(workspace),
+            &marker,
+            &format!("guarded-dep v{version}"),
+        );
+        let mut review = fixture.command(workspace, &marker);
+        review
+            .env(
+                "CARGO_GUARD_GLOBAL_APPROVED_BUILDS_PATH",
+                fixture.global_path(),
+            )
+            .args([
+                env!("CARGO_BIN_EXE_cargo-guard"),
+                "review",
+                "--global",
+                &format!("guarded-dep@{version}"),
+            ]);
+        approve_review(&review, version);
+        assert!(!marker.exists());
+        assert!(
+            !fixture
+                .temp
+                .path()
+                .join(workspace)
+                .join("approved-builds.toml")
+                .exists()
+        );
+    }
+    let saved = fs::read_to_string(fixture.global_path()).unwrap();
+    let policy: toml::Value = toml::from_str(&saved).unwrap();
+    assert_eq!(
+        policy["approved"]["guarded-dep"],
+        toml::Value::Array(vec!["1.0.0".into(), "2.0.0".into()])
+    );
+    for workspace in ["workspace", "workspace-b"] {
+        assert_success(&fixture.build_workspace(workspace));
+        assert_eq!(
+            fs::read(fixture.workspace_marker(workspace)).unwrap(),
+            b"executed\n"
+        );
+    }
 }
 
 #[test]
@@ -1060,7 +1221,8 @@ impl vt100::Callbacks for TerminalResponses {
     }
 }
 
-fn approve_review(command: &Command) {
+fn approve_review(command: &Command, version: &str) {
+    let displayed_version = format!("v{version}");
     let mut builder = portable_pty::CommandBuilder::new(command.get_program());
     builder.args(command.get_args());
     builder.cwd(command.get_current_dir().unwrap());
@@ -1132,7 +1294,8 @@ fn approve_review(command: &Command) {
                         last_screen = screen;
                     }
                     if !accepted
-                        && last_screen.contains("guarded-dep v1.0.0")
+                        && last_screen.contains("guarded-dep")
+                        && last_screen.contains(&displayed_version)
                         && last_screen.contains("a approve")
                     {
                         writer.write_all(b"a")?;
