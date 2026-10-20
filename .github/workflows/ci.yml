@@ -65,7 +65,7 @@ jobs:
         with:
           tool: cargo-guard
 
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
 
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
@@ -104,7 +104,7 @@ jobs:
         with:
           tool: nextest,cargo-guard
 
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
 
       - name: Run tests
         run: cargo nextest run --all-features --all-targets --no-fail-fast
